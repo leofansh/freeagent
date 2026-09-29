@@ -10,6 +10,12 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+# 开发依赖。核心包保持零依赖，装不装这些都不影响 freeagent 本身。
+#
+# 刻意不加进度条插件（pytest-sugar / pytest-progress）：实测在 pytest 9.1.1 下
+# 与内置输出逐字相同，等于白加一个依赖。进度提示 pytest 自带 —— 每个用例行尾的
+# `[ 42%]` 就是。看不到它的原因通常是自己加了 `-q`（与下面 addopts 里的叠加成
+# -qq，末尾的 `N passed` 摘要也会被抑制）或中间夹了管道过滤。
 dev = ["pytest>=8"]
 # 飞书通道。**刻意做成 extra**：核心包保持零依赖，装不装飞书都不影响
 # ``freeagent`` 本身，README 里的「无需安装依赖即可运行」继续成立。
