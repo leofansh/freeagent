@@ -283,14 +283,16 @@ class Repl:
 
         ``check_reminders=False`` 供**远程通道**（飞书等）使用：
         提醒必须由通道自己按节奏推送，不能在这里被顺带消费掉。
-        原因见 :mod:`freeagent.services.channel` —— ``reminders.check()``
-        是**消费型**的（写 ``REMINDER_FIRED`` 记录且不重发），
-        一条无关消息就能把提醒吞掉。
+        原因见 :mod:`freeagent.services.channel`。
         """
         if check_reminders:
-            digest_text = render.render_digest(self.app.reminders.check())
+            digest = self.app.reminders.due()
+            digest_text = render.render_digest(digest)
             if digest_text:
                 self._say(f"[提醒] {digest_text}")
+                # 说出去才记账。_say 抛异常（管道断裂、编码失败）时令牌不落库，
+                # 下一轮还会提醒 —— 宁可重复也不静默丢弃（设计文档 9.2）。
+                self.app.reminders.acknowledge(digest)
         if line in ("/quit", "/exit", "/q"):
             self._say("再见。")
             return False
@@ -665,8 +667,15 @@ class Repl:
             self._say(f"  最近降级：{degraded}")
 
     def _cmd_tick(self, args: list[str]) -> None:
-        text = render.render_digest(self.app.reminders.check())
-        self._say(text if text else "没有到点的提醒。")
+        digest = self.app.reminders.due()
+        text = render.render_digest(digest)
+        if not text:
+            self._say("没有到点的提醒。")
+            return
+        self._say(text)
+        # 确认放在 _say 之后：写不出去就别记账，否则这条提醒会被永久
+        # 标记成已送达而用户从没看到（设计文档 9.2）。
+        self.app.reminders.acknowledge(digest)
 
     # ---- 角色管理 ---- #
     def _cmd_role_add(self, args: list[str]) -> None:

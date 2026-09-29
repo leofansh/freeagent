@@ -45,6 +45,33 @@ def feishu_routes() -> dict[str, Callable[..., Any]]:
     }
 
 
+def _reminders(app: App, _q: dict[str, list[str]]) -> dict[str, Any]:
+    """``GET /api/reminders`` —— 唯一会写库的 GET，且**刻意**如此。
+
+    它是提醒的**一个送达通道**：用户每次加载界面都被提醒一次，这本身
+    就是「送达」（设计文档 9.2 把 Web 列为三条提醒渠道之一）。
+
+    ## 为什么确认放在 payload 构造之后
+
+    以前这个端点直接调消费型的 ``reminders.check()``，于是：
+
+    * **GET 有副作用** —— 刷新、prefetch、探活、监控轮询都会吃掉提醒；
+    * **并发双加载互相吞** —— 第一个请求消费掉，第二个拿到空；
+    * **失败在构造之前就落库** —— handler 或序列化一抛，提醒永久丢失。
+
+    现在分两步：先查（纯查询），构造出 payload，成功之后再落令牌。
+    剩下的极限是「响应构造成功但客户端没渲染」—— HTTP 单向确认测不到
+    这一段，这是协议本身的限制，不是这里能补的。
+
+    ``server.py`` 把整个 handler 放在 ``app.lock`` 里，所以查与确认之间
+    不会被另一个请求插进来。
+    """
+    digest = app.reminders.due()
+    payload = serialize_api.reminder_payload(digest)
+    app.reminders.acknowledge(digest)
+    return payload
+
+
 #: GET 路由表。加接口在这里加一行，不碰 handler。
 READ_ROUTES: dict[str, Callable[..., Any]] = {
     "/api/health": endpoints_read.health,
@@ -55,9 +82,7 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
         app, (q.get("scope") or ["open"])[0]
     ),
     "/api/roles": endpoints_read.roles,
-    "/api/reminders": lambda app, q: serialize_api.reminder_payload(
-        app.reminders.check()
-    ),
+    "/api/reminders": _reminders,
     "/api/settings": endpoints_read.settings,
     "/api/chat": endpoints_read.chat_menu,
     "/api/vision": endpoints_read.vision_status,

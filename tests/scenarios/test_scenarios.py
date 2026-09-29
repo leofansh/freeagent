@@ -389,9 +389,13 @@ class TestS6Reminders:
             reminder_time=datetime(2026, 9, 26, 15, 0),
         )
         clock.set(datetime(2026, 9, 26, 15, 5))
-        first = app.reminders.check()
+        first = app.reminders.due()
         assert first.count == 1 and "修一下窗户螺丝" in first.text()
-        assert app.reminders.check().is_empty, "同一次提醒不应重复推送"
+        # due() 是纯查询，取两次都在；确认送达之后才不再出现。
+        # 契约见设计文档 9.2：令牌是对「已送达」的记账，不是对「已检查」的。
+        assert app.reminders.due().count == 1, "due() 不该消费"
+        app.reminders.acknowledge(first)
+        assert app.reminders.due().is_empty, "同一次提醒不应重复推送"
 
     def test_missed_reminder_is_labelled_not_shown_as_urgent(self, app: App, roles, clock):
         app.tasks.create(
@@ -399,7 +403,7 @@ class TestS6Reminders:
             reminder_time=datetime(2026, 9, 25, 10, 0),
         )
         clock.set(datetime(2026, 9, 26, 20, 0))
-        digest = app.reminders.check()
+        digest = app.reminders.due()
         assert len(digest.missed) == 1
         assert "已错过" in digest.text()
         assert digest.fired == ()
@@ -411,7 +415,7 @@ class TestS6Reminders:
                 reminder_time=datetime(2026, 9, 26, 15, i),
             )
         clock.set(datetime(2026, 9, 26, 15, 30))
-        text = app.reminders.check().text()
+        text = app.reminders.due().text()
         assert text and "\n" not in text
         assert "4 条" in text
 
@@ -422,4 +426,4 @@ class TestS6Reminders:
         )
         app.tasks.drop(t.id)
         clock.set(datetime(2026, 9, 26, 15, 5))
-        assert app.reminders.check().is_empty
+        assert app.reminders.due().is_empty

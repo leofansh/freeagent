@@ -257,32 +257,51 @@ def test_empty_rollover_summary_is_none(app: App, roles):
 def test_reminder_not_yet_due(app: App, roles, clock):
     t = app.tasks.create("修窗户", [roles["work"].id], kind=TaskKind.REMINDER,
                          reminder_time=datetime(2026, 9, 26, 15, 0))
-    assert app.reminders.check().is_empty
+    assert app.reminders.due().is_empty
 
 
 def test_reminder_fires_when_due(app: App, roles, clock):
     t = app.tasks.create("修窗户", [roles["work"].id], kind=TaskKind.REMINDER,
                          reminder_time=datetime(2026, 9, 26, 15, 0))
     clock.set(datetime(2026, 9, 26, 15, 5))
-    digest = app.reminders.check()
+    digest = app.reminders.due()
     assert digest.count == 1
     assert digest.missed == () and len(digest.fired) == 1
     assert "修窗户" in digest.text()
 
 
-def test_reminder_is_not_refired(app: App, roles, clock):
+def test_due_is_pure_query_and_acknowledge_consumes(app: App, roles, clock):
+    """``due()`` 只查不落库，``acknowledge()`` 才落去重令牌。
+
+    这条是设计文档 9.2 的规范性条款：令牌是对「已送达」的记账，不是对
+    「已检查」的记账。两者合一的时候，令牌在推送之前就落库，于是「进程死在
+    检查与推送之间」或「推送失败」时提醒会被永久标记成已送达，而用户从没收到。
+    """
     app.tasks.create("修窗户", [roles["work"].id], kind=TaskKind.REMINDER,
                      reminder_time=datetime(2026, 9, 26, 15, 0))
     clock.set(datetime(2026, 9, 26, 15, 5))
-    assert app.reminders.check().count == 1
-    assert app.reminders.check().count == 0
+    first = app.reminders.due()
+    assert first.count == 1
+    # 纯查询：连续查两次都还在，因为没落过令牌
+    assert app.reminders.due().count == 1, "due() 是纯查询，不该消费"
+    assert app.reminders.due().count == 1, "due() 重复调用不该改变任何东西"
+    # 确认送达之后才消失
+    app.reminders.acknowledge(first)
+    assert app.reminders.due().is_empty, "确认送达后同一提醒不再出现"
+
+
+def test_acknowledge_of_empty_digest_is_noop(app: App, roles, clock):
+    """空摘要不该写任何记录 —— 通道每轮都会调它。"""
+    assert app.reminders.due().is_empty
+    app.reminders.acknowledge(app.reminders.due())
+    assert app.reminders.due().is_empty
 
 
 def test_missed_reminder_is_labelled(app: App, roles, clock):
     app.tasks.create("很久以前", [roles["work"].id], kind=TaskKind.REMINDER,
                      reminder_time=datetime(2026, 9, 25, 10, 0))
     clock.set(datetime(2026, 9, 26, 20, 0))
-    digest = app.reminders.check()
+    digest = app.reminders.due()
     assert len(digest.missed) == 1 and digest.fired == ()
     assert "已错过" in digest.text()
 
@@ -292,7 +311,7 @@ def test_reminder_digest_is_merged_single_message(app: App, roles, clock):
         app.tasks.create(f"提醒{i}", [roles["work"].id], kind=TaskKind.REMINDER,
                          reminder_time=datetime(2026, 9, 26, 15, i))
     clock.set(datetime(2026, 9, 26, 15, 30))
-    digest = app.reminders.check()
+    digest = app.reminders.due()
     assert digest.count == 3
     text = digest.text()
     # 单条摘要，一行说完，三条都在里面
@@ -308,7 +327,7 @@ def test_reminder_digest_merges_fired_and_missed(app: App, roles, clock):
     app.tasks.create("早错过", [roles["work"].id], kind=TaskKind.REMINDER,
                      reminder_time=datetime(2026, 9, 25, 10, 0))
     clock.set(datetime(2026, 9, 26, 20, 0))
-    text = app.reminders.check().text()
+    text = app.reminders.due().text()
     assert text is not None and "\n" not in text
     assert "到点" in text and "已错过" in text
     assert "；" in text, "两组之间应有分隔"
@@ -319,4 +338,4 @@ def test_closed_task_does_not_remind(app: App, roles, clock):
                          reminder_time=datetime(2026, 9, 26, 15, 0))
     app.tasks.drop(t.id)
     clock.set(datetime(2026, 9, 26, 15, 5))
-    assert app.reminders.check().is_empty
+    assert app.reminders.due().is_empty

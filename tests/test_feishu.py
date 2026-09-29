@@ -1314,13 +1314,11 @@ class TestBridgeWorker:
 
 class TestBridgeReminders:
     def test_pushes_to_each_allowed_user(self, bridge):
-        bridge.channel.due_reminders = lambda: "该交周报了"
         bridge._notify_operators("该交周报了")
         targets = {uid for uid, _ in bridge.sender.sent_to_user}
         assert targets == {ALICE, BOB}, "每个被授权的人都该收到"
 
     def test_pushes_nothing_when_no_due(self, bridge):
-        bridge.channel.due_reminders = lambda: ""
         bridge._notify_operators("")
         assert bridge.sender.sent_to_user == []
         assert bridge.sender.sent == [], "没到期就不该发任何消息"
@@ -1338,6 +1336,31 @@ class TestBridgeReminders:
         bridge._notify_operators("该交周报了")
         assert bridge.sender.sent == [], "提醒不该按会话 id 发"
         assert bridge.sender.sent_to_user, "提醒必须按 open_id 发"
+
+    # -- 送达与否必须报告出来（设计文档 9.2）--------------------------- #
+    def test_reports_delivered_when_someone_got_it(self, bridge):
+        assert bridge._notify_operators("该交周报了") is True
+
+    def test_reports_not_delivered_when_all_sends_fail(self, bridge):
+        """白名单全是会话 id 时每个发送都抛错 —— 必须报告「没送到」。
+
+        以前这里把每个用户的异常各自吞掉且不报结果，调用方只能当成功。
+        于是飞书推送失败时，那条提醒照样被落去重令牌、永久标记成已送达，
+        而用户从没收到过。
+        """
+        import dataclasses
+
+        # config 是 frozen dataclass，只能整体换掉
+        bridge.config = dataclasses.replace(bridge.config, allowed_users=["oc_a", "oc_b"])
+        assert bridge._notify_operators("该交周报了") is False
+
+    def test_empty_text_is_never_delivered(self, bridge):
+        assert bridge._notify_operators("") is False
+        assert bridge._notify_operators(None) is False
+        assert bridge._notify_operators("   ") is False
+
+    # 「推送失败后提醒仍在待发状态」这条端到端保证放在 test_channel.py ——
+    # 那里有 _task 建任务的 helper，而本文件全程走消息接口、不直接建任务。
 
     def test_zero_poll_does_not_start_thread(self, bridge):
         """poll=0 就是明确关掉提醒，不该起线程。"""

@@ -222,24 +222,52 @@ class TestRemindersAreNotSwallowed:
             "普通消息不该夹带提醒 —— 那会把它消费掉"
         )
         # 关键断言：提醒还在，没被消费
-        assert channel.due_reminders(), "提醒应该还在等着被推送"
+        assert channel.due_reminders().text, "提醒应该还在等着被推送"
 
     def test_due_reminders_delivers_them(self, app, channel):
         self._due_task(app)
         pushed = channel.due_reminders()
-        assert "该交周报了" in pushed
+        assert "该交周报了" in pushed.text
 
     def test_reminders_only_fire_once(self, app, channel):
         self._due_task(app)
-        assert channel.due_reminders(), "第一次应推出去"
-        assert channel.due_reminders() == "", "不该重复推"
+        first = channel.due_reminders()
+        assert first.text, "第一次应推出去"
+        # 取而不确认 = 还没送达，提醒必须还在。这正是设计文档 9.2 要的：
+        # 令牌只对「已送达」记账。
+        assert channel.due_reminders().text, "未确认前不该消失"
+        channel.confirm_reminders(first)
+        assert channel.due_reminders().text == "", "确认送达后不该重复推"
+
+    def test_unconfirmed_batch_is_retried_next_poll(self, app, channel):
+        """推送失败（不调 confirm）时提醒必须留下来等下一轮。
+
+        这是本次改动的核心：以前 ``due_reminders()`` 取走即消费，于是
+        飞书推送失败时那条提醒被永久标记成已送达，用户从没收到过。
+        """
+        self._due_task(app)
+        first = channel.due_reminders()
+        assert "该交周报了" in first.text
+        # 模拟传输层送达失败：拿到文字，但没调 confirm_reminders
+        assert "该交周报了" in channel.due_reminders().text, (
+            "送达失败后必须还会再提醒一次"
+        )
+        # 这一轮送达了 —— 确认之后才真的不再提醒
+        channel.confirm_reminders(first)
+        assert channel.due_reminders().text == ""
+
+    def test_confirming_empty_batch_is_safe(self, app, channel):
+        empty = channel.due_reminders()
+        assert empty.text == "" and empty.digest is None
+        channel.confirm_reminders(empty)  # 不得抛
+        assert channel.due_reminders().text == ""
 
     def test_reminder_flow_survives_many_messages(self, app, channel):
         """连发十条无关消息，提醒仍必须送达。"""
         self._due_task(app)
         for i in range(10):
             channel.handle("c1", ALLOWED, f"/note {self._any_id(app)} 第 {i} 笔")
-        assert "该交周报了" in channel.due_reminders()
+        assert "该交周报了" in channel.due_reminders().text
 
     @staticmethod
     def _any_id(app) -> str:

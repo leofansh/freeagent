@@ -357,6 +357,36 @@ class TestS10WaitingInUi:
         _s, again = ui.get("/api/reminders")
         assert again["count"] == 0
 
+    def test_handler_failure_does_not_consume_the_reminder(
+        self, ui: Ui, app: App, clock, work, monkeypatch
+    ):
+        """**回归**：handler 失败时提醒必须还在。
+
+        以前这个端点直接调消费型的 ``check()``，于是 payload 构造一抛，
+        令牌已经落库、提醒永久丢失，而用户从没看到。9.2 现在要求
+        「令牌在送达确认之后才落库」，所以确认必须在 payload 成功之后。
+        """
+        from freeagent.web import serialize_api
+
+        t = app.tasks.create(
+            "修窗户", [work.id], kind=TaskKind.REMINDER,
+            reminder_time=datetime(2026, 9, 26, 15, 0),
+        )
+        clock.set(datetime(2026, 9, 26, 15, 5))
+
+        def boom(_digest):
+            raise RuntimeError("序列化炸了")
+
+        monkeypatch.setattr(serialize_api, "reminder_payload", boom)
+        status, _ = ui.get("/api/reminders")
+        assert status == 500, "handler 抛异常时该回 500"
+
+        # 关键断言：失败没有消费掉提醒
+        monkeypatch.undo()
+        _s, after = ui.get("/api/reminders")
+        assert after["count"] == 1, "handler 失败不该把提醒消费掉"
+        assert after["fired"][0]["task_id"] == t.id
+
     def test_missed_reminder_labelled_in_ui(self, ui: Ui, app: App, clock, work):
         app.tasks.create(
             "交物业费", [work.id], kind=TaskKind.REMINDER,

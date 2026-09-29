@@ -6,6 +6,13 @@ V1 的诚实边界（设计文档 9.2）：**系统不运行时不会通知**。
 两条不扰民规则：
 * 一个周期内所有到期提醒**合并成一条摘要**；
 * 超过 6 小时的提醒标记为**已错过**，如实说明，不当作刚发生的新提醒。
+
+## 两阶段：查与确认分开
+
+取提醒是**纯查询** :meth:`ReminderEngine.due`，落去重令牌是**送达之后**的
+:meth:`ReminderEngine.acknowledge`。两者曾经是一个方法，于是令牌在推送之前
+就落库 —— 进程死在中间、或推送失败，那条提醒就被永久标记成「已发过」，
+而用户从没收到。分开的代价是**允许重复**：不承诺恰好一次。
 """
 
 from __future__ import annotations
@@ -43,6 +50,11 @@ class ReminderDigest:
         return not self.fired and not self.missed
 
     @property
+    def entries(self) -> tuple[ReminderEntry, ...]:
+        """全部条目（先到点、后已错过）。确认送达时按这个顺序落库。"""
+        return self.fired + self.missed
+
+    @property
     def count(self) -> int:
         return len(self.fired) + len(self.missed)
 
@@ -78,8 +90,15 @@ class ReminderEngine:
             for r in self._records.list_for_task(task_id)
         )
 
-    def check(self) -> ReminderDigest:
-        """检查到期提醒。幂等：已发过的不会重复发。"""
+    def due(self) -> ReminderDigest:
+        """**纯查询**：到期且尚未确认送达的提醒。**不写库。**
+
+        为什么必须与 :meth:`acknowledge` 分开：去重令牌是对「已送达」的
+        记账，不是对「已检查」的记账。两者合一的时候，令牌在推送之前就落了库，
+        于是「进程死在检查与推送之间」或「推送失败」这两种情况里，提醒都会被
+        永久标记成已送达 —— 而用户从没收到，且 9.3 的「已错过」分支也不会再
+        触发它。这条约束见设计文档 9.2。
+        """
         now = self._clock.now()
         fired: list[ReminderEntry] = []
         missed: list[ReminderEntry] = []
@@ -91,7 +110,6 @@ class ReminderEngine:
             token = self._token(reminder_time)
             if self._already_sent(task.id, token):
                 continue
-            self._records.append(task.id, RecordType.REMINDER_FIRED, token, now)
             entry = ReminderEntry(
                 task_id=task.id,
                 title=task.title,
@@ -101,6 +119,26 @@ class ReminderEngine:
             (missed if entry.missed else fired).append(entry)
 
         return ReminderDigest(fired=tuple(fired), missed=tuple(missed))
+
+    def acknowledge(self, digest: ReminderDigest) -> None:
+        """确认送达，落去重令牌。**必须在推送成功之后调用。**
+
+        送达失败时就**不要**调用 —— 令牌不落库，那条提醒下一轮还会出现。
+
+        刻意**不承诺恰好一次**：这个设计允许同一条提醒被送达两次。
+        个人事务助手的代价函数里，重复提醒的代价远小于静默吞掉一条提醒，
+        所以宁可重复也不静默丢弃（设计文档 9.2）。
+        """
+        if digest.is_empty:
+            return
+        now = self._clock.now()
+        for entry in digest.entries:
+            self._records.append(
+                entry.task_id,
+                RecordType.REMINDER_FIRED,
+                self._token(entry.due_at),
+                now,
+            )
 
     def due_count(self) -> int:
         return len(self._tasks.list_due_reminders(self._clock.now()))

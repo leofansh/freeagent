@@ -421,8 +421,8 @@ class FeishuBridge:
     def start_reminders(self) -> None:
         """定时把到期提醒推进「home chat」。
 
-        刻意由通道自己推：``reminders.check()`` 是消费型的，
-        若靠用户发消息顺带触发，一条无关消息就能把提醒吞掉。
+        刻意由通道自己推：若靠用户发消息顺带触发，一条无关消息就能把
+        提醒吞掉。
         """
         if self.config.reminder_poll <= 0:
             return
@@ -434,25 +434,33 @@ class FeishuBridge:
     def _run_reminders(self) -> None:
         while not self._stop.wait(self.config.reminder_poll):
             try:
-                text = self.channel.due_reminders()
-                if text:
-                    self._notify_operators(text)
+                batch = self.channel.due_reminders()
+                # 送达失败就不确认 —— 令牌不落库，下一轮还会提醒。
+                # 宁可重复提醒，也别静默吞掉一条（设计文档 9.2）。
+                if batch.text and self._notify_operators(batch.text):
+                    self.channel.confirm_reminders(batch)
             except Exception:
                 log.exception("推送提醒时出错")
 
-    def _notify_operators(self, text: str) -> None:
-        """推给每个白名单用户。
+    def _notify_operators(self, text: str) -> bool:
+        """推给每个白名单用户。**返回是否至少有一个送达。**
 
         这里推**私聊**而不是某个群：提醒是给「你」的，落到工作群里
         等于把私事广播出去。要在群里收提醒，得用 bot 私聊。
 
-        空文本直接返回：``FakeSender`` 之类的替身不会像真 sender 那样
-        自己跳过空消息，那样它们就会收到一条空消息 —— 而真实用户看到的是
-        一次毫无意义的「对方发来一条空白」。
+        空文本直接返回 ``False``：``FakeSender`` 之类的替身不会像真 sender
+        那样自己跳过空消息，那样它们就会收到一条空消息 —— 而真实用户看到的
+        是一次毫无意义的「对方发来一条空白」。
+
+        ## 为什么必须返回送达与否
+        以前这里把每个用户的发送异常各自吞掉、且不报结果，于是调用方
+        无论如何都当成功 —— 全部失败时提醒被永久标记成已送达，用户从没收到。
+        一个人收到了就算送达：提醒是私事，转告给白名单里另一个人也算到了。
         """
         text = (text or "").strip()
         if not text:
-            return
+            return False
+        delivered = False
         for user in self.config.allowed_users:
             try:
                 # 按条目形状选 receive_id_type：白名单现在同时接受
@@ -461,6 +469,9 @@ class FeishuBridge:
                 self.sender.send_to_allowlist_entry(user, text)
             except Exception:
                 log.exception("推送给 %s 失败", user)
+            else:
+                delivered = True
+        return delivered
 
 
 # --------------------------------------------------------------------------- #

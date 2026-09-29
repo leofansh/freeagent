@@ -144,6 +144,25 @@ class ChannelReply:
     choices: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ReminderBatch:
+    """一次推送的**两半**：要发的话，和还没落库的凭据。
+
+    刻意不把确认藏在取提醒里面 —— 传输层拿到文字时才刚开始发，
+    发没发成功只有它知道。取的时候就把令牌落了，失败那条就永远丢了
+    （设计文档 9.2）。
+
+    这是**纯数据**，不持有任何协作者也不自己落库。确认走
+    :meth:`ChannelService.confirm_reminders`，与 :meth:`due_reminders`
+    对称 —— 两个方法都在这一层碰 reminders，调用方只管发。
+    """
+
+    #: 合并摘要正文；空串表示这轮没有到期提醒。
+    text: str
+    #: 确认用的凭据；``text`` 为空时为 ``None``。
+    digest: ReminderDigest | None = None
+
+
 class ChannelService:
     """把聊天消息路由到与终端**完全一致**的命令语义。"""
 
@@ -305,16 +324,28 @@ class ChannelService:
         return text[:MAX_REPLY_CHARS] + f"\n…（还有 {dropped} 字被截断）"
 
     # -- 提醒推送 ----------------------------------------------------------- #
-    def due_reminders(self) -> str:
-        """取出当前所有到期提醒，返回要推送的文字；没有则空串。
+    def due_reminders(self) -> ReminderBatch:
+        """取出当前所有到期提醒，**不落去重令牌**。
 
-        **由传输层按节奏调用**（比如每分钟一次）。因为 ``check()`` 是消费型的，
-        这里取走之后就不再重复 —— 通道必须自己保证调用频率，否则提醒会丢。
+        **由传输层按节奏调用**（比如每分钟一次）。送达成功后必须调
+        :meth:`confirm_reminders` —— 失败不调，那条提醒下一轮还会来。
+
+        以前这里是「取走即消费」，于是通道必须自己保证调用频率，
+        否则提醒会丢（那句警告还写在 docstring 里）。现在取与确认分开了。
         """
         from ..cli import render
 
         with self.app.lock:
-            return render.render_digest(self.app.reminders.check())
+            digest = self.app.reminders.due()
+            text = render.render_digest(digest)
+        return ReminderBatch(text=text, digest=digest if text else None)
+
+    def confirm_reminders(self, batch: ReminderBatch) -> None:
+        """确认这批提醒已送达，落去重令牌。**送达成功之后才调。**"""
+        if batch.digest is None:
+            return
+        with self.app.lock:
+            self.app.reminders.acknowledge(batch.digest)
 
     # -- 事件去重 ----------------------------------------------------------- #
     def _is_duplicate(self, event_id: str) -> bool:
