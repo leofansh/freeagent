@@ -1,0 +1,1261 @@
+"""飞书长连接桥接。**本模块是唯一需要 ``lark-oapi`` 的地方。**
+
+为什么只有这里要：长连接的握手、心跳、自动重连自己手搓不划算。
+而收消息之后的解析、发消息都已经在 :mod:`events` / :mod:`sender` 里
+用标准库做完了。所以 SDK 依赖被限制在这一个文件、且是**可选依赖**。
+
+## 结构：为什么必须「先入队再处理」
+
+飞书要求事件在 **3 秒内**确认，否则会重投。而本地命令可能很慢 ——
+``/today`` 会触发顺延并写库，``/delegate`` 会过白名单。所以：
+
+    回调线程：解析 → 入队 → 立刻返回（秒回，不阻塞）
+    工作线程：单线程 FIFO 串行取队列 → 执行 → 回消息
+
+单线程而不是线程池，是为了**保序 + 免并发冲突**：同一个 chat 里
+``/new`` 之后紧跟一条自然语言，第二条要看到第一条建出的角色。
+多个线程并发处理就会串台，而且 SQLite 连接不是线程安全的。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import queue
+import socket
+import sys
+import threading
+from pathlib import Path
+from typing import Any
+
+from .config import (
+    ConfigError,
+    FeishuConfig,
+    load_config,
+    merged_env,
+    state_home,
+)
+from .events import (
+    IncomingMessage,
+    Ignored,
+    describe_sdk_shape,
+    from_sdk_event,
+)
+from .identity import resolve_identity
+from .sender import (  # noqa: E402
+    _approval_card,
+    _card_action_response,
+    _decided_card,
+    VIEW_CHOICE_ACTION,
+)
+from .status import (
+    SEEN_SENDERS_KEY,
+    StatusReporter,
+    config_revision,
+    record_sender,
+    status_path,
+)
+
+__all__ = [
+    "FeishuBridge",
+    "PortLock",
+    "AlreadyRunning",
+    "lock_port_from_env",
+    "DEFAULT_LOCK_PORT",
+    "ENV_LOCK_PORT",
+    "main",
+]
+
+log = logging.getLogger("freeagent.feishu")
+
+#: 队列上限。满了就**丢最旧的**而不是无限增长 —— 助手落后几十条消息
+#: 毫无价值，但把内存吃光会影响机器上别的事。
+_QUEUE_MAX = 256
+
+#: 身份探测失败后的重试退避（秒）。取值抄 openclaw 的
+#: ``monitor.bot-identity.ts``：1min → 2min → 5min → 10min → 15min。
+#:
+#: 为什么要有：探测失败的**表现**是「群里 @ 它永远不回」，而启动日志里
+#: 只有一行告警 —— 用户很难联想到「重启一下就好了」，于是要么一直等，
+#: 要么去查完全无关的方向（权限？网络？白名单？）。
+#: 网络抖动、飞书临时故障这类**瞬时**原因，重试就能自愈。
+#: 配置错误（Secret 填错）重试确实没用，但那种情况跑 ``doctor`` 一眼就看到，
+#: 不该由这个线程替用户猜。
+#:
+#: 刻意不设成「密集重试」：探测是网络请求，短间隔既容易撞上飞书的频率限制，
+#: 也会在日志里刷出一片失败，看着像出了大事。
+_IDENTITY_RETRY_DELAYS: tuple[float, ...] = (60.0, 120.0, 300.0, 600.0, 900.0)
+
+
+class FeishuBridge:
+    """把飞书消息接到本地助手上。**不直接持有 SDK 客户端**，只管路由。"""
+
+    def __init__(
+        self,
+        channel,
+        sender,
+        config: FeishuConfig,
+        *,
+        bot_open_id: str | None = None,
+        reporter: StatusReporter | None = None,
+    ) -> None:
+        """
+        ``bot_open_id`` 是 bot 自己的 ``open_id``，**群聊 @ 门控的唯一依据**。
+
+        传 ``None``（探测失败）时门控**失败关闭**：群里带 @ 的消息一律不响应。
+        这时必须由调用方在启动时**显著告警**，否则用户会对着沉默的 bot 猜。
+        见设计方案 11.9.1。
+
+        ``reporter`` 用来把「最近见过谁」写进状态文件，供控制面显示 ——
+        白名单最难的就是「不知道该填什么」，界面直接列出实际 ID 就绕过了。
+        不传则不记（离线测试与 FakeBridge 都不需要）。
+        """
+        self.channel = channel
+        self.sender = sender
+        self.config = config
+        self.bot_open_id = bot_open_id or None
+        self.reporter = reporter
+        self._seen_senders: dict[str, dict[str, object]] = {}
+        self._queue: queue.Queue[IncomingMessage | None] = queue.Queue(
+            maxsize=_QUEUE_MAX
+        )
+        self._worker: threading.Thread | None = None
+        self._reminder: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    # -- 入口 --------------------------------------------------------------- #
+    def start_worker(self) -> None:
+        self._worker = threading.Thread(
+            target=self._run_worker, name="feishu-worker", daemon=True
+        )
+        self._worker.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._queue.put(None)          # 叫醒正在阻塞的 take()
+
+    # -- 回调：必须秒回 ----------------------------------------------------- #
+    def on_message(self, event: Any) -> None:
+        """长连接回调。**必须 3 秒内返回**，所以只解析 + 入队。"""
+        try:
+            parsed = from_sdk_event(event, bot_open_id=self.bot_open_id)
+        except Exception:                # 解析器也不许把回调搞崩
+            log.exception("解析飞书事件失败")
+            return
+        if parsed is None:
+            return                      # 不是收消息事件，静默跳过
+        if isinstance(parsed, Ignored):
+            log.info("忽略一条消息：%s", parsed.reason)
+            # **同时把实际结构打出来。** from_sdk_event 是照文档写的，
+            # 从没在真实事件上验证过 —— 万一结构对不上，光有「缺 message」
+            # 这句话是查不出根因的，机器人只会安静地不理人。
+            # 只列属性名不列值：事件里有消息正文和 open_id，那是隐私。
+            log.info("实际结构：%s", describe_sdk_shape(event))
+            return
+        # 群里必须 @ **bot 自己** 才响应 —— 否则整群聊天都会被我插嘴。
+        # 判据是身份比对，不是「@ 了某个东西就算」（见设计方案 11.9.1）。
+        # ``mention_note`` 带着具体原因，@ 了别人和身份未知要能分开看：
+        # 前者是正常的，后者是配置问题、不修就一直不响应。
+        if parsed.is_group and not parsed.mentioned:
+            log.info(parsed.mention_note or "群里未 @ 机器人，不响应")
+            return
+        # 记下「这个人在事件里带了哪些 ID」，供界面显示（见 record_sender）。
+        #
+        # 刻意放在**群聊门控之后**：这里只记「主动找过 bot 的人」，不记
+        # 群里所有成员。否则这张表会变成一份群成员名单 —— 既没用到
+        # （要授权的是找过它的人），又让人不必要地知道自己被记了。
+        #
+        # 必须在**白名单之前**记：白名单没配好的人正是最需要看到自己 ID
+        # 的那批人 —— 漏了他们，用户就只能去日志里翻。
+        if self.reporter is not None:
+            record_sender(self._seen_senders, parsed)
+            self.reporter.update(**{SEEN_SENDERS_KEY: dict(self._seen_senders)})
+        try:
+            self._queue.put_nowait(parsed)
+        except queue.Full:
+            dropped = self._get_nowait()
+            log.warning("队列满，丢掉最旧的一条：%s", dropped.text[:20] if dropped else "")
+
+    def _get_nowait(self) -> IncomingMessage | None:
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    # -- 工作线程 ----------------------------------------------------------- #
+    def _run_worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            try:
+                self._process(item)
+            except Exception:
+                # 一条消息处理失败不能拖垮整个通道。
+                log.exception("处理消息时出错")
+            finally:
+                self._queue.task_done()
+
+    def _process(self, msg: IncomingMessage) -> None:
+        if msg.unsupported_type:
+            # 不支持的消息类型：回一句提示，但**绝不进派发逻辑**。
+            # 见设计方案 11.9.1「不支持的消息类型要回一句提示，不能沉默」。
+            self._reply_unsupported(msg)
+            return
+        # 去重键用 ``msg.dedup_key``（``event_id`` → ``message_id`` 兜底），
+        # **不是** ``msg.event_id or None``。
+        #
+        # 踩过的坑（实测撞出来的，不是推的）：飞书**确实会**投递不带
+        # ``event_id`` 的事件。那种情况下传 None 进去，
+        # ``ChannelService.handle`` 里的去重整段被跳过 —— 而飞书重连时会
+        # **重投**事件，于是同一条消息会**再建一次事务**。
+        #
+        # 证据：实测收到一条消息、处理成功、也回了话，但去重表条目数没动，
+        # 说明那次的 ``event_id`` 是空的、去重压根没跑。
+        #
+        # 这个坑在非文字那条路径上**已经修过一次**（见 :meth:`_reply_unsupported`
+        # 的注释），当时只改了那一处，文字这条漏了 —— 同一个坑要踩两次。
+        # ``dedup_key`` 这个属性就是为此存在的（设计方案 11.9.2）。
+        key = msg.dedup_key
+        if not key:
+            # 绝不能静默跳过（和 :meth:`_reply_unsupported` 同一把尺）：
+            # 没有键就无法去重，重投会重复建事务，而用户只看到「怎么有两条」。
+            log.warning(
+                "这条消息既无 event_id 也无 message_id，**无法去重**；"
+                "若被飞书重投，会重复处理（chat=%s，event_id=%r message_id=%r）",
+                msg.chat_id, msg.event_id, msg.message_id,
+            )
+        reply = self.channel.handle(
+            msg.chat_id, msg.sender_ids, msg.text,
+            event_id=key or None,
+        )
+        if reply.denied:
+            # **被拒时必须打出发送者的每一层标识 + 白名单内容。**
+            #
+            # 理由很实际：白名单填错时的表现是「bot 一句话都不回」，而用户
+            # 拿不到任何可操作的信息。原先只打一个 open_id，够用但不够 —— 换过
+            # 飞书应用之后 open_id 变了，光看它无法判断「是它变了」还是
+            # 「我配错了」。把双方的对照一起打出来，这一行就成了自证。
+            #
+            # 仍然**不打消息正文** —— 正文可能有隐私内容，而排查「谁被拒了」
+            # 只需要身份。
+            detail = self.channel.allowlist_mismatch(msg.sender_ids)
+            if msg.event_id:
+                log.info(
+                    "发送者不在白名单：%s（%s，event_id=%s）",
+                    msg.sender_label, detail, msg.event_id,
+                )
+            else:
+                log.info(
+                    "发送者不在白名单：%s（%s）", msg.sender_label, detail,
+                )
+            if not reply.text:
+                return                    # 重复事件：静默，不打扰
+        elif not reply.text:
+            # **没被拒、却算出空回复** —— 这是异常，必须出声。
+            #
+            # 踩过的坑（真在飞书里撞出来的）：原先空回复一律 `return`，和
+            # 「重复事件」混在一起。可那正是 ``ChannelService._run`` 少绑一次
+            # ``repl.out`` 时的症状 —— **同一会话第 2 条起全部沉默**。
+            # 两个缺陷叠在一起：症状是沉默，沉默又不留日志，于是**完全无法
+            # 被诊断**，我为此白查了一轮。
+            #
+            # 所以这里分开：重复事件是**预期**（``denied=True``），空回复是
+            # **不该发生**，后者要 warning。
+            log.warning(
+                "处理了消息却算出**空回复**，已不给用户回任何话（chat=%s，"
+                "发送者=%s，event_id=%s）。这是异常不是重复事件 —— "
+                "若用户说「发了没反应」，先看这里。",
+                msg.chat_id, msg.sender_label, msg.event_id,
+            )
+            return
+        else:
+            # 成功也**必须留痕**。原先成功时一行都不打，于是「bot 回了什么 /
+            # 到底回了没有」在日志里完全不可见 —— 用户报「没反应」时，
+            # 日志是空的，和「消息压根没到」长得一模一样。
+            #
+            # 只记元信息、**不记正文**：回复里会带用户自己的话（任务标题等），
+            # 而这个文件明确不打消息正文（见上面「被拒」分支的说明）。
+            # 排查「回了没有 / 回了多长」不需要正文。
+            log.info(
+                "已回复：chat=%s，发送者=%s，%d 字",
+                msg.chat_id, msg.sender_label, len(reply.text),
+            )
+
+        # **有只读选项时改发按钮卡**（设计文档 12.1.1 的 A 方案）。
+        #
+        # 只在 ``CLARIFY`` 时才有选项 —— 那是「我没把握，请选一个」的时刻，
+        # 也就是唯一值得花一次交互成本去问的时刻。正常回答照旧发纯文本，
+        # 否则飞书会变成「每条消息一张卡」。
+        #
+        # 卡片里**仍然把正文也发一遍**（``send_text``），因为发卡可能失败，
+        # 而「点了没反应」比「多点一次」糟得多。
+        if reply.choices:
+            from .sender import send_view_choice_card
+
+            try:
+                send_view_choice_card(
+                    self.sender,
+                    open_id=msg.sender_open_id,
+                    subject="你要看哪个？",
+                    choices=reply.choices,
+                    chat_id=msg.chat_id,
+                )
+                log.info("已发选项卡：chat=%s，%d 个选项", msg.chat_id,
+                         len(reply.choices))
+            except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
+                log.warning("发选项卡失败，回退成纯文本", exc_info=True)
+        self.sender.send_text(msg.chat_id, reply.text)
+
+    def _reply_unsupported(self, msg: IncomingMessage) -> None:
+        """回一句「我只处理文字」，然后就此打住。
+
+        群聊 @ 门控在 :meth:`on_message` 入队前就过了（没 @ 到 bot 的根本
+        不会走到这里），所以这里只剩**白名单**这一道。
+
+        白名单**必须**复用 :meth:`ChannelService.is_allowed`，不在这里自己
+        比一遍 allowed 列表 —— 两份白名单逻辑迟早会漂移，而漂移的表现是
+        「提示语漏给了陌生人」：那等于向任意人确认「这里有个 bot 在跑」，
+        正是白名单要挡的泄露面。
+
+        踩过的坑（**实测发现的**，离线测试全绿）：去重发生在
+        :meth:`ChannelService.handle` 里面，而这里刻意不走 ``handle``
+        （它只处理可派发的正文）。于是非文字消息**从不写去重表** ——
+        飞书重连重投同一张图时，就会**再回一次**提示。
+        症状很隐蔽：文字消息不会重复，图片会，去重表里也查不到那条记录。
+        所以这里必须显式补记一次，否则「跨重启去重」这个承诺对图片是假的。
+        """
+        # 先记去重再决定回不回：判定本身就是「处理」，处理过就该被记住。
+        #
+        # 键用 ``dedup_key``（event_id → message_id 兜底），**不再用裸
+        # ``event_id``**：原写法 ``if msg.event_id and ...`` 在 event_id 为空
+        # 时把整段跳过了 —— 回了提示却不写表，同一张图重投会再回一次。
+        # 而离线 fixture 的 event_id 一直都有，所以测试全绿。
+        key = msg.dedup_key
+        if key and self.channel.dedup.is_duplicate(key):
+            log.info(
+                "重复事件（%r），不重复回提示（key=%s）",
+                msg.unsupported_type, key,
+            )
+            return
+        if not key:
+            # **绝不能静默跳过**（设计方案 11.9.2）。没有键就无法去重，
+            # 这条提示在重投时会重复发出 —— 用户只看到「同一张图被回了两次」。
+            # 明确报出来，至少能查。
+            log.warning(
+                "这条 %r 消息既无 event_id 也无 message_id，**无法去重**；"
+                "若它被飞书重投，提示会重复发出（event_id=%r message_id=%r）",
+                msg.unsupported_type, msg.event_id, msg.message_id,
+            )
+        if not self.channel.is_allowed(msg.sender_ids):
+            log.info(
+                "发送者不在白名单，%r 消息不回提示：%s（event_id=%s）",
+                msg.unsupported_type,
+                self.channel.allowlist_mismatch(msg.sender_ids),
+                msg.event_id,
+            )
+            return
+        log.info(
+            "收到 %r 消息（发送者 %s），回一句「只处理文字」而不建事务",
+            msg.unsupported_type, msg.sender_label,
+        )
+        self.sender.send_text(
+            msg.chat_id,
+            f"我只处理文字消息，这条收到的是 {msg.unsupported_type}。"
+            "图片、文件、富文本请直接用文字说。",
+        )
+
+    # -- 身份恢复 ------------------------------------------------------------ #
+    def start_identity_recovery(self, sender, home=None) -> None:
+        """身份探测失败后，**后台按退避重试**，成功即让群聊门控生效。
+
+        没有这条时的表现：启动那一瞬网络抖了一下（或飞书临时故障），
+        探测失败 → 群里 @ 永远不回 → 用户以为配置坏了，去查权限、查网络、
+        查白名单 —— 而真正原因是「你运气不好，重启一下就好了」。
+
+        成功后直接写 ``self.bot_open_id``：``on_message`` 每条消息都现读这个
+        属性，所以**下一次消息就按新身份判**，不用重启、不用重新订阅。
+        赋值是原子的（``str | None`` 单引用），而读取方只会拿到「旧值或新值」，
+        不会出现半截字符串。
+
+        退避用 ``self._stop.wait(delay)`` 而不是 ``time.sleep(delay)``：
+        前者被 ``stop()`` 立刻唤醒，桥接退出时不用干等完整个退避周期。
+        """
+        def _retry() -> None:
+            for i, delay in enumerate(_IDENTITY_RETRY_DELAYS, 1):
+                if self._stop.wait(delay):
+                    return                     # 桥接在等退避期间关了，别再探
+                try:
+                    identity, note = resolve_identity(sender, home=home)
+                except Exception:
+                    # 探测本身不该把重试线程带走 —— 一次意外就放弃等于白做。
+                    log.exception("身份后台重试 %d 出了意外", i)
+                    continue
+                if identity is not None:
+                    self.bot_open_id = identity.open_id
+                    log.warning(
+                        "bot 身份已在后台探到（%s，%s）。"
+                        "**群里 @ 门控现在生效了**，不用重启。",
+                        identity.open_id, note,
+                    )
+                    return
+                log.warning(
+                    "身份后台重试 %d/%d 仍失败：%s",
+                    i, len(_IDENTITY_RETRY_DELAYS), note,
+                )
+            log.warning(
+                "身份后台重试用尽，群里 @ 门控保持失败关闭直到下次启动。"
+                "跑 `python -m freeagent.feishu.doctor` 查这一项 —— "
+                "如果每次都失败，多半是凭据或权限配错了，不是网络问题。"
+            )
+
+        threading.Thread(
+            target=_retry, name="feishu-identity-retry", daemon=True
+        ).start()
+
+    # -- 提醒推送 ----------------------------------------------------------- #
+    def start_reminders(self) -> None:
+        """定时把到期提醒推进「home chat」。
+
+        刻意由通道自己推：``reminders.check()`` 是消费型的，
+        若靠用户发消息顺带触发，一条无关消息就能把提醒吞掉。
+        """
+        if self.config.reminder_poll <= 0:
+            return
+        self._reminder = threading.Thread(
+            target=self._run_reminders, name="feishu-reminder", daemon=True
+        )
+        self._reminder.start()
+
+    def _run_reminders(self) -> None:
+        while not self._stop.wait(self.config.reminder_poll):
+            try:
+                text = self.channel.due_reminders()
+                if text:
+                    self._notify_operators(text)
+            except Exception:
+                log.exception("推送提醒时出错")
+
+    def _notify_operators(self, text: str) -> None:
+        """推给每个白名单用户。
+
+        这里推**私聊**而不是某个群：提醒是给「你」的，落到工作群里
+        等于把私事广播出去。要在群里收提醒，得用 bot 私聊。
+
+        空文本直接返回：``FakeSender`` 之类的替身不会像真 sender 那样
+        自己跳过空消息，那样它们就会收到一条空消息 —— 而真实用户看到的是
+        一次毫无意义的「对方发来一条空白」。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        for user in self.config.allowed_users:
+            try:
+                # 按条目形状选 receive_id_type：白名单现在同时接受
+                # ou_ 开头的 open_id 和裸的租户级 user_id，写死成 open_id
+                # 会让后者永远发不出去（见 send_to_allowlist_entry）。
+                self.sender.send_to_allowlist_entry(user, text)
+            except Exception:
+                log.exception("推送给 %s 失败", user)
+
+
+# --------------------------------------------------------------------------- #
+# 单实例守卫
+# --------------------------------------------------------------------------- #
+
+#: 默认锁端口。刻意避开 Web 的 8770 —— 两个进程撞端口会互相误杀。
+DEFAULT_LOCK_PORT = 8771
+ENV_LOCK_PORT = "FEISHU_LOCK_PORT"
+
+
+class AlreadyRunning(RuntimeError):
+    """已经有桥接在跑。"""
+
+
+class PortLock:
+    """bind 一个回环端口当单实例锁。
+
+    ## 为什么必须单实例
+
+    同一个 ``app_id`` 上跑两个长连接，飞书只会把事件投给其中一个，
+    另一个静默失效。现场表现是「bot 时好时坏」，而且极难定位 ——
+    两边日志都正常，没有报错。
+
+    ## 为什么用端口而不是锁文件
+
+    锁文件在进程被强杀时会留下残骸，下次启动就得人工清理；
+    端口由操作系统在进程退出（含崩溃）时**自动释放**。
+    端口的生命周期就是进程的生命周期，不需要额外的判断逻辑。
+    """
+
+    def __init__(self, port: int) -> None:
+        self.port = int(port)
+        self._sock: socket.socket | None = None
+
+    def acquire(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", self.port))
+        except OSError as exc:
+            sock.close()
+            raise AlreadyRunning(
+                f"端口 {self.port} 已被占用 —— 大概率已经有一个桥接在跑了。"
+                f"（{exc.strerror}）"
+                f"确实要开第二个的话，换一个端口：set {ENV_LOCK_PORT}=8781"
+            ) from exc
+        # 刻意**不** listen。占端口只需要 bind：第二次 bind 会拿到
+        # WSAEADDRINUSE / EADDRINUSE，排他性就已经建立了（``TestPortLock``
+        # 逐条锁住这个行为）。listen 只会多开一个毫无用途的监听套接字 ——
+        # 别人还能 connect 上来，虽然绑在回环地址不外露，但没必要留着。
+        self._sock = sock
+
+    def release(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    def __enter__(self) -> "PortLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+def lock_port_from_env() -> int:
+    """锁端口。默认 8771；``FEISHU_LOCK_PORT`` 可改。
+
+    给 doctor 复用 —— 「端口被占」这条诊断结论必须和桥接实际用的是
+    **同一个**解析逻辑，否则会出现「doctor 说没占、桥接说占了」。
+
+    走 :func:`merged_env` 而不是直接读 ``os.environ``：锁端口也在
+    ``feishu.env`` 的白名单里，而界面存进去的值要是读不到，那这半个功能
+    就是假的（见 12.7）。
+    """
+    raw = merged_env().get(ENV_LOCK_PORT, "").strip()
+    if not raw:
+        return DEFAULT_LOCK_PORT
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{ENV_LOCK_PORT} 必须是整数，收到 {raw!r}") from exc
+
+
+# --------------------------------------------------------------------------- #
+# 装配
+# --------------------------------------------------------------------------- #
+def _build_handler(bridge: FeishuBridge) -> Any:
+    """注册消息回调。**这里才 import SDK**，所以不装也不影响其它模块。"""
+    import lark_oapi as lark
+
+    builder = lark.EventDispatcherHandler.builder("", "")
+    builder.register_p2_im_message_receive_v1(bridge.on_message)
+    builder.register_p2_card_action_trigger(_card_action_sdk)
+    return builder.build()
+
+
+#: 卡片动作事件名。SDK 报的错里就是这个串（实测：「processor not found,
+#: type: card.action.trigger」），记下来做交叉核对。
+CARD_ACTION_EVENT = "card.action.trigger"
+
+
+#: 卡片处理器用的连接。**由 :func:`main` 显式注入**。
+#:
+#: 为什么是模块级：SDK 的回调是**零参可调用对象**，不接受额外参数，
+#: 而我们要往里传数据库连接。用模块全局是这个 SDK 形状下的常规做法，
+#: 但**必须显式设、且未设时明确降级** —— 不能偷偷新建连接，那会开第二个
+#: 连接去写同一个库，绕开 app.lock。
+#:
+#: 踩过的坑（实测）：它挂在**函数**上时，``def`` 语句还没执行完，
+#: 同一处的 ``_card_action.conn: Any = None`` 会在名字绑定之前就求值，
+#: 直接 ``NameError`` 把整个模块打挂。挂函数属性必须**放在 def 之后**。
+_card_conn: Any = None
+
+#: 卡片处理器的钟。``None`` = 用真钟。
+#:
+#: 为什么单独留一个口：处理器会**自己**建 ``ApprovalStore``，而那个类默认
+#: 用 ``datetime.now()``。于是测试注入的 FakeClock 只对它自己那个 store 生效，
+#: 处理器这边仍看真时间 —— 结果「新卡」被判成过期，decided_by 写成 expired。
+#:
+#: 踩过的坑（实测）：4 条测试红了，读起来像「决策被翻掉」「卡片颜色错」，
+#: 真正的原因只是**两个 store 用了两个钟**。
+_card_clock: Any = None
+
+
+def _no_card_change(why: str) -> dict[str, Any]:
+    """**刻意不动卡片**，但给一个 toast。
+
+    只在「我们连这张卡是什么都不知道」时用（载荷不认、处理崩了）。
+    那时替换卡片等于凭空编一张卡片出来 —— 用户会以为之前那张真的处理过。
+    留 toast 至少让他看到「点了，但没成」。
+
+    刻意**不带** ``card`` 字段：SDK 那个字段为 None 时不替换。
+    """
+    return {"toast": {"type": "error", "content": f"未处理：{why}"}}
+
+
+def _card_action(data: Any = None) -> dict[str, Any]:
+    """卡片点击 → 把答复落库。**这里不做任何决定**，只写。
+
+    载荷形状是**实测**出来的（前期验证，见 docs 11.9.4）::
+
+        event.action.value = {"action": "allow_once", "id": "<凭据>"}
+        event.operator      = {open_id, user_id, union_id, tenant_key}
+        event.context       = {open_message_id, open_chat_id, ...}
+        header.event_id     = 去重键
+
+    三个刻意的决定：
+
+    1. **凭据查不到就丢弃，不报错。** 那几乎总是「过期后有人点老卡片」，
+       属正常。但**要记日志** —— 否则「我点了没反应」无从排查。
+    2. **点击者身份要记下来**（``decided_by``），哪怕不做白名单校验。
+       凭据是 uuid4 不可猜，真正要防的是「谁能发起请求」，那在 ask 之前
+       就卡住了；而「谁批的」必须在事后查得到。
+    3. **不吞异常**，但也不让它掀翻桥接 —— 卡片处理失败不该影响
+       消息处理。返回 ``{}`` 表示「不更新卡片」，是最安全的应答。
+    """
+    import json
+
+    log = logging.getLogger("freeagent.feishu")
+
+    def _plain(obj: Any, depth: int = 0) -> Any:
+        """把 SDK 的 model 对象**逐层拆成普通结构**。
+
+        第一版用 ``json.dumps(default=str)``，结果 ``action`` 被打成
+        ``<CallBackAction object at 0x...>`` —— 形状拿到了，**值没拿到**，
+        于是凭据串在日志里 0 处。所以这里必须真的去读属性。
+        """
+        if depth > 4:
+            return "…"
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        if isinstance(obj, dict):
+            return {str(k): _plain(v, depth + 1) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_plain(v, depth + 1) for v in obj]
+        if hasattr(obj, "__dict__"):
+            return {k: _plain(v, depth + 1) for k, v in vars(obj).items()
+                    if not k.startswith("_")}
+        # 没有 __dict__ 的 model 对象：按 dir() 试读公开属性
+        out: dict[str, Any] = {}
+        for name in dir(obj):
+            if name.startswith("_"):
+                continue
+            try:
+                v = getattr(obj, name)
+            except Exception:
+                continue
+            if callable(v):
+                continue
+            out[name] = _plain(v, depth + 1)
+        return out or str(obj)
+
+    try:
+        payload = _plain(data)
+        # 载荷可能压根不是 dict（None / 列表 / 字符串）。不判一下的话
+        # 下面 ``payload.get`` 会抛，而那一抛会被下面的 except 兜住 —— 于是
+        # 每来一条乱七八糟的帧就往日志里打一段 traceback。
+        # **垃圾输入不该产生堆栈。**
+        if not isinstance(payload, dict):
+            payload = {}
+        event = payload.get("event") or {}
+        value = (event.get("action") or {}).get("value") or {}
+        operator = event.get("operator") or {}
+        who = operator.get("open_id") or operator.get("user_id") or "unknown"
+        event_id = (payload.get("header") or {}).get("event_id")
+
+        # **只读选项**：不需要审批凭据，点了就跑那个视图并回话。
+        #
+        # 刻意放在最前面、且**不查库** —— 它是纯只读切换，没有副作用，
+        # 因此没有东西需要授权（见 ``sender.VIEW_CHOICE_ACTION`` 的说明）。
+        # 放进批准流程会是错配：凭空多出「凭据过期」「决策不可篡改」
+        # 这些为「授权」设计的机制，却用在一个根本没有授权的动作上。
+        if value.get("action") == VIEW_CHOICE_ACTION:
+            # 模块级函数，**没有 self** —— 踩过的坑：这里原先写成
+            # ``self._run_view_choice(...)``，类型检查直接报
+            # 「self is not defined」，而它要等到**真机上点一下按钮**
+            # 才会炸成 NameError。
+            return _run_view_choice(value, who=who)
+
+        credential = value.get("id")
+        choice = value.get("action")
+
+        if not credential or choice not in ("allow_once", "deny"):
+            log.info("【卡片动作】载荷不认（credential=%r choice=%r）—— 丢弃",
+                     credential, choice)
+            return _no_card_change("载荷不认，未处理")
+
+        if _card_conn is None:
+            # 没注入连接 = 桥接没带着库起来。这条路不能猜：宁可拒，
+            # 也不能在没落盘的情况下报「已允许」。
+            log.warning("【卡片动作】没有数据库连接，拒绝写入（凭据=%s）",
+                        credential)
+            return _card_action_response(
+                _decided_card("无法处理", "**已拒绝**：助手没连上数据库，"
+                                          "没有记录你的选择。", granted=False),
+                "error", "没连上数据库，未能记录",
+            )
+
+        from ..services.approval import ApprovalStore
+
+        store = ApprovalStore(_card_conn, clock=_card_clock)
+        known = store.get(credential)
+        if known is None:
+            # 过期后点老卡片。正常，但得留痕 —— 而且要**告诉用户**，
+            # 否则他点了什么都没发生，只会觉得「这机器人坏了」。
+            log.info("【卡片动作】凭据 %s 不在库里（多半已过期）—— "
+                     "点击者=%s 丢弃", credential, who)
+            return _card_action_response(
+                _decided_card("这张卡已过期",
+                              "**已过期，未生效。** 过期后点它不会批准任何操作。",
+                              granted=False),
+                "warning", "这张卡已过期",
+            )
+
+        wrote = store.resolve(
+            credential,
+            "allow" if choice == "allow_once" else "deny",
+            decided_by=who,
+        )
+        # **不是发起人**要单独判、单独说 —— 它和「已决定过」「已过期」在
+        # :meth:`resolve` 里都是 ``False``，但给用户的话**完全不同**。
+        #
+        # 混成一句「先前已经 X 过了」的后果是：白名单里的另一个人点了
+        # 别人发起的委派，屏幕上写「这张卡先前已被允许」—— 他会以为
+        # 系统记错了，而实际上**是他自己没权限**。那条规则
+        # （只有发起人能批）在 resolve 里强制，这里只负责说清楚。
+        if not store.can_answer(credential, who):
+            requester = known.requested_by or "(未记录)"
+            log.info("【卡片动作】凭据 %s 的发起人是 %s，点击者=%s —— "
+                     "非发起人，丢弃", credential, requester, who)
+            return _card_action_response(
+                _decided_card(
+                    known.subject,
+                    f"**这次点击没有生效** —— 只有**发起这条委派的人**能批。"
+                    f"发起人是 `{requester}`。",
+                    granted=False,
+                ),
+                "warning", "只有发起人能批这条",
+            )
+
+        # **不能拿「resolve 没报错」当成「用户点的那个被记下了」。**
+        #
+        # 踩过的坑（实测）：``resolve()`` 对**两种**情况都返回 True ——
+        # 真的记下了 allow，**或者**已过期于是降级成 deny。于是
+        # 「写了就 granted=True」会让**过期的卡点「允许」显示成绿头
+        # 「已允许」** —— 恰恰与实际相反的那种谎。
+        #
+        # 所以：**结论一律以库里那个 decision 为准**，不用返回值、
+        # 也不用用户点了哪个按钮来推。
+        settled = store.get(credential)
+        prior = settled.decided_by if settled is not None else None
+
+        # 已决定过 → 这次点击没写入任何东西，必须**如实说没生效**。
+        if not wrote:
+            already = settled.decision if settled is not None else None
+            label = "允许" if already == "allow" else "拒绝"
+            log.info("【卡片动作】凭据 %s 已被决定过（%s by %s）—— 本次点击不生效",
+                     credential, label, prior)
+            return _card_action_response(
+                _decided_card(
+                    known.subject,
+                    f"**这次点击没有生效** —— 这张卡先前已被**{label}**"
+                    f"（{prior or '未知'}）。决策只在第一次点击时定下。",
+                    granted=(already == "allow"),
+                ),
+                "warning", f"先前已经{label}过了",
+            )
+
+        granted = bool(settled is not None and settled.decision == "allow")
+        expired = prior == "expired"
+
+        if expired:
+            log.info("【卡片动作】凭据 %s 已过期，点「%s」不生效", credential, choice)
+            return _card_action_response(
+                _decided_card(
+                    known.subject,
+                    "**已过期，未生效。** 这张卡过了有效期，"
+                    "点它不会批准任何操作。",
+                    granted=False,
+                ),
+                "warning", "这张卡已过期",
+            )
+
+        log.info("【卡片动作】%s 凭据=%s 主题=%r 点击者=%s event_id=%s",
+                 "允许" if granted else "拒绝",
+                 credential, known.subject, prior, event_id)
+        return _card_action_response(
+            _decided_card(
+                known.subject,
+                (f"**已允许**（{prior}）\n\n{known.detail or ''}" if granted else
+                 f"**已拒绝**（{prior}）\n\n没有访问任何东西。"),
+                granted=granted,
+            ),
+            "success" if granted else "error",
+            "已允许" if granted else "已拒绝",
+        )
+    except Exception:
+        log.exception("【卡片动作】处理失败（不影响消息通道）")
+        return _no_card_change("处理时出错")
+
+
+#: 模块级持有 ChannelService，供 :func:`_run_view_choice` 用。
+#: 与 :data:`_card_conn` 同理：卡片回调是**模块级** handler，拿不到实例。
+#: 刻意复用**同一个** ChannelService 而不是新建一个 —— 新建会绕开去重表，
+#: 而去重是「同一句话重发不会重复回」的唯一保证。
+_card_channel: Any = None
+
+#: 模块级持有 sender，供 :func:`_run_view_choice` 把结果发成**聊天消息**。
+_card_sender: Any = None
+
+
+def _run_view_choice(value: dict[str, Any], *, who: str) -> dict[str, Any]:
+    """点了只读选项 → 跑那个视图，结果发回聊天窗口，然后把按钮收掉。
+
+    结果走**两条路**，缺一不可：
+
+    1. ``send_text`` 发一个**聊天气泡** —— 用户在窗口里等的就是这个。
+       只靠卡片回写的话，他得自己发现「刚才那张卡变了」。
+    2. 卡片回写把按钮**收掉** —— 留着按钮等于骗人，他会以为还能再点，
+       而第二次点只会得到同一份数据（实测过的坑：留着可点的按钮＝骗人）。
+
+    复用**同一个** :class:`ChannelService`：只读视图的语义必须与「你直接
+    在飞书里打『今天该做什么』」**逐字一致**。另写一套渲染就是第二份实现，
+    而设计文档 12.1.1 明写「一份能力一份实现」—— 分叉的表现极隐蔽
+    （Web 正常、飞书错，而两边各自都测过）。
+    """
+    view = str(value.get("view") or "").strip()
+    chat_id = str(value.get("chat") or "").strip()
+    if not view or not chat_id:
+        return _no_card_change("选项不完整，未处理")
+    if _card_channel is None or _card_sender is None:
+        # 没有通道 = 没人能执行。**不猜**、不发话：只把卡收掉。
+        log.warning("【选项卡】没连上通道，不处理（view=%r chat=%r）", view, chat_id)
+        return _card_action_response(
+            _decided_card("看不了", "**没连上，暂时看不到数据。**", granted=False),
+            "error", "没连上",
+        )
+
+    try:
+        with _card_channel.app.lock:
+            reply = _card_channel.handle(chat_id, who, view)
+    except Exception:
+        log.exception("【选项卡】执行视图失败（view=%r）", view)
+        return _card_action_response(
+            _decided_card("看不了", f"**没能跑成**「{view}」。稍后再试。",
+                          granted=False),
+            "error", "没跑成",
+        )
+
+    if reply.denied:
+        # 拒了（不在白名单/去重）。**不当成成功**回写 ——
+        # 那会让卡面显示「已切换」而用户什么都没收到。
+        log.info("【选项卡】通道拒了（view=%r denied=True）", view)
+        return _no_card_change("没权限，未处理")
+
+    try:
+        _card_sender.send_text(chat_id, reply.text)
+    except Exception:
+        # 气泡发不出去**不能**掀翻整个点击：卡面回写照旧，用户至少看得见。
+        log.warning("【选项卡】结果发不进聊天（view=%r）", view, exc_info=True)
+
+    return _card_action_response(
+        _decided_card("已切换", f"**{view}** —— 结果已发在上面。", granted=True),
+        "success", "已切换",
+    )
+
+
+def _card_action_sdk(data: Any = None) -> Any:
+    """把 :func:`_card_action` 的 dict 答复包成 SDK 声明的类型。
+
+    ``register_p2_card_action_trigger`` 的签名要求 handler 返回
+    ``P2CardActionTriggerResponse``，而 :func:`_card_action` 返回
+    ``dict[str, Any]`` —— **运行时没事**（SDK 的 Encoder 照样能把 dict
+    序列化出去，这也是之前能收到 1226 字节应答的原因），但类型上是违约的。
+
+    为什么不直接让 ``_card_action`` 返回模型：那 30+ 个 ``return
+    _card_action_response(...)`` 全都要包一层，测试也跟着全要改成读
+    ``.toast``/``.card`` 属性，可读性反而变差。**在这一层包一次**就够了。
+
+    为什么不 ``cast`` 蒙过去：``cast`` 是对类型系统说谎 —— 声称是模型，
+    实际是 dict；哪天 SDK 真的去读模型属性就会炸。这里是真的构造一个模型。
+
+    包一层安不安全？实测过（``tests/test_card_sdk_envelope.py``）：
+    SDK 的 ``Encoder`` 对每个 model 做 ``filter_null(vars(o))``，逐层剥掉
+    ``None``，所以模型多出来的 ``toast.i18n=None`` **不会**发出去。
+    同一个测试断言 ``JSON.marshal(model) == JSON.marshal(dict)``，
+    JSON 形状逐字节相同 —— 不是"应该没问题"，是"证明了没问题"。
+    """
+    from lark_oapi.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTriggerResponse,
+    )
+
+    return P2CardActionTriggerResponse(_card_action(data))
+
+
+
+#: SDK 在真正连上 / 断开时打的日志片段（``lark_oapi/ws/client.py``）。
+#:
+#: 为什么盯日志而不自己推断：``WSClient`` **没有**「连上了」的回调。它只有
+#: ``on_reconnecting`` / ``on_reconnected`` 两个**重连**钩子，而初次连接
+#: 不走它们。唯一确证的信号是它自己打出来的日志。
+#:
+#: logger 名字是 ``"Lark"``（实测，不是我猜的模块路径）。
+_SDK_LOGGER_NAME = "Lark"
+_SDK_CONNECTED = "connected to "
+_SDK_DISCONNECTED = "disconnected to "
+
+
+class _ConnectionWatcher(logging.Handler):
+    """把 SDK 的连接日志翻译成状态上报。
+
+    **只报确证**：没看到「connected to」就报 `connected=False`。宁可让界面
+    显示「正在连接」，也不要显示一个假的「已连接」—— 后者比没有状态更坏，
+    因为它给出虚假的安心（见 :mod:`freeagent.feishu.status` 的模块说明）。
+    """
+
+    def __init__(self, reporter: StatusReporter, ready_state: str) -> None:
+        super().__init__(level=logging.INFO)
+        self._reporter = reporter
+        self._ready_state = ready_state
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        # ⚠️ 顺序是**故意的**：`disconnected to` 里含 `connected to` 子串。
+        # 先判断开，否则一次断线会被当成重新连上 —— 正好是这个 bug 的翻版。
+        if _SDK_DISCONNECTED in msg:
+            self._report(connected=False, state="starting")
+        elif _SDK_CONNECTED in msg:
+            self._report(connected=True, state=self._ready_state)
+
+    def _report(self, *, connected: bool, state: str) -> None:
+        try:
+            self._reporter.update(state=state, connected=connected)
+        except Exception:            # noqa: BLE001
+            # 这是第三方事件循环里的日志回调。这里抛出去只会让 logging 往
+            # stderr 刷一串 "--- Logging error ---"，把真正的日志淹掉。
+            pass
+
+
+def _run_connection(
+    client: Any,
+    reporter: StatusReporter | None,
+    bot_open_id: str | None,
+) -> None:
+    """跑长连接，**在真正连上之后**才把状态报成 ready。
+
+    踩过的坑（会造成假健康）：原实现是在 ``client.start()`` **之前**就
+    ``connected=True`` + 打「长连接已建立」，而文档还声称有个「短延时确认
+    start() 没抛异常」的机制——代码里根本没有。于是凭据错误时 start() 立刻
+    抛出，状态文件却仍写着 ready/connected，心跳照旧，界面就一直显示
+    「已连接」，对着一个压根没连上的进程报健康。
+
+    ``client.start()`` 的实际形状是：先 ``await self._connect()``（此刻
+    连上了才会打 ``connected to``），**然后**才进阻塞的 ``_select()``。
+    所以确证信号只能从日志里拿，见 :class:`_ConnectionWatcher`。
+    """
+    if reporter is None:
+        client.start()
+        return
+
+    # 还没开始连。先落一个「连着吗还不知道」的状态，而不是先宣布就绪。
+    reporter.update(state="starting", connected=False)
+
+    watcher = _ConnectionWatcher(
+        reporter, "ready" if bot_open_id else "degraded"
+    )
+    sdk_log = logging.getLogger(_SDK_LOGGER_NAME)
+    # 状态**依赖**这一条日志，所以必须保证 level 放得过 INFO。
+    #
+    # 踩过的坑：原先指望 SDK 构造 Client 时会把级别设成调用方给的那个值
+    # （bridge 传的是 INFO，于是碰巧能用）。可一旦有人把日志级别调成
+    # WARN/ERROR，「connected to」就不打了，状态会**永远**停在「正在连接」——
+    # 一个自己引入的静默失效，而且只在改日志级别时才发作。
+    #
+    # 只在会挡住时**调低到** INFO；调用方主动要更啰嗦的（DEBUG）时不按回去。
+    if sdk_log.level == logging.NOTSET or sdk_log.level > logging.INFO:
+        sdk_log.setLevel(logging.INFO)
+    sdk_log.addHandler(watcher)
+    try:
+        client.start()                      # 连上时 watcher 会翻成 ready
+    except Exception as exc:                # noqa: BLE001 - 报出去再照旧抛出
+        # 启动就失败时必须说清，别留一个 ready 的假状态在盘上。
+        try:
+            reporter.update(
+                state="down", connected=False, last_error=f"连接失败：{exc}"
+            )
+        except Exception:                   # noqa: BLE001
+            pass
+        raise
+    finally:
+        # start() 正常返回意味着事件循环结束了；一直阻塞时不会走到这。
+        sdk_log.removeHandler(watcher)
+
+
+def _log_path(db: str | None) -> Path:
+    """日志文件放哪：与身份缓存、事件去重表**同源**。
+
+    复用 :func:`state_home`（而不是自己拼 ``~/.freeagent``）：它已经处理了
+    ``FREEAGENT_HOME`` 与 ``--db`` 跟随，且明确禁止另写一份路径解析 ——
+    复制粘贴的解析迟早漂移，而漂移的表现是「缓存写在 A、读取去 B 找」，
+    于是缓存永远命中不了，**且没有任何报错**。
+
+    契约见设计文档 11.9.5。
+    """
+    return state_home(Path(db).parent if db else None) / "feishu.log"
+
+
+def _log_handlers(args: argparse.Namespace) -> list[logging.Handler]:
+    """stderr + **UTF-8** 文件。
+
+    踩过的坑（实测）：原先这里只写 ``logging.basicConfig(level=..., format=...)``，
+    它只建 ``StreamHandler(stderr)``，**没有 FileHandler**。于是
+    ``feishu.log`` 的内容是**启动器把 stderr 重定向**进去的 ——
+    而重定向的编码取决于**启动那个 shell 的代码页**：
+
+    ====================  ==========
+    启动方式                写出的中文
+    ====================  ==========
+    UTF-8 终端              UTF-8
+    中文 Windows 的 cmd(936)  **GBK**
+    ====================  ==========
+
+    后果不是「日志不好看」，是**排障会被骗**：实测 9826 行合法 UTF-8 里
+    混着 4 行 GBK，而那 4 行恰好是两次真实点击（``【卡片动作】允许`` /
+    ``【卡片动作】拒绝``）。用 UTF-8 grep「卡片动作」**一条都搜不到** ——
+    险些反过来断定「实机证据是假的」。
+
+    所以编码**必须显式钉死** ``utf-8``，且**不许依赖任何隐式默认**。
+
+    ``encoding`` 写死而不是跟随 locale：跟随 locale 等于把这个 bug 换个
+    地方复现。日志是给人（和工具）读的，跨机器可读比「合本地口味」重要。
+
+    **stderr 保留**：控制台仍要看得到日志。文件是为了**事后**能查。
+
+    建文件失败**不许炸桥接** —— 记一条 stderr 告警然后只留 stderr。
+    日志是诊断手段，为了写日志而拒绝启动是本末倒置。
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    path = _log_path(getattr(args, "db", None))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(path, encoding="utf-8"))
+    except OSError as exc:
+        # 此时 logging 还没配好，print/stderr 是唯一能说话的地方。
+        print(f"⚠ 日志文件开不了（{path}：{exc}），日志只走 stderr", file=sys.stderr)
+    return handlers
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="freeagent-feishu",
+        description="把本地助手接到飞书/Lark（长连接，无需公网 IP）",
+    )
+    parser.add_argument("--db", default=None, help="数据库路径（默认 ~/.freeagent）")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=_log_handlers(args),
+        # ``force=True`` **不是**为了覆盖别人的配置，而是为了不漏句柄。
+        #
+        # ``basicConfig`` 在 root logger 已有 handler 时是**静默 no-op** ——
+        # 于是 :func:`_log_handlers` 建出来的 ``FileHandler`` 既没被装上、
+        # 也没人关，``ResourceWarning: unclosed file`` 就漏出来了。
+        # 表现很误导：报的是「文件没关」，根因却是「配置压根没生效」。
+        # 本函数是进程入口（CLI/被 supervisor 拉起），本就**该**由它决定日志。
+        force=True,
+    )
+
+    try:
+        config = load_config()
+        config.check_ready()
+        lock_port = lock_port_from_env()
+    except ConfigError as exc:
+        print(f"配置有问题：{exc}", file=sys.stderr)
+        return 2
+
+    # 单实例守卫放在最前面：连库都不必打开就能发现「已经有一个在跑」。
+    lock = PortLock(lock_port)
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        print(f"起不来：{exc}", file=sys.stderr)
+        return 4
+
+    # 资源清理集中在一个 ``finally``。此前有两条出错路径会漏：
+    # 第二个 ``ImportError``（SDK 装了一半、``lark_oapi.ws`` 缺失时）没放锁，
+    # 而非 ``ImportError`` 的异常连 ``app.close()`` 都不走。漏放锁的后果很
+    # 难查 —— 「桥接起不来，但看不出为什么」，而这正是这道守卫唯一的作用。
+    #
+    # 意外的异常**不吞**：让它带着 traceback 冒出来，只是资源照样收干净。
+    app = None
+    bridge = None
+    reporter = None
+    try:
+        from ..app import build_app
+        from ..services.channel import ChannelService
+        from .dedup import SeenEventStore, default_path
+        from .sender import FeishuSender
+
+        app = build_app(args.db)
+        sender = FeishuSender(config)
+
+        # 卡片处理器要用**同一个**库连接 —— 不新建第二个。
+        # 新建会绕开 app.lock，于是「桥接写答复 / 执行器读答复」变成两个
+        # 连接各写各的，锁形同虚设（实测会撞 SQLite 的 busy）。
+        #
+        # 必须放在 ``build_app`` **之后**：原来写在前面，于是「假装缺 SDK」
+        # 那条测试直接 ``AttributeError: 'NoneType' has no attribute 'conn'``
+        # —— 而它本该验的是「缺依赖时要给安装提示」。
+        global _card_conn
+        _card_conn = app.conn
+        # 选项卡（只读视图切换）要用**同一个** ChannelService 与 sender。
+        # 与 _card_conn 同理：卡片回调是模块级 handler，拿不到实例。
+        global _card_channel, _card_sender
+        _card_channel = ChannelService(app, allowed_senders=config.allowed_users)
+        _card_sender = sender
+
+        # 状态文件跟着 ``--db`` 走：改了库的位置，去重记录和身份缓存也跟着走，
+        # 不会「换了一套数据却还记着旧的事件 id」。
+        home = state_home(Path(args.db).parent if args.db else None)
+
+        seen = SeenEventStore(default_path(home))
+        if seen.last_error:
+            log.warning("事件去重表：%s", seen.last_error)
+
+        # bot 身份：群里「只认 @ 自己」的唯一依据。探不到就失败关闭，
+        # 所以下面必须**显著告警**——否则用户只见群里静默，无从判断原因。
+        #
+        # 踩过的坑（类型检查抓出来的，1076 个测试全都漏了）：
+        # ``resolve_identity`` 返回的是 ``BotIdentity`` **对象**，而
+        # ``FeishuBridge`` 要的是 ``str``。之前直接把对象传进去，
+        # ``self.bot_open_id`` 存下的是对象，于是 events.py 里
+        # ``mention_open_id == bot_open_id`` 恒为 False ——
+        # **真实环境里 bot 在群里永远不会被 @ 叫醒，而且一声不吭**。
+        # 测试抓不到是因为每条测试都直接注入 ``"ou_bot"`` 这样的裸字符串，
+        # 从没走过 ``main()`` 这段真实装配。
+        identity, note = resolve_identity(sender, home=home)
+        bot_open_id = identity.open_id if identity is not None else None
+        if bot_open_id is None:
+            log.warning(
+                "⚠ %s\n"
+                "  私聊不受影响，但**群里 @ 它也不会回**，直到探测成功。\n"
+                "  我会在后台按退避重试（最多约 33 分钟），探到就自动恢复，"
+                "不用你重启。若每次都失败，跑 "
+                "`python -m freeagent.feishu.doctor` 看这一项 —— "
+                "那通常是凭据或权限配错，不是网络问题。",
+                note,
+            )
+        else:
+            log.info("bot 身份 %s（%s）", bot_open_id, note)
+
+        channel = ChannelService(
+            app, allowed_senders=config.allowed_users, dedup=seen
+        )
+
+        # 运行状态上报（设计方案 12.7）。先报「还没连上」—— 用户在控制面
+        # 看到 starting 比看到一片空白好，那片空白会被当成「界面坏了」。
+        #
+        # 刻意**建在桥接之前**：桥接要把「最近见过谁」写进状态文件，需要
+        # 拿着 reporter 的引用（见 record_sender 的说明）。先后反了就得回头
+        # 补一个 setter，那比挪两行更啰嗦。
+        reporter = StatusReporter(status_path(home))
+        reporter.update(
+            state="starting",
+            connected=False,
+            bot_open_id=bot_open_id or "",
+            bot_name=identity.app_name if identity is not None else "",
+            allowed_users_count=len(config.allowed_users),
+            lock_port=lock_port,
+            dedup_entries=len(seen),
+            last_error="",
+            # 记下「这个进程是照着哪份配置起来的」。界面拿它跟盘上现在的
+            # 配置比，就知道要不要提示重启（12.7）—— 少了它，界面只能显示
+            # 「已保存」，而那可能根本没生效。
+            config_revision=config_revision(home),
+        )
+        reporter.start()
+
+        bridge = FeishuBridge(
+            channel, sender, config,
+            bot_open_id=bot_open_id, reporter=reporter,
+        )
+        if bot_open_id is None:
+            # 探到了就不起这个线程：没得可重试，白白挂个线程只增加出错面。
+            bridge.start_identity_recovery(sender, home=home)
+
+        bridge.start_worker()
+        bridge.start_reminders()
+
+        import lark_oapi as lark
+        from lark_oapi.ws import client as ws_client
+
+        client = ws_client.Client(
+            config.app_id,
+            config.app_secret.use(),      # SDK 要裸字符串
+            log_level=lark.LogLevel.INFO,
+            event_handler=_build_handler(bridge),
+            domain=config.base_url,
+        )
+        # 注意：**「Client 对象造好了」不等于「连上了」**。真正握手在
+        # ``client.start()`` 里面，而它是阻塞的。所以这里先报 degraded，
+        # 连上之后再报 ready —— 反过来做的话，控制面会在根本没连上时
+        # 傻傻地显示「已连接」。
+        reporter.update(
+            state="degraded" if bot_open_id is None else "starting",
+            connected=False,
+        )
+        log.info(
+            "正在建立飞书长连接（域名 %s，授权 %d 人，提醒轮询 %s，"
+            "跨重启去重已记住 %d 条，@ 门控 %s）",
+            config.base_url, len(config.allowed_users),
+            f"{config.reminder_poll}s" if config.reminder_poll else "关",
+            len(seen),
+            "按 open_id 判定" if bot_open_id else "失败关闭（身份未知）",
+        )
+        _run_connection(client, reporter, bot_open_id)
+        return 0
+    except ImportError as exc:
+        print(
+            f"缺少飞书依赖：{exc}\n"
+            '装它：pip install ".[feishu]"',
+            file=sys.stderr,
+        )
+        return 3
+    except KeyboardInterrupt:
+        log.info("收到 Ctrl+C，正在退出")
+    finally:
+        # 每一步都自己兜住：清理抛异常会把原始异常盖掉，还会连带跳过
+        # 后面的关库和放锁 —— 那比不清理更糟。
+        if reporter is not None:
+            try:
+                reporter.stop()
+            except Exception:
+                log.warning("停状态上报出错（已忽略）", exc_info=True)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:
+                log.warning("停桥接出错（已忽略）", exc_info=True)
+        if app is not None:
+            try:
+                app.close()
+            except Exception:
+                log.warning("关库出错（已忽略）", exc_info=True)
+        lock.release()
+    return 0
+
+
+#: 踩过的坑：一开始漏了这个守卫，于是 ``python -m freeagent.feishu.bridge``
+#: 只是导入模块、什么都不做、**退出码 0 且没有任何输出** ——
+#: 看起来「启动成功了」，其实一条命令都没执行。控制台脚本
+#: （``freeagent-feishu``）走的是另一条路，所以它是对的，``-m`` 这条却是哑的。
+#: 联调时白等一轮才发现。
+if __name__ == "__main__":
+    raise SystemExit(main())

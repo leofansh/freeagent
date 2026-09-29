@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freeagent"
+version = "0.1.0"
+description = "个人事务助手原型 — 角色脉络 / 事务生命周期 / 今天视图 / 可恢复状态"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# 飞书通道。**刻意做成 extra**：核心包保持零依赖，装不装飞书都不影响
+# ``freeagent`` 本身，README 里的「无需安装依赖即可运行」继续成立。
+# 版本下界取 lark-oapi 首个提供稳定 ws 客户端的版本线。
+feishu = ["lark-oapi>=1.2.0"]
+
+[project.scripts]
+freeagent = "freeagent.cli.app:main"
+freeagent-feishu = "freeagent.feishu.bridge:main"
+freeagent-feishu-doctor = "freeagent.feishu.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+filterwarnings = ["error"]

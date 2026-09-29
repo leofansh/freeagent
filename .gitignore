@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 本地数据（原型默认落在仓库根，测试用 tmpdir）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# agent 工具状态与调试产物。
+# .omo/ 是会话续跑状态（只有 sessionID 与时间戳，对项目没有价值）；
+# .playwright-mcp/ 是页面 DOM 快照与浏览器控制台日志，可能含浏览过的页面内容。
+.omo/
+.playwright-mcp/
+.codegraph/
+
+# 运行时日志（_bridge.log、data/web.log）
+*.log
+
+# 批处理变量未展开时留下的字面量目录（FreeAgentProvider 的已知环境隐患）
+%FREEAGENT_HOME%/
