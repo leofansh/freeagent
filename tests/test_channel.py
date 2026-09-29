@@ -203,9 +203,10 @@ class TestDelegationThroughChannel:
 class TestRemindersAreNotSwallowed:
     """**核心回归**。
 
-    ``reminders.check()`` 是消费型的：写 ``REMINDER_FIRED`` 记录且不重发。
-    若通道沿用终端的 ``handle()``，一条「今天该做什么」就能把到期提醒
-    吞进不相干的回复里，用户**再也收不到**。所以必须走 ``check_reminders=False``。
+    ``reminders.due()`` 是**纯查询**，不落去重令牌 —— 所以一条普通消息
+    不会再把提醒**消费掉**。但沿用终端的 ``handle()`` 仍会把到期提醒
+    **渲染进不相干的回复里**：用户问「今天该做什么」却收到一坨提醒，答非所问。
+    提醒必须由 :meth:`ChannelService.due_reminders` 按节奏单独推。
     """
 
     def _due_task(self, app):

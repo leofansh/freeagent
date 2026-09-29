@@ -145,6 +145,76 @@ def test_doc_declares_record_window(doc_text: str):
     assert str(domain.REMINDER_FIRED_WINDOW) in doc_text
 
 
+# ------------------------------------------------- 提醒的取 / 确认分离（9.2）
+def test_doc_declares_two_phase_reminder_api(doc_text: str):
+    """9.2 把 ``due()`` / ``acknowledge()`` 写成规范性 API，文档必须有。
+
+    这两个名字是**契约**：三条渠道的确认点全靠它们分工。文档写了而实现改名，
+    或者实现改了而文档没改，调用方就会各自去猜「什么时候算送达」——
+    而这个 bug 的表现形式是提醒静默消失，用户不会知道是哪里错了。
+    """
+    section = doc_text.split("### 9.2")[1].split("### 9.3")[0]
+    # 按文档里的记法匹配：``ReminderEngine.due()`` / ``acknowledge(digest)``
+    for name in ("ReminderEngine.due()", "acknowledge("):
+        assert name in section, f"9.2 未声明 {name}"
+
+
+def test_reminder_engine_has_no_consuming_check():
+    """**不得**存在「取走即消费」的入口。
+
+    曾经有一个 ``check()`` 同时查和落去重令牌，于是三条渠道全部踩坑：
+    推送失败时提醒被永久标记成已送达。留着这个方法等于给回归留后门，
+    所以这里断言它**不存在**，而不只是断言新方法可用。
+    """
+    assert not hasattr(services.reminders.ReminderEngine, "check"), (
+        "消费型的 check() 已删除；新代码必须走 due() + acknowledge()"
+    )
+    assert hasattr(services.reminders.ReminderEngine, "due")
+    assert hasattr(services.reminders.ReminderEngine, "acknowledge")
+
+
+def test_no_module_still_calls_the_old_consuming_api():
+    """用 AST 搜一遍：没有任何地方还在**调用**已删除的 ``check()``。
+
+    刻意用 ``ast`` 而不是文本 grep —— 文档字符串与注释里会合法地提到
+    「以前有个 check() 是消费型的」，那是**历史叙述**，不是调用。
+    文本 grep 分不清这两者，断言就会变成噪音，然后被人加白名单绕过。
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for path in sorted(root.glob("src/**/*.py")) + sorted(root.glob("tests/**/*.py")):
+        # utf-8-sig：部分源文件带 BOM（app.py 就有），ast.parse 不接受 U+FEFF。
+        # Python 的 import 机制会剥掉它，所以只有手写解析时才必须显式处理。
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "check":
+                src = ast.unparse(node)
+                # 只认真的调用：``reminders.check()`` / ``self.app.reminders.check()``
+                if "reminders" in src:
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno}: {src}")
+    assert not offenders, "还在调用已删除的消费型 check():\n" + "\n".join(offenders)
+
+
+def test_每条渠道都在送达之后才确认(doc_text: str):
+    """三条渠道的确认点必须写在 9.2 里，且都在「送」之后。
+
+    这是防回归的文档侧锚点：某天有人把确认挪到发送之前（比如「简化一下」），
+    文档就变成过期契约，而代码测试未必抓得到 —— 因为三条渠道各自的
+    失败路径不同。
+    """
+    section = doc_text.split("### 9.2")[1].split("### 9.3")[0]
+    # 确认点分列在三个渠道名下
+    for channel in ("终端", "飞书", "Web"):
+        assert channel in section, f"9.2 未说明 {channel} 渠道的确认点"
+    # 明确写了「不承诺恰好一次」
+    assert "不承诺恰好一次" in section, "9.2 必须写明不承诺恰好一次及其理由"
+
+
 def test_doc_declares_feishu_normative_parameters(doc_text: str):
     """飞书通道的规范性参数必须在文档里，且和代码一致。
 
