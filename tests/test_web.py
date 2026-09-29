@@ -533,8 +533,9 @@ class TestSettings:
         设置页的 API Key 框就是它。之前两条规则只写了 ``input[type=text]``：
         基础外观（边框/内边距/字号）和 ``form.set .field`` 下的 ``width:100%``
         都没它，于是那个框又窄又没统一外观，占位符被截成
-        「填了会写进 C:\\Users\\fanli\\Ap」—— 而那正是用户最需要看清的一句
-        （它要说清 Key 会写到哪个文件）。
+        「填了会写进 ~\\.free…」—— 而那正是用户最需要看清的一句
+        （它要说清 Key 会写到哪个文件）。真值见 ``paths.py``：
+        默认 ``~/.freeagent/llm.env``，可由 ``FREEAGENT_HOME`` 改。
         """
         from freeagent.web.style import STYLE_CSS
 
