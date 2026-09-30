@@ -28,6 +28,56 @@ def _store(path, **kw):
     return SeenEventStore(path, **kw)
 
 
+class TestOverCapLeavesEvidence:
+    """读入时超量被裁**必须留证据**。
+
+    「文件损坏」会 quarantine 并写 ``last_error``，而「超量被裁」原先一声不吭
+    —— 同一类「内容没按预期读到」，一个记一个不记。后果是表被裁过的用户
+    完全无从知道，症状是「去重时灵时不灵」，而那正是 11.9.2 当初要防的事。
+    """
+
+    def _over_cap_file(self, tmp_path, count):
+        p = tmp_path / CACHE_FILE_NAME
+        p.write_text(
+            json.dumps({"seen": {f"e{i}": 1000.0 + i for i in range(count)}}),
+            encoding="utf-8",
+        )
+        return p
+
+    def test_loading_over_cap_file_records_last_error(self, tmp_path):
+        p = self._over_cap_file(tmp_path, 12)
+        store = SeenEventStore(p, max_entries=10, now=lambda: 5000.0)
+        assert store.last_error, "超量被裁必须留痕迹"
+        assert "超出上限" in store.last_error
+        assert "2" in store.last_error, "应说清丢了几条"
+
+    def test_loading_within_cap_records_no_error(self, tmp_path):
+        p = self._over_cap_file(tmp_path, 4)
+        store = SeenEventStore(p, max_entries=10, now=lambda: 5000.0)
+        assert store.last_error == "", "没超量就不该报错"
+        assert len(store) == 4
+
+    def test_trim_returns_dropped_count(self, tmp_path):
+        store = SeenEventStore(tmp_path / CACHE_FILE_NAME, now=lambda: 0.0)
+        for i in range(5):
+            store.is_duplicate(f"e{i}")
+        assert store._trim() == 0, "没超量时返回 0"
+        store.max_entries = 3
+        assert store._trim() == 2, "超量时返回丢弃条数"
+
+    def test_runtime_trim_does_not_set_error(self, tmp_path):
+        """运行期裁剪是正常兜底，**不**当成异常。
+
+        上限被撞到只说明「有人在灌垃圾」，而灌垃圾这件事本身是正常的
+        防御路径 —— 每次都报警反而会让 ``last_error`` 变成噪声。
+        """
+        store = SeenEventStore(tmp_path / CACHE_FILE_NAME, max_entries=3, now=lambda: 0.0)
+        for i in range(6):
+            store.is_duplicate(f"e{i}")
+        assert len(store) == 3
+        assert store.last_error == "", "运行期裁剪不该写 last_error"
+
+
 class TestPath:
     def test_default_path_is_under_given_home(self, tmp_path):
         assert default_path(tmp_path) == tmp_path / CACHE_FILE_NAME

@@ -327,7 +327,12 @@ def test_user_docs_mention_the_new_switches():
 
 # --------------------------------------------------------------------- 结构
 def test_doc_code_structure_matches_reality(doc_text: str):
-    """文档 12.2 节列出的模块必须真的存在，且都在结构树里出现过。"""
+    """文档 12.2 节列出的模块必须真的存在，且都在结构树里出现过。
+
+    **双向**：既查「文档列的存在」，也查「存在的被列了」。只有前向那半边时，
+    文档漏掉新文件是查不出来的 —— 而 12.2 是实现契约，漏列就等于那份契约
+    少了一条，而读者无从发现。
+    """
     root = Path(__file__).resolve().parents[1] / "src" / "freeagent"
     tree_region = doc_text.split("### 12.2")[1].split("### 12.3")[0]
     for module in (
@@ -354,6 +359,21 @@ def test_doc_code_structure_matches_reality(doc_text: str):
         if package:
             leaf = package.split("/")[-1]
             assert f"{leaf}/" in tree_region, f"目录 {leaf}/ 未在文档结构树中出现"
+
+    # ---- 反向：实际存在的模块必须被文档列出 ---------------------------- #
+    # ``__init__.py`` 跳过：它们是包标记，列出会让 12.2 凭空多出十几行噪音，
+    # 而漏列一个 ``__init__`` 不构成契约缺失。
+    unlisted: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        rel = path.relative_to(root).as_posix()
+        if path.name not in tree_region:
+            unlisted.append(rel)
+    assert not unlisted, (
+        "这些模块存在但没写进 12.2 结构树，12.2 是实现契约，漏列即契约缺失：\n"
+        + "\n".join(f"  {u}" for u in unlisted)
+    )
 
 
 def test_doc_declares_tech_stack(doc_text: str):

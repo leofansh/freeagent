@@ -122,19 +122,22 @@ class SeenEventStore:
         for key in stale:
             del self._seen[key]
 
-    def _trim(self) -> None:
-        """超量时**删最旧的**。
+    def _trim(self) -> int:
+        """超量时**删最旧的**，返回丢了几条。
 
         踩过的坑：原先写的是 ``key=self._seen.get``。运行时没毛病（键必然
         存在，``get`` 返回 ``float``），但 ``dict.get`` 有一堆重载，类型检查
         匹配不出唯一签名。改成显式下标，顺带把「按时间升序」写明白。
+
+        **返回丢弃条数**，是为了让 :meth:`_load` 能留证据。
         """
         overflow = len(self._seen) - self.max_entries
         if overflow <= 0:
-            return
+            return 0
         oldest = sorted(self._seen, key=lambda k: self._seen[k])
         for key in oldest[:overflow]:
             del self._seen[key]
+        return overflow
 
     # -- 落盘 ---------------------------------------------------------------- #
     def _load(self) -> None:
@@ -167,7 +170,18 @@ class SeenEventStore:
             if isinstance(key, str) and isinstance(stamp, (int, float)):
                 self._seen[key] = float(stamp)
         self._evict(now)                  # 读进来就先按 TTL 剪一次
-        self._trim()
+        dropped = self._trim()
+        if dropped:
+            # 留证据。**超量被裁与文件损坏同属「内容没按预期读到」** ——
+            # 损坏会 quarantine 并写 last_error，裁剪原先却一声不吭。
+            # 两者不一致的后果是：表被裁过的用户完全无从知道，症状是
+            # 「去重时灵时不灵」，与 11.9.2 当初要防的正是同一件事。
+            # 上限本身只为兜底灌垃圾，正常的量远小于它，所以裁掉不影响
+            # 正确性 —— 但「不影响」不等于「不用讲」。
+            self.last_error = (
+                f"{self.path.name} 里有 {dropped} 条超出上限 {self.max_entries}，"
+                "已裁掉最旧的（上限只为兜底灌垃圾，正常量远小于它）"
+            )
 
     def _quarantine(self) -> None:
         try:
