@@ -59,6 +59,12 @@ from .services.delegate import (
     eligible_tasks,
     parse_opencode_output,
 )
+from .services.executors import (
+    V2_FIELD_RENAMES,
+    adapter_for,
+    dispatchable_majors,
+    known_majors,
+)
 from .services.localops import CardSender
 from .services.opencode_server import (
     OpenCodeServer,
@@ -70,7 +76,8 @@ from .services.opencode_server import (
 __all__ = ["Runner", "subprocess_runner", "run_once", "main",
            "ApprovalGate", "Gate", "run_with_tool_gate",
            "ToolCardSender", "ServerFactory",
-           "SUPPORTED_OPENCODE_MAJOR", "parse_major_version",
+           "SUPPORTED_OPENCODE_MAJOR", "KNOWN_OPENCODE_MAJORS",
+           "parse_major_version",
            "detect_opencode_version", "version_mismatch_reason"]
 
 #: 回推飞书失败之类的问题走日志，不走 stdout —— stdout 是给用户看的报告，
@@ -108,7 +115,7 @@ def resolve_command(command: str) -> str:
     return shutil.which(command) or command
 
 
-#: 本仓实测并据以接线的 opencode **主版本**。
+#: 本仓**可派发**的 opencode 主版本 —— 由注册表推导，不硬编码。
 #:
 #: V1 与 V2 的 permission 模型字段名完全不同（``permission`` 对象 /
 #: ``bash`` / ``task`` vs ``permissions`` 数组 / ``shell`` / ``subagent``），
@@ -116,9 +123,21 @@ def resolve_command(command: str) -> str:
 #: **升到 V2 后旧字段会被静默忽略 —— 不报错，但闸门随之失效，
 #: 失效方向恰好是最危险的那侧**（默认回到 allow）。
 #:
-#: 所以这里朝**关**开：不认识的版本直接拒绝派发，而不是警告后照跑。
-#: 判定见 :func:`parse_major_version`。
-SUPPORTED_OPENCODE_MAJOR = 1
+#: 所以这里朝**关**开：只放行注册表里 ``verified=True`` 的适配器，
+#: 而不是警告后照跑。V2 的适配器**存在但未验证**（数组元素形状官方未给出
+# 可据以接线的定义），所以它拿不到这个值 —— 也就是说**本次改动不改变
+# 任何运行时行为**，只是把「支持哪个版本」从常量变成注册表的一个查询。
+#:
+#: 判定见 :func:`parse_major_version` 与 :func:`version_mismatch_reason`。
+#:
+#: 用「取第一个」而不是「取全部」是刻意的：一旦某天 V2 也验证过了，
+#: 这里会变成 2，而闸门仍然只放行 1 —— 那时要**显式**改这一行，
+#: 而不是让「多了一个已验证适配器」自动改变闸门行为。
+SUPPORTED_OPENCODE_MAJOR: int = next(iter(dispatchable_majors("opencode")), 1)
+
+#: 本仓**知道**的主版本（不是可派发的）。用于给「不认识的版本」与
+#: 「知道但没验证」两种拒绝各一句**不同且能照着做**的话。
+KNOWN_OPENCODE_MAJORS: tuple[int, ...] = known_majors("opencode")
 
 
 def parse_major_version(text: str) -> int | None:
@@ -163,21 +182,44 @@ def version_mismatch_reason(
 
     探不到版本（``None``）与版本不对同等对待 —— 两者都意味着
     「我们不知道自己在跟什么东西说话」，按设计文档的默认朝关开。
+
+    三种拒绝各给**不同**的话，因为该做的事不同：
+
+    - **不认识的版本** → 只能升级本仓（或降级执行器）
+    - **认识但未验证**（V2） → 先对着真实实例验完适配器
+    - **就是期望版本** → 放行
     """
     if detected is None:
         return (
             f"探不到 opencode 版本（期望主版本 {expected}）。"
             "可能没装，或 `opencode --version` 输出变了格式。"
         )
-    if detected != expected:
+    if detected == expected:
+        return None
+
+    adapter = adapter_for(detected, "opencode")
+    if adapter is None:
         return (
-            f"opencode 主版本是 {detected}，本仓只按 V{expected} 接缝实现"
-            f"（见设计文档 11.8.1 的版本陷阱表）。"
-            "V1→V2 的 permission 字段名全变，旧配置会被**静默忽略**，"
-            "闸门随之失效——所以这里拒绝派发，而不是照跑。"
-            "要接 V2 需先重读官方文档并改写 11.8.1。"
+            f"opencode 主版本是 {detected}，本仓**不认识**它"
+            f"（已知的只有 {list(KNOWN_OPENCODE_MAJORS)}，见设计文档 11.8.1 "
+            "的版本陷阱表）。"
+            "本仓拒绝派发而不是照跑 —— 未知版本的 permission 字段名会被"
+            "**静默忽略**，闸门随之失效，且失效方向是回到 allow。"
+            "请升级本仓，或把执行器降回已知版本。"
         )
-    return None
+    # 认识但 verified=False —— 这就是 V2 当前的状态
+    return (
+        f"opencode 主版本是 {detected}，本仓**认识**它但**未验证**接线"
+        f"（见设计文档 11.8.1 的版本陷阱表）。"
+        "本仓拒绝派发而不是照跑 —— V1→V2 的 permission 字段名全变，"
+        "旧配置会被**静默忽略**，闸门随之失效，且失效方向是回到 allow。\n"
+        f"已知改名：{V2_FIELD_RENAMES}。\n"
+        "未确认的是 `permissions` **数组元素的形状** —— 官方文档未给出"
+        "可据以接线的定义，猜一个『看起来很像对的』形状比拒绝更危险。\n"
+        "要接 V2：对着一个真实 V2 实例实测，改 "
+        "`freeagent/services/executors.py` 里那三个 `_v2_unverified`，"
+        "把 `verified` 改成 True，并同步设计文档 11.8.1。"
+    )
 
 
 def subprocess_runner(

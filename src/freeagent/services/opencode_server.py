@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import dataclasses
 import json
 import os
 import pathlib
@@ -38,6 +37,12 @@ import urllib.request
 import uuid
 from typing import Any, Iterator
 
+from .executors import (
+    ExecutorAdapter,
+    ToolPermission,
+    adapter_for,
+)
+
 __all__ = [
     "ToolPermission",
     "ServerError",
@@ -48,48 +53,65 @@ __all__ = [
     "reply_payload",
     "OpenCodeServer",
     "free_port",
+    "current_adapter",
+    "set_current_adapter",
 ]
+
+
+# ── 执行器接缝 ────────────────────────────────────────────────────────── #
+#
+# 下面三个函数曾经**直接硬编码** opencode V1 的字段名与载荷形状。那意味着
+# 协议变更要改三处，而漏掉一处的后果不是「跑不起来」，是**闸门静默失效**
+# （旧字段被忽略，权限回到默认 allow）—— 失效方向恰好是最危险的那侧。
+#
+# 现在它们是对 :mod:`freeagent.services.executors` 里那个**带版本号的适配器**
+# 的委托。V1 的字段名、事件形状、答复载荷全都住在适配器里，协议变更收敛到
+# 一个文件。
+#
+# 这三个名字**保留**：delegate.py 与 tests 都从这里导入它们。适配器换版本时
+# 调用方不需要改。
+
+#: 当前使用的适配器。**默认 V1** —— 本仓实测并据以接线的那个版本。
+#:
+#: 刻意做成模块级可替换而不是每次构造传参：委派是**独立进程**里跑的短命
+#: 流程，没有多处需要注入；而测试要能换掉它来验证 V2 不会被误用。
+_CURRENT_ADAPTER = adapter_for(1)
+assert _CURRENT_ADAPTER is not None, "V1 适配器必须存在"
+
+
+def current_adapter() -> ExecutorAdapter:
+    """当前适配器。带断言，因为「取不到」意味着注册表被改坏了。"""
+    assert _CURRENT_ADAPTER is not None
+    return _CURRENT_ADAPTER
+
+
+def set_current_adapter(adapter: ExecutorAdapter | None) -> None:
+    """换掉当前适配器。**只给测试用** —— 换完记得换回来。
+
+    存在的理由：V2 适配器是 :class:`~freeagent.services.executors.UnverifiedExecutorError`
+    的来源，必须能验证「用它会响」而不是「没人调用它所以看起来没事」。
+    """
+    global _CURRENT_ADAPTER
+    if adapter is None:
+        adapter = adapter_for(1)
+        assert adapter is not None
+    _CURRENT_ADAPTER = adapter
 
 
 # ── 纯函数（可测，无 IO）─────────────────────────────────────────────── #
 
 def delegation_permission_config() -> dict[str, Any]:
-    """委派用的 permission 配置（**V1 字段名**）。
+    """当前适配器的 permission 配置。
 
-    ⚠️ **键序有意义**：V1 是 ``last matching rule wins``，所以通配 ``*``
-    必须**放最前**，具体规则放后面。deny 放最后才不会被 ``*: allow`` 覆盖。
-    （Python 的 ``dict`` 保序，``json.dumps`` 也保序，所以这个形状能原样落盘。）
+    字段名、键序、每条规则**为什么**这么设，全部在
+    :func:`freeagent.services.executors._v1_permission_config` 里 ——
+    那是执行器特有的知识，**只该有一个地方有**。
 
-    逐条的理由：
-
-    - ``*: allow`` —— 底子。``read``/``grep``/``glob`` 是干活必需的，
-      全设 ask 会让 agent 一直问、卡片刷屏，**问到最后就是无脑点**。
-    - ``edit: ask`` —— 改文件。这是执行期闸门**真正要拦的东西**。
-    - ``bash: ask`` —— 跑命令。与 edit 同级；官方 V1 文档明说 shell
-      带宿主机的文件/进程/网络权限。
-    - ``webfetch`` / ``websearch: ask`` —— 出网。委派的需求通常不需要，
-      需要时再放。
-    - ``task: deny`` —— 不让 agent 拉子代理。与 FreeAgent 的分层一致
-      （「派什么由代码决定，不由模型决定」），也与本机既有配置一致。
-    - ``external_directory: deny`` —— **永不越界**。这是 11.8 第 1 道闸门在
-      opencode 侧的落点；FreeAgent 侧只拒相对路径，两侧都拒才算闸门。
-
-    为什么不给 ``bash`` 配窄白名单：官方文档明说目录推断是 best effort，
-    **不要试图用规则枚举所有危险命令**。所以这里走「全 ask + 人判断」，
-    靠闸门而不是靠正则。
+    为什么这里保留一个转发函数：`delegate.py` 与 tests 都从本模块导入它，
+    而适配器版本是会变的（见 :func:`set_current_adapter`）。转发让调用方
+    不必知道适配器存在。
     """
-    return {
-        "$schema": "https://opencode.ai/config.json",
-        "permission": {
-            "*": "allow",
-            "edit": "ask",
-            "bash": "ask",
-            "webfetch": "ask",
-            "websearch": "ask",
-            "task": "deny",
-            "external_directory": "deny",
-        },
-    }
+    return current_adapter().build_permission_config()
 
 
 def build_isolated_config(config: dict[str, Any] | None = None) -> str:
@@ -100,60 +122,17 @@ def build_isolated_config(config: dict[str, Any] | None = None) -> str:
     )
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class ToolPermission:
-    """一次「opencode 想动手」的请求（实测载荷的形状）。
-
-    刻意**只保留渲染卡片真正需要的字段**，其余原样丢掉：载荷里还有
-    ``tool.messageID`` / ``callID`` 之类，它们是 opencode 的内部坐标，
-    留着容易让人误以为该拿它们做点什么。
-    """
-
-    request_id: str
-    permission: str
-    paths: tuple[str, ...] = ()
-    diff: str | None = None
-    suggested_always: tuple[str, ...] = ()
-
-    @property
-    def summary(self) -> str:
-        """一行摘要，给日志用。"""
-        where = self.paths[0] if self.paths else "(无路径)"
-        return f"{self.permission} → {where}"
-
-
 def permission_from_event(properties: Any) -> ToolPermission | None:
-    """从 ``permission.asked`` 事件的 properties 里取出请求。
+    """当前适配器对 ``permission.asked`` 事件的解析。
 
     **返回 ``None`` 表示这不是一条可回应的请求**（缺 id 或缺动作名），
     绝不用空字符串凑一个 —— 那会让上层把「无法回应」当成「已拒绝」，
     两种错误的处理方式完全不同。
+
+    载荷形状随版本而变，所以形状住在适配器里（归一化后的
+    :class:`~freeagent.services.executors.ToolPermission` 才是调用方要的东西）。
     """
-    if not isinstance(properties, dict):
-        return None
-    rid = properties.get("id")
-    perm = properties.get("permission")
-    if not isinstance(rid, str) or not rid:
-        return None
-    if not isinstance(perm, str) or not perm:
-        return None
-    meta = properties.get("metadata")
-    meta = meta if isinstance(meta, dict) else {}
-    raw_paths = properties.get("patterns")
-    paths = tuple(p for p in raw_paths if isinstance(p, str)) \
-        if isinstance(raw_paths, list) else ()
-    filepath = meta.get("filepath")
-    if isinstance(filepath, str) and filepath and filepath not in paths:
-        paths = paths + (filepath,)
-    diff = meta.get("diff")
-    raw_always = properties.get("always")
-    always = tuple(a for a in raw_always if isinstance(a, str)) \
-        if isinstance(raw_always, list) else ()
-    return ToolPermission(
-        request_id=rid, permission=perm, paths=paths,
-        diff=diff if isinstance(diff, str) and diff else None,
-        suggested_always=always,
-    )
+    return current_adapter().parse_request(properties)
 
 
 def parse_sse_event(line: str) -> tuple[str, Any] | None:
@@ -179,19 +158,16 @@ def parse_sse_event(line: str) -> tuple[str, Any] | None:
 
 
 def reply_payload(decision: str) -> dict[str, str]:
-    """把本地结论翻成 opencode 的 ``reply`` 载荷。
+    """把本地结论翻成**当前适配器**的答复载荷。
 
-    ⚠️ **必须带 ``reply`` 键**（实测：裸字符串 → ``400 Expected object``；
-    ``{"action": ...}`` → ``400 Missing key ["reply"]``）。
+    载荷形状随版本而变（V1 是 ``{"reply": "once"}``，且实测裸字符串会被拒
+    —— ``400 Expected object``），所以形状住在适配器里。
 
-    映射：本地 ``allow`` → opencode ``once``。
-    **刻意不映射到 ``always``** —— V1 的 ``always`` 是会话级授权，
-    而本项目明确不做永久授权（设计文档 11.9.7）；而且每次都问一次
+    映射：本地 ``allow`` → 执行器的「这一次」。**刻意不映射到「永久授权」**
+    —— 那与本项目明确不做永久授权冲突（设计文档 11.9.7）；而且每次都问一次
     本来就是这个闸门的意义。
     """
-    if decision not in ("allow", "deny"):
-        raise ValueError(f"未知结论：{decision!r}")
-    return {"reply": "once" if decision == "allow" else "reject"}
+    return current_adapter().build_reply(decision)
 
 
 class ServerError(RuntimeError):
