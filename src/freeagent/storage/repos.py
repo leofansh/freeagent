@@ -21,6 +21,7 @@ from ..domain import (
     NotFoundError,
     RecordType,
     Role,
+    StaleRevisionError,
     Task,
     TaskKind,
     TaskRecord,
@@ -50,6 +51,7 @@ _TASK_COLUMNS = (
     "scheduled_for",
     "due_time",
     "reminder_time",
+    "reminder_rule",
     "waiting_on",
     "entered_at",
     "created_at",
@@ -331,15 +333,40 @@ class TaskRepo(_RepoBase):
         return _replace(task, role_ids=role_ids)
 
     def update(self, task: Task, now: datetime) -> Task:
-        updated = _replace(task, updated_at=now)
-        role_ids = _dedup(updated.role_ids)
+        """写入，并把 ``revision`` 自增一。
+
+        **乐观并发**：``task.revision`` 必须是**读出来那一刻**的值。
+        库里当前值与之不符说明中间有人改过 —— 抛
+        :class:`~freeagent.domain.errors.StaleRevisionError`，**不覆盖**。
+
+        现有服务方法全是「``get()`` → ``_replace()`` → ``update()``」，
+        ``get()`` 读到的就是当前 revision，所以它们全都照常工作；
+        冲突只在真的有并发写入时触发。覆盖是最后手段 ——
+        提醒改期与委派状态都是「读-改-写」，静默覆盖会把对方的改动吃掉，
+        而症状是「我明明改过了，怎么又变回去了」。
+        """
+        role_ids = _dedup(task.role_ids)
         if not role_ids:
             raise InvariantViolation("事务至少属于一个角色")
         assignments = ", ".join(f"{col}=?" for col in _TASK_COLUMNS)
         with self._tx():
+            row = self._conn.execute(
+                "SELECT revision FROM tasks WHERE id=?", (task.id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("事务", task.id)
+            current_revision = int(row[0])
+            if current_revision != task.revision:
+                raise StaleRevisionError(
+                    "事务", task.id, task.revision, current_revision
+                )
+            next_revision = current_revision + 1
+            updated = _replace(
+                task, updated_at=now, revision=next_revision, role_ids=role_ids
+            )
             cursor = self._conn.execute(
-                f"UPDATE tasks SET {assignments} WHERE id=?",
-                (*self._task_field_params(updated), updated.id),
+                f"UPDATE tasks SET {assignments}, revision=? WHERE id=?",
+                (*self._task_field_params(updated), next_revision, updated.id),
             )
             if cursor.rowcount == 0:
                 raise NotFoundError("事务", updated.id)
@@ -355,7 +382,7 @@ class TaskRepo(_RepoBase):
         try:
             with self._tx():
                 cursor = self._conn.execute(
-                    "UPDATE tasks SET updated_at=? WHERE id=?",
+                    "UPDATE tasks SET updated_at=?, revision=revision+1 WHERE id=?",
                     (now.isoformat(), task_id),
                 )
                 if cursor.rowcount == 0:
@@ -376,8 +403,8 @@ class TaskRepo(_RepoBase):
     ) -> Task:
         with self._tx():
             cursor = self._conn.execute(
-                "UPDATE tasks SET state=?, completed_at=?, dropped_at=?, updated_at=?"
-                " WHERE id=?",
+                "UPDATE tasks SET state=?, completed_at=?, dropped_at=?, updated_at=?,"
+                " revision=revision+1 WHERE id=?",
                 (
                     state.value,
                     _dt_out(completed_at),
@@ -393,7 +420,8 @@ class TaskRepo(_RepoBase):
     def set_schedule(self, task_id: str, scheduled_for: date | None, now: datetime) -> Task:
         with self._tx():
             cursor = self._conn.execute(
-                "UPDATE tasks SET scheduled_for=?, updated_at=? WHERE id=?",
+                "UPDATE tasks SET scheduled_for=?, updated_at=?,"
+                " revision=revision+1 WHERE id=?",
                 (_d_out(scheduled_for), now.isoformat(), task_id),
             )
         if cursor.rowcount == 0:
@@ -414,9 +442,14 @@ class TaskRepo(_RepoBase):
     def set_progress_note(self, task_id: str, note: str | None) -> Task:
         """写入派生缓存 ``progress_note``。
 
-        **刻意不更新 ``updated_at``。** 写派生缓存不是用户活动 ——
-        若在这里更新时间戳，每次重建进度摘要都会被当成「刚刚动过」，
-        ``RESUME_STALE`` 信号就永远不会触发了。
+        **刻意不更新 ``updated_at``，也不推进 ``revision``。**
+        写派生缓存不是用户活动 —— 若在这里更新时间戳，每次重建进度摘要都会
+        被当成「刚刚动过」，``RESUME_STALE`` 信号就永远不会触发了。
+
+        不推进 ``revision`` 是同一个道理的第二面：``revision`` 回答的是
+        「这条事务的状态被**人**改过吗」，而缓存是从日志重算出来的。
+        跟着它一起 bump 的话，两人各记一笔笔记（``note()`` 会顺带重建缓存）
+        就会互相冲突 —— 而那没有任何不变量被破坏，只是缓存重算了两遍。
         """
         with self._tx():
             cursor = self._conn.execute(
@@ -429,7 +462,8 @@ class TaskRepo(_RepoBase):
     def set_current_artifact(self, task_id: str, artifact_id: str | None, now: datetime) -> Task:
         with self._tx():
             cursor = self._conn.execute(
-                "UPDATE tasks SET current_artifact_id=?, updated_at=? WHERE id=?",
+                "UPDATE tasks SET current_artifact_id=?, updated_at=?,"
+                " revision=revision+1 WHERE id=?",
                 (artifact_id, now.isoformat(), task_id),
             )
         if cursor.rowcount == 0:
@@ -439,7 +473,8 @@ class TaskRepo(_RepoBase):
     def touch_resumed(self, task_id: str, now: datetime) -> Task:
         with self._tx():
             cursor = self._conn.execute(
-                "UPDATE tasks SET last_resumed_at=?, updated_at=? WHERE id=?",
+                "UPDATE tasks SET last_resumed_at=?, updated_at=?,"
+                " revision=revision+1 WHERE id=?",
                 (now.isoformat(), now.isoformat(), task_id),
             )
         if cursor.rowcount == 0:
@@ -609,6 +644,8 @@ class TaskRepo(_RepoBase):
             scheduled_for=_d_in(row["scheduled_for"]),
             due_time=_dt_in(row["due_time"]),
             reminder_time=_dt_in(row["reminder_time"]),
+            reminder_rule=row["reminder_rule"],
+            revision=row["revision"],
             waiting_on=_waiting_in(row["waiting_on"]),
             blocked_by=self.get_dependencies(row["id"]),
             entered_at=datetime.fromisoformat(row["entered_at"]),
@@ -638,6 +675,7 @@ class TaskRepo(_RepoBase):
             _d_out(task.scheduled_for),
             _dt_out(task.due_time),
             _dt_out(task.reminder_time),
+            task.reminder_rule,
             _waiting_out(task.waiting_on),
             task.entered_at.isoformat(),
             task.created_at.isoformat(),

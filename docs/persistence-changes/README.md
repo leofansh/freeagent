@@ -27,8 +27,10 @@
 | 3 | `tasks.delegate_chat_id` | 委派跑完要把结果推回**发起那个飞书会话** | `_MIGRATIONS[1]` |
 | 4 | 新表 `pending_approvals` | 逐次授权的等待与答复**必须落盘** | `_MIGRATIONS[2]` |
 | 5 | `pending_approvals.requested_by` | 「只有发起人能批」此前只写在文档里、**代码没实现** | `_MIGRATIONS[3]` |
+| 6 | `tasks.reminder_rule` | 重复提醒需要**显式时区 + 墙钟时间**；没有它「每天八点」会随夏令时漂 | `_MIGRATIONS[4]` |
+| 7 | `tasks.revision` | 读-改-写要能发现「我读到的已经不是最新的」；`updated_at` 是时间戳，同一秒内分不出先后 | `_MIGRATIONS[5]` |
 
-`SCHEMA_VERSION = 5`（`storage/db.py`）。
+`SCHEMA_VERSION = 7`（`storage/db.py`）。
 
 ## 存储约定
 

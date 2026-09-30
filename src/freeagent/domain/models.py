@@ -117,6 +117,23 @@ class Task:
     scheduled_for: date | None = None
     due_time: datetime | None = None
     reminder_time: datetime | None = None
+    #: 重复提醒的**生成器**（原始 JSON 文本），空 = 一次性提醒。
+    #:
+    #: 刻意存**文本**而不是 ``RecurrenceRule`` 对象：那个类型的
+    #: ``next_after()`` 要用 ``zoneinfo``（读 tzdata）且含业务判断，
+    #: 而 domain 层纪律是「零 I/O、零业务判断」。解释留给
+    #: :mod:`freeagent.services.recurrence`。
+    #:
+    #: 分工：``reminder_time`` 始终是**下一次触发的瞬时**（指针），
+    #: 本字段是产生它的规则。确认送达后引擎问规则要下一个，写回指针 ——
+    #: 于是到期查询、合并摘要、错过窗口全都不需要知道规则存在。
+    reminder_rule: str | None = None
+    #: 每次写入自增。**乐观并发**用：读到的 revision 与写入时不一致，
+    #: 说明中间有人改过 —— 这时该拒绝而不是覆盖。
+    #:
+    #: 为什么不用 ``updated_at``：它是时间戳，同一秒内的两次写入分不出先后。
+    #: 并发控制要的是**单调计数**，不是「什么时候改的」。
+    revision: int = 0
     waiting_on: WaitingOn | None = None
     blocked_by: tuple[str, ...] = ()
     completed_at: datetime | None = None

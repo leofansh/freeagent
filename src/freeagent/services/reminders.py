@@ -17,12 +17,14 @@ V1 的诚实边界（设计文档 9.2）：**系统不运行时不会通知**。
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from ..domain import RecordType, Task
+from ..domain import NotFoundError, RecordType, Task
 from ..storage.repos import RecordRepo, TaskRepo
 from .clock import Clock
+from .recurrence import RecurrenceError, parse_rule
 
 __all__ = ["ReminderEngine", "ReminderDigest", "ReminderEntry", "MISSED_AFTER"]
 
@@ -78,6 +80,11 @@ class ReminderEngine:
         self._tasks = tasks
         self._records = records
         self._clock = clock
+        #: 最近一次「重复规则坏了 / 算不出下一次」的原因，空串 = 没问题。
+        #: 由调用方（doctor / 启动日志）决定要不要告诉用户 ——
+        #: 引擎自己不打印，理由同 :class:`~freeagent.secrets.SecretStr`：
+        #: 错误信息会进日志，而这条里带着事务 id 与规则原文。
+        self.last_rule_error: str = ""
 
     @staticmethod
     def _token(reminder_time: datetime) -> str:
@@ -121,13 +128,23 @@ class ReminderEngine:
         return ReminderDigest(fired=tuple(fired), missed=tuple(missed))
 
     def acknowledge(self, digest: ReminderDigest) -> None:
-        """确认送达，落去重令牌。**必须在推送成功之后调用。**
+        """确认送达，落去重令牌，并**推进重复提醒到下一次**。
 
         送达失败时就**不要**调用 —— 令牌不落库，那条提醒下一轮还会出现。
 
         刻意**不承诺恰好一次**：这个设计允许同一条提醒被送达两次。
         个人事务助手的代价函数里，重复提醒的代价远小于静默吞掉一条提醒，
         所以宁可重复也不静默丢弃（设计文档 9.2）。
+
+        ## 重复提醒怎么推进
+
+        一次性提醒落完令牌就完事。**带规则**的还要问规则「下一个在哪」，
+        把结果写回 ``reminder_time`` —— 那个字段始终是「下一次触发的瞬时」，
+        所以到期查询、合并摘要、错过窗口都不需要知道规则存在。
+
+        规则坏了（``parse_rule`` 抛）时**只跳过这一条的推进**，并把原因记进
+        ``last_rule_error``，不去动令牌 —— 令牌照落，因为这条**确实送达了**。
+        反过来做的话，一条坏规则会连累已经发出去的提醒被反复重发。
         """
         if digest.is_empty:
             return
@@ -139,6 +156,30 @@ class ReminderEngine:
                 self._token(entry.due_at),
                 now,
             )
+            self._advance_recurring(entry.task_id, now)
+
+    def _advance_recurring(self, task_id: str, now: datetime) -> None:
+        """把带规则的事务推到下一次触发。无规则 / 规则坏 / 事务已消失都安静跳过。"""
+        try:
+            task = self._tasks.get(task_id)
+        except NotFoundError:
+            return
+        try:
+            rule = parse_rule(task.reminder_rule)
+        except RecurrenceError as exc:
+            self.last_rule_error = f"事务 {task_id} 的重复规则坏了：{exc}"
+            return
+        if rule is None:
+            return
+        try:
+            nxt = rule.next_after(now)
+        except RecurrenceError as exc:
+            # 找不到下一个可触发时刻：规则配错了。已经把这条记成送达是
+            # **对的**（它确实到了），所以不撤销，只是不再排下一次 ——
+            # 否则它会每轮都冒出来。
+            self.last_rule_error = f"事务 {task_id} 的重复规则算不出下一次：{exc}"
+            return
+        self._tasks.update(dataclasses.replace(task, reminder_time=nxt), now)
 
     def due_count(self) -> int:
         return len(self._tasks.list_due_reminders(self._clock.now()))

@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -73,6 +73,23 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # （见 ApprovalStore.resolve），不能因为加列让旧库读不出来。
         "ALTER TABLE pending_approvals ADD COLUMN requested_by TEXT",
     ),
+    (
+        "5 → 6：tasks 加 reminder_rule（重复提醒的生成器）",
+        # reminder_time 仍然是「下一次触发的瞬时」，规则只当生成器。
+        # 存原始 JSON 文本而不是拆成结构化列，因为规则是**整体替换**的
+        # （改时间就是换一条规则），没有按字段查询的需求；而文本列让
+        # 「规则坏了」这件事由 services 层一次校验拦住，不落到 SQL。
+        "ALTER TABLE tasks ADD COLUMN reminder_rule TEXT",
+    ),
+    (
+        "6 → 7：tasks 加 revision（乐观并发）",
+        # 每次 update 自增。委派与提醒的状态变更要能发现
+        # 「我读到的已经不是最新的了」—— 之前只能靠 updated_at，
+        # 而它是时间戳：同一秒内两次写入分不出先后。
+        # 用 INTEGER 而不是时间戳，是因为并发控制要的是**单调计数**，
+        # 不是「什么时候改的」。
+        "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+    ),
 )
 
 #: 覆盖默认数据目录的环境变量名。
@@ -112,6 +129,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     progress_note        TEXT,
     project_path         TEXT,
     delegate_chat_id     TEXT,
+    reminder_rule        TEXT,
+    revision             INTEGER NOT NULL DEFAULT 0,
     current_artifact_id  TEXT REFERENCES artifacts(id) ON DELETE SET NULL
 );
 

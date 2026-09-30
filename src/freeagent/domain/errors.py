@@ -11,6 +11,7 @@ __all__ = [
     "ValidationError",
     "InvariantViolation",
     "ConflictError",
+    "StaleRevisionError",
     "LLMError",
 ]
 
@@ -54,7 +55,11 @@ class InvariantViolation(FreeAgentError):
 
 
 class ConflictError(FreeAgentError):
-    """与当前数据状态冲突：删除仍被引用的角色、未完成重定向等。"""
+    """与当前数据状态冲突：删除仍被引用的角色、未完成重定向等。
+
+    也用于**乐观并发**：读到的 ``revision`` 与写入时库里的不一致，
+    说明中间有人改过 —— 这时必须拒绝而不是覆盖。
+    """
 
     def __init__(self, message: str) -> None:
         self.message = message
@@ -62,6 +67,28 @@ class ConflictError(FreeAgentError):
 
     def __str__(self) -> str:
         return f"状态冲突: {self.message}"
+
+
+class StaleRevisionError(ConflictError):
+    """乐观并发失败：你手上那份已经不是最新的了。
+
+    刻意是 :class:`ConflictError` 的子类 —— 上层捕获「状态冲突」就能
+    统一处理这类「数据被别人动过」的情况，不必知道具体是哪一种。
+
+    为什么值得单列：``updated_at`` 是**时间戳**，同一秒内的两次写入
+    分不出先后，于是「我读到的还是最新的吗」这个问题用时间戳回答不了。
+    ``revision`` 是单调计数，比时间戳多一分保证，少一分含糊。
+    """
+
+    def __init__(self, entity: str, ident: str, expected: int, actual: int) -> None:
+        self.entity = entity
+        self.ident = ident
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"{entity} {ident} 已被改动（你读到的是第 {expected} 版，"
+            f"库里现在是第 {actual} 版），请重新读取后再试"
+        )
 
 
 class LLMError(FreeAgentError):

@@ -20,6 +20,7 @@ from .errors import (
     InvariantViolation,
     LLMError,
     NotFoundError,
+    StaleRevisionError,
     ValidationError,
 )
 from .models import (

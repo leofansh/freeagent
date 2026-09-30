@@ -22,6 +22,7 @@ from ..domain import (
 )
 from ..storage.repos import RecordRepo, TaskRepo
 from .clock import Clock
+from .recurrence import RecurrenceError, RecurrenceRule, parse_rule
 
 __all__ = ["TaskService", "ALLOWED_TRANSITIONS", "validate_task"]
 
@@ -308,6 +309,41 @@ class TaskService:
         now = self._clock.now()
         current = self._tasks.get(task_id)
         return self._tasks.update(_replace(current, reminder_time=reminder_time), now)
+
+    def set_reminder_rule(
+        self, task_id: str, rule: RecurrenceRule | None
+    ) -> Task:
+        """装/卸重复提醒规则，并把 ``reminder_time`` 对齐到下一次。
+
+        规则存**原始 JSON 文本**（见 :class:`~freeagent.domain.models.Task`
+        上 ``reminder_rule`` 的说明：domain 层零 I/O、零业务判断，解释留给
+        services）。这里负责三件事：
+
+        1. 规则为 ``None`` → **只清规则，不动时间**。留着时间当一次性提醒
+           是合理的降级（用户可能只是暂时不重复了），而清掉时间会静默
+           取消提醒 —— 那是另一种后果，得让用户显式说。
+        2. 规则非空 → **立刻把 ``reminder_time`` 推到下一次**。
+           不推的话，这条事务要么永远不响（时间在过去的空档），
+           要么立刻响一次（时间还没到）—— 两种都是错的。
+        3. 规则的时区**必填**，由 :class:`RecurrenceRule` 在构造时就校验。
+
+        ``RecurrenceError`` 直接往上抛：规则配错是**配置错误**，
+        该在设置时就说出来，不该表现成「提醒没响」。
+        """
+        now = self._clock.now()
+        current = self._tasks.get(task_id)
+        if rule is None:
+            return self._tasks.update(
+                _replace(current, reminder_rule=None), now
+            )
+        nxt = rule.next_after(now)
+        return self._tasks.update(
+            _replace(current, reminder_rule=rule.to_json(), reminder_time=nxt), now
+        )
+
+    def reminder_rule_of(self, task_id: str) -> RecurrenceRule | None:
+        """读出规则并**校验**。规则坏了就抛，不返回半合法的东西。"""
+        return parse_rule(self._tasks.get(task_id).reminder_rule)
 
     def set_blocked_by(self, task_id: str, blocked_by: Sequence[str]) -> Task:
         return self._tasks.set_dependencies(task_id, blocked_by)
