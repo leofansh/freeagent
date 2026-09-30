@@ -122,8 +122,17 @@ class RestoreService:
             actions.append("先说清楚做到什么程度算完")
 
         # 逾期
+        #
+        # 这里**只说「已逾期」，不说「已顺延」**。
+        # 顺延由 :meth:`TodayService.view` 触发，而 ``/task`` **不调它** ——
+        # 用户先跑 ``/task`` 时，库里 ``scheduled_for`` 还是旧日期，
+        # 说「已顺延」就是**假话**（本轮实测抓到）。
+        #
+        # 判据是：``next_actions`` 的每一句都必须能从**本函数持有的事实**推出。
+        # ``scheduled_for < today`` 是两个持有事实的比较，成立；
+        # 「顺延执行过」是一个本函数**无权确认**的全局状态，不许断言。
         if task.scheduled_for is not None and task.scheduled_for < today:
-            actions.append(f"原定 {task.scheduled_for}，已顺延；今天做还是改期")
+            actions.append(f"原定 {task.scheduled_for}，已逾期；今天做还是改期")
 
         if not actions:
             actions.append("没有待处理的下一步，按你自己的节奏来")

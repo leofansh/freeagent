@@ -258,11 +258,39 @@ def test_restore_next_actions_flag_missing_intent(app: App, roles):
 def test_restore_next_actions_flag_overdue(app: App, roles):
     t = app.tasks.create("周报", [roles["work"].id], intent="做出来")
     app.tasks.schedule(t.id, date(2026, 9, 20))
+    actions = app.restore.open_task(t.id).next_actions
+    # 「已逾期」而不是「已顺延」：本函数持有 scheduled_for 与 today，
+    # 两者比较得出「逾期」；「顺延执行过」是它无权确认的全局状态。
+    # 详见设计文档 8.2「文本必须能从本函数持有的事实推出」。
+    assert any("已逾期" in a for a in actions), actions
+
+
+def test_next_actions_never_claims_a_rollover_it_cannot_know(app: App, roles):
+    """**这条锁的是原则，不是文案。**
+
+    这条测试的前身断言的是「已顺延」，而它先 :meth:`rollover` 再把日期排回
+    过去 —— 造出的正是「已逾期但**没有**顺延」的状态，然后要求文案说
+    「已顺延」。**假话被测试锁住了**，所以一直没被发现。
+
+    现在反过来：无论有没有跑过 ``/today``，文案都只许说「已逾期」。
+    ``/task`` 是只读的，它**无权**断言一个自己没触发的全局状态发生过。
+    """
+    t = app.tasks.create("周报", [roles["work"].id], intent="做出来")
+    app.tasks.schedule(t.id, date(2026, 9, 20))
+
+    # 情形一：从没跑过 /today —— 顺延确实没发生
+    actions = app.restore.open_task(t.id).next_actions
+    assert not any("已顺延" in a for a in actions), (
+        f"没跑过 rollover 就不能说已顺延：{actions}"
+    )
+
+    # 情形二：跑过一次 /today 又排回过去 —— 顺延发生过，但**不是为这条**发生的
     app.today.rollover()
-    t2 = app.tasks.get(t.id)
-    t3 = app.tasks.schedule(t.id, date(2026, 9, 20))  # 再排回过去
-    actions = app.restore.open_task(t3.id).next_actions
-    assert any("已顺延" in a for a in actions), actions
+    app.tasks.schedule(t.id, date(2026, 9, 20))
+    actions = app.restore.open_task(t.id).next_actions
+    assert not any("已顺延" in a for a in actions), (
+        f"上一次 rollover 不能替这一次背书：{actions}"
+    )
 
 
 def test_export_context_is_loadable_text(app: App, roles):
