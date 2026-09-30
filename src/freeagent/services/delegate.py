@@ -137,38 +137,75 @@ _DISPATCH_TERMINAL = (
 
 
 def already_dispatched(records: Sequence) -> bool:
-    """这条事务**现在**该不该被跳过（已派且不该重派）。
+    """这条事务**现在**该不该被跳过。
 
     踩过的坑（真机测出来的）：原来只问「有没有 ``delegation_dispatched``」，
     于是**失败的委派永远无法重派** —— 而落库时写的那条 note 偏偏写着
     「执行失败，可以 /note 记下原因后重派」。**文档承诺了重派，守卫禁止它。**
     结果是：一次失败就变成一条死任务，只能手工建新事务顶替。
 
-    现在看**最后一条**派发相关记录：
+    第二次踩坑（``--watch`` 实测，2026-09-30）：上面那条「失败可重派」修好之后，
+    ``--watch`` 常驻把**配置类失败**放大成了持续损坏 —— 180 秒内扫了 60 轮、
+    写了 60 个产物版本（v51→v60），而真正的委派一条没干成。
 
-    ==========================  ========
-    最后一条是                    含义
-    ==========================  ========
-    （没有）                     没派过 → 派
-    ``delegation_dispatched``   在跑 → **别再派一次**（会并发跑同一件事）
-    ``delegation_succeeded``    做完了 → 别再派
-    ``delegation_failed``       失败 → **可重派**
-    ==========================  ========
+    根因：**「失败可重派」被无条件化了。** 但有些失败是**确定性**的 ——
+    「没有闸门」「白名单拒绝」这类阻塞在任务之外，不改配置就永远不会成功。
+    可重试的只有**执行期**的失败（模型偶发 402、opencode 崩了、网络抖了）。
 
-    「在跑」那条刻意**不**重派：``--watch`` 每轮都扫，而 opencode 可能要跑
-    几分钟。不挡住就会连发好几个进程改同一个目录。
+    判据是**从记录推出来的**，不靠给失败加标签：
+    **一次尝试里有没有真的 ``delegation_dispatched``。**
 
-    ⚠️ ``--watch`` 下的副作用：对**持续失败**的任务，每轮都会重派、
-    每轮都要重新发一张批准卡。不会静默重跑（闸门仍要人点），
-    但会周期性地刷卡片。盯着失败任务排查时**别开** ``--watch``。
+    ==============================  ==============  ================
+    最后一次尝试                        记录形状          判定
+    ==============================  ==============  ================
+    （没有）                          —               没试过 → 派
+    派发前就被拒                        failed（无前置）    **不重试**（本轮新增）
+    执行期失败                        dispatched→failed  可重试
+    跑着                              dispatched        别再派（会并发）
+    做完                              succeeded         别再派
+    ==============================  ==============  ================
+
+    「派发前就被拒」不再自动重试，代价是：**修好配置后这条不会自动恢复**。
+    那个恢复入口（让 ``/note`` 能重置）**至今没有实现** —— 落库那句
+    「可以 /note 记下原因后重派」是**空头承诺**（note 不是 terminal 记录，
+    什么也重置不了）。要么手工建新事务，要么将来真做那个入口。
+    明确写在这里，免得下一个人以为有重试机制。
+
+    ⚠️ ``--watch`` 下的**另一类**副作用仍然存在：``--tool-gate`` 路径下，
+    持续失败会**周期性地重新发批准卡**（闸门仍要人点，不会静默重跑，
+    但会刷卡片）。盯着失败任务排查时**别开** ``--watch``。
     """
-    last = None
+    #: 本次尝试里**真的**派出去过吗。派发前就被拒的（缺闸门 / 白名单不符）
+    #: 压根没走到 :func:`subprocess_runner`，所以这个标记是 ``False``。
+    dispatched_in_attempt = False
+    #: 最后一次尝试的结局。``None`` = 还没试过；
+    #: ``"refused"`` = 试了但**派发前就被拒**（确定性失败，重试无用）。
+    last: str | None = None
     for record in records:
-        if record.type in _DISPATCH_TERMINAL:
-            last = record.type
+        kind = record.type
+        if kind is RecordType.DELEGATION_DISPATCHED:
+            dispatched_in_attempt = True
+        elif kind in _DISPATCH_TERMINAL:
+            if kind is RecordType.DELEGATION_FAILED and not dispatched_in_attempt:
+                last = "refused"
+            else:
+                last = "failed" if kind is RecordType.DELEGATION_FAILED else "succeeded"
+            dispatched_in_attempt = False
+
+    # 末尾是「已派出但还没有收尾记录」—— **正在跑**。
+    #
+    # 这一条我第一版漏了，回归测试当场抓住：只问「最后一条 terminal 是什么」
+    # 的话，「在跑」和「没试过」都落在「没有 terminal」上，
+    # 于是 ``--watch`` 会在 opencode 还在跑的时候再派一遍 ——
+    # 两个进程改同一个项目目录。宁可漏派也不能并发派。
+    if dispatched_in_attempt:
+        return True
     if last is None:
         return False
-    return last is not RecordType.DELEGATION_FAILED
+    # 确定性失败不重派：重试一千次也是同一个结果。
+    # 而执行期失败（last == "failed"）**要**能重派 ——
+    # 否则又回到「一次失败变死任务」那个旧坑。
+    return last != "failed"
 
 
 def eligible_tasks(repo, records_repo) -> list[Task]:

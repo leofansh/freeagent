@@ -126,6 +126,76 @@ class TestFailureIsRetryable:
         assert r2.succeeded == 1, r2.notes
 
 
+class TestPreDispatchRefusalIsNotRetriedForever:
+    """``--watch`` 实测抓到的缺陷（2026-09-30）：配置类失败被无限重试。
+
+    现象：常驻执行器 180 秒扫了 60 轮、写了 60 个产物版本（v51→v60），
+    而真正的委派一条没干成 —— 因为每轮都撞同一堵墙（缺飞书凭据 → 无闸门）。
+
+    ``already_dispatched`` 的 docstring 早就预警过「持续失败会刷卡片」，
+    但只覆盖了 ``--tool-gate`` 路径。**无闸门时一张卡都没有**，
+    代价从「刷屏」变成**静默的数据库膨胀** —— 那句预警完全没提到它。
+
+    根因：「失败可重派」被无条件化了。可有些失败是**确定性**的：
+    阻塞在任务之外（缺闸门、白名单不符），不改配置就永远不会成功。
+    """
+
+    def _records(self, *types):
+        return [_Rec(t) for t in types]
+
+    def test_predispatch_refusal_is_not_retryable(self):
+        # 真机形状：只有 failed，**前面没有** dispatched
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_FAILED)
+        ) is True
+
+    def test_execution_failure_is_still_retryable(self):
+        # 真机形状：dispatched -> failed。这一类**必须**还能重派，
+        # 否则又回到「一次失败变死任务」那个旧坑。
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_DISPATCHED,
+                          RecordType.DELEGATION_FAILED)
+        ) is False
+
+    def test_never_dispatched_still_eligible(self):
+        assert already_dispatched([]) is False
+
+    def test_succeeded_still_blocks(self):
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_DISPATCHED,
+                          RecordType.DELEGATION_SUCCEEDED)
+        ) is True
+
+    def test_in_flight_still_blocks(self):
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_DISPATCHED)
+        ) is True
+
+    def test_refusal_then_real_attempt_keeps_retry_semantics(self):
+        """先被拒、后来真跑过并失败 —— 应当**恢复可重派**。
+
+        否则「一次误操作导致永久卡死」：人修好配置重试一次，
+        又因为历史里有条 refused 而再也派不出去。
+        """
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_FAILED,
+                          RecordType.DELEGATION_DISPATCHED,
+                          RecordType.DELEGATION_FAILED)
+        ) is False
+
+    def test_repeated_refusals_do_not_accumulate(self, tmp_path):
+        """真机那 60 轮的形状：反复 refused 之后**不该**再多派一次。"""
+        app = build_app(tmp_path / "a.db", clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        role = app.roles.create("工作")
+        task = app.tasks.create("活儿", [role.id], project_path=str(tmp_path))
+        app.tasks.start(task.id)
+        for _ in range(3):
+            app.record_repo.append(task.id, RecordType.DELEGATION_FAILED,
+                                   "没有闸门", app.clock.now())
+        assert eligible_tasks(app.task_repo, app.record_repo) == []
+        app.close()
+
+
 class TestErrorReasonReachesTheDatabase:
     """错因必须**落库**，而不只是出现在终端那一行。"""
 
