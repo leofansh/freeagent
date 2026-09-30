@@ -14,6 +14,7 @@ from .config import Config, load_config
 from .services.artifacts import ArtifactService
 from .services.chat import ChatService
 from .services.clock import Clock, SystemClock
+from .services.knowledge import KnowledgeService
 from .services.llm import LLMProvider, build_provider
 from .services.llm.vision import VisionProvider
 from .services.reminders import ReminderEngine
@@ -46,6 +47,9 @@ class App:
     restore: RestoreService
     reminders: ReminderEngine
     chat: ChatService
+    #: 角色脉络知识。检索结果**自带来源说明**（关键词命中 / 近期回落 / 被截断）——
+    #: 见 :class:`~freeagent.services.knowledge.RetrievalResult`。
+    knowledge: KnowledgeService
     task_repo: TaskRepo
     role_repo: RoleRepo
     record_repo: RecordRepo
@@ -159,6 +163,9 @@ def build_app(
         task_service, artifact_service, record_repo, role_service, the_clock
     )
     reminder_engine = ReminderEngine(task_repo, record_repo, the_clock)
+    # 角色知识只需要连接与角色仓储（要校验 role_id 存在），不碰任务仓储 ——
+    # 知识是**角色的**，不是事务的。
+    knowledge_service = KnowledgeService(conn, role_repo, the_clock)
     chat_service = ChatService(
         task_service, task_repo, role_service, restore_service,
         today_service, the_clock, the_llm,
@@ -189,6 +196,7 @@ def build_app(
         restore=restore_service,
         reminders=reminder_engine,
         chat=chat_service,
+        knowledge=knowledge_service,
         task_repo=task_repo,
         role_repo=role_repo,
         record_repo=record_repo,

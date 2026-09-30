@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -90,6 +90,96 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 不是「什么时候改的」。
         "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
     ),
+)
+
+
+#: 角色知识域（v8）。**与 ``_SCHEMA`` 分开**，因为它含虚拟表与触发器 ——
+#: ``_MIGRATIONS`` 一步只跑一条语句（``conn.execute``），而这里是多条。
+#:
+#: ## 为什么需要自己分词（实测，别凭直觉改）
+#:
+#: SQLite 的 FTS5 内置分词器对中文**不可用**，实测：
+#:
+#: * ``unicode61``：把整串中文当**一个 token**。``MATCH '周报'`` → **0 命中**。
+#: * ``trigram``：``销售周报``（3 字）能命中，但 ``周报`` / ``王工``（2 字）
+#:   **全部 0 命中** —— 而中文查询大量是 2 字词。
+#:
+#: 所以写入前把 CJK 切成**重叠二元组**（``交付销售周报`` →
+#: ``交付 付销 销售 售周 周报``），查询用同样形态。实测 2 字词全部命中。
+#:
+#: ## 为什么 ``search_text`` 是一列而不是触发器里算
+#:
+#: SQLite **没有 bigram 函数**，触发器里做不了这个变换。所以变换由 Python
+#: 算好写进 ``search_text``，触发器只负责把它**复制**进 FTS5 ——
+#: 于是索引不会与真源漂移（删除/更新自动同步），而变换仍然只有一处实现。
+#:
+#: ``content='role_knowledge'`` 是**外部内容表**：FTS5 不复制正文，只存索引。
+#: 原文永远在 ``content`` 列 —— FTS5 里只有 bigram，取不回原文。
+#:
+#: 刻意用 ``executescript``（可多条、``IF NOT EXISTS`` 幂等）而不是
+#: ``_MIGRATIONS`` 的一步一条：虚拟表 + 三个触发器没法塞进一条语句。
+_KNOWLEDGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS role_knowledge (
+    id          TEXT PRIMARY KEY NOT NULL,
+    role_id     TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    content     TEXT NOT NULL,          -- 原文，唯一真源
+    search_text TEXT NOT NULL,          -- bigram 形态，由 Python 算好写入
+    source_ref  TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rk_role ON role_knowledge(role_id, created_at);
+
+-- 注意 FTS5 的语法：索引列名写在**前面**，content=/content_rowid= 这些
+-- 选项写在**后面**。写成 `fts5(content='role_knowledge')` 会被当成
+-- 「有一个叫 content 的列，值是 role_knowledge」，于是外部内容表根本没生效，
+-- 建表直接报 vtable constructor failed。
+CREATE VIRTUAL TABLE IF NOT EXISTS role_knowledge_fts
+    USING fts5(search_text, content='role_knowledge', content_rowid='rowid');
+
+CREATE TRIGGER IF NOT EXISTS role_knowledge_ai AFTER INSERT ON role_knowledge BEGIN
+    INSERT INTO role_knowledge_fts(rowid, search_text)
+        VALUES (new.rowid, new.search_text);
+END;
+
+-- delete / update 用 **BEFORE** 而不是 AFTER：外部内容表的 FTS5 **不存正文**，
+-- 「删掉这一行」这条指令要回内容表读该行的值才知道该移除哪些 token。
+-- 官方示例给的就是 BEFORE。
+--
+-- 验证同步时**不要用 JOIN 查**：内容行删掉之后 JOIN 必然返回空，
+-- 那个结果与索引是否同步无关。踩过的坑就是这个 —— 第一版验证写成
+-- `... FROM role_knowledge_fts f JOIN role_knowledge k ON k.rowid=f.rowid
+-- WHERE role_knowledge_fts MATCH ?`，于是「触发器坏了」和「触发器好的」
+-- 跑出来一模一样。正确姿势是**直接查索引**：
+--   SELECT rowid FROM role_knowledge_fts WHERE role_knowledge_fts MATCH ?
+-- 再补一句 `INSERT INTO role_knowledge_fts(role_knowledge_fts)
+-- VALUES('integrity-check')`。
+CREATE TRIGGER IF NOT EXISTS role_knowledge_ad BEFORE DELETE ON role_knowledge BEGIN
+    INSERT INTO role_knowledge_fts(role_knowledge_fts, rowid, search_text)
+        VALUES ('delete', old.rowid, old.search_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS role_knowledge_au BEFORE UPDATE ON role_knowledge BEGIN
+    INSERT INTO role_knowledge_fts(role_knowledge_fts, rowid, search_text)
+        VALUES ('delete', old.rowid, old.search_text);
+    INSERT INTO role_knowledge_fts(rowid, search_text)
+        VALUES (new.rowid, new.search_text);
+END;
+"""
+
+#: **多语句**的域变更，键是**目标**版本。
+#:
+#: 为什么不并进 :data:`_MIGRATIONS`：那个元组一步只跑一条 ``conn.execute``，
+#: 而「建虚拟表 + 三个触发器」塞不进一条语句。硬塞的后果是要么拆成四步
+#: （中间态是「表建了触发器没建」，一次崩溃就留下不同步的索引），
+#: 要么在那个元组里混入多语句（于是「一步一条」这个不变量没了，
+#: 而 :func:`_run_idempotent` 的幂等兜底只认单条 ALTER）。
+#:
+#: 两种步骤共用 :func:`migrate` 的同一个循环与同一个版本号推进 ——
+#: 版本号仍然**一步一版**，不会因为加了域步骤就跳版。
+_DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
+    (8, _KNOWLEDGE_SCHEMA),
 )
 
 #: 覆盖默认数据目录的环境变量名。
@@ -233,6 +323,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
 def init_schema(conn: sqlite3.Connection) -> None:
     """幂等建表。可重复调用。"""
     conn.executescript(_SCHEMA)
+    conn.executescript(_KNOWLEDGE_SCHEMA)
     conn.commit()
 
 
@@ -255,8 +346,20 @@ def migrate(conn: sqlite3.Connection) -> None:
     # 停在原地 —— 迁移 SQL 照跑（列确实加上了），但版本不推进，
     # 每次启动都重跑一遍迁移。只靠「列在不在」断言会漏掉这个错。
     for source in range(current, SCHEMA_VERSION):
-        _label, sql = _MIGRATIONS[source - 1]
-        _run_idempotent(conn, sql)
+        # 单语句步骤（ALTER TABLE ADD COLUMN 之类）。``_MIGRATIONS`` 按**源版本**
+        # 索引，所以 ``source - 1``。
+        #
+        # 判 ``source - 1 < len(...)`` 而不是只判上界：v8 那一步是**多语句**
+        # 的（见 :data:`_DOMAIN_STEPS`），刻意不进这个元组。写死上界的话
+        # 以后再加一个多语句版本就会 IndexError，而那个错发生得很晚 ——
+        # 只在用户从旧库升上来时才炸。
+        if source - 1 < len(_MIGRATIONS):
+            _label, sql = _MIGRATIONS[source - 1]
+            _run_idempotent(conn, sql)
+        # 多语句步骤（虚拟表 + 触发器）。``executescript`` 可跑多条且幂等。
+        for target, script in _DOMAIN_STEPS:
+            if target == source + 1:
+                conn.executescript(script)
         conn.execute(f"PRAGMA user_version = {source + 1}")
         conn.commit()
 

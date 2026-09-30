@@ -29,8 +29,16 @@
 | 5 | `pending_approvals.requested_by` | 「只有发起人能批」此前只写在文档里、**代码没实现** | `_MIGRATIONS[3]` |
 | 6 | `tasks.reminder_rule` | 重复提醒需要**显式时区 + 墙钟时间**；没有它「每天八点」会随夏令时漂 | `_MIGRATIONS[4]` |
 | 7 | `tasks.revision` | 读-改-写要能发现「我读到的已经不是最新的」；`updated_at` 是时间戳，同一秒内分不出先后 | `_MIGRATIONS[5]` |
+| 8 | `role_knowledge` + FTS5 索引 | 角色脉络知识要**可检索**（3.6）。`Role.note` 是自由文本，能读不能搜 | `_DOMAIN_STEPS[0]` |
 
-`SCHEMA_VERSION = 7`（`storage/db.py`）。
+`SCHEMA_VERSION = 8`（`storage/db.py`）。
+
+> **v8 是第一个「多语句」迁移。** `_MIGRATIONS` 一步只跑一条 `conn.execute`，
+> 而 v8 要建一张表 + 一个索引 + 一个**虚拟表** + 三个触发器，塞不进一条语句。
+> 硬拆成四步的后果是中间态「表建了触发器没建」，一次崩溃就留下不同步的索引。
+> 所以另立 `_DOMAIN_STEPS`（键是**目标**版本），两种步骤共用 `migrate()` 的
+> **同一个循环**与同一次版本号推进 —— 版本号仍**一步一版**，不会跳版。
+> 详见 3.6 的「索引同步」。
 
 ## 存储约定
 
