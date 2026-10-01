@@ -70,7 +70,9 @@ from .services.opencode_server import (
     OpenCodeServer,
     ServerError,
     ToolPermission,
+    ToolQuestion,
     permission_from_event,
+    question_from_event,
 )
 
 __all__ = ["Runner", "subprocess_runner", "run_once", "main",
@@ -651,6 +653,20 @@ class ToolCardSender(Protocol):
     ) -> str: ...
 
 
+class QuestionCardSender(Protocol):
+    """提问卡需要的**那一个方法**。
+
+    与 :class:`ToolCardSender` 分开声明，刻意不合并成一个 sender 协议：
+    两者的按钮语义不同（一个有 allow/deny，一个**没有按钮**），合并会
+    让「调用方到底需不需要实现发卡」这个问题变得要看实现才知道。
+    """
+
+    def send_question_card(
+        self, *, open_id: str, subject: str, detail: str,
+        credential: str, ttl_seconds: int,
+    ) -> str: ...
+
+
 class ServerFactory(Protocol):
     """造一个**隔离的** opencode 服务。
 
@@ -676,7 +692,7 @@ def run_with_tool_gate(
     *,
     policy: DelegationPolicy,
     store: "ApprovalStore",
-    sender: "ToolCardSender | None",
+    sender: "ToolCardSender | QuestionCardSender | None",
     approver: str,
     server_factory: "ServerFactory | None" = None,
 ) -> DispatchOutcome:
@@ -689,7 +705,11 @@ def run_with_tool_gate(
       —— 那正是闸门形同虚设的样子。所以下面 ``sender is None`` 直接失败。
 
     循环：发指令 → 订阅事件 → 遇到 ``permission.asked`` 就发卡等回答 →
-    把回答送回 opencode → 继续。
+    把回答送回 opencode → 继续。遇到 ``question.asked`` 则发**无按钮**提问卡，
+    等人**打字**回答（桥接把文本路由到 ``put_answer``），齐了再送回 opencode。
+
+    提问没答就**停下会话并报失败**（无人答的提问下去就改代码，
+    而那会被记成「完成」）。
 
     **超时即拒绝**（:meth:`ApprovalStore.wait` 的既有语义）。opencode 那侧
     会一直等下去，所以这里必须自己给期限 —— 沉默即拒绝，不是「等下去」。
@@ -705,15 +725,37 @@ def run_with_tool_gate(
     handled: list[str] = []
     granted = 0
     session_id = ""
+    #: 有提问没答。记下来是为了在结尾把它报成**失败**——
+    #: 一次无人答的提问下去就算完成，那是最像成功的一种失败。
+    unanswered = False
     try:
         with make_server(project, policy.command) as oc:
             session_id = oc.create_session()
             oc.prompt_async(session_id, brief, model=policy.model)
             for kind, props in oc.events():
-                if kind != "permission.asked":
-                    # 只在会话结束/出错时收尾，其它事件（进度、消息）不处理。
-                    if kind in ("session.idle", "session.error"):
+                if kind in ("session.idle", "session.error"):
+                    break
+                if kind == "question.asked":
+                    # 提问**不计入授权统计**：它不是动作审批，
+                    # 混进去会让「几次授权」这个数字不再可信。
+                    q = question_from_event(props)
+                    if q is None:
+                        # 同样不能当成「已拒篝」悄悄跳过。
+                        log.warning("【执行期】收到认不出的 question.asked：%r", props)
+                        continue
+                    note = _ask_one_question(oc, q, store=store, sender=sender,
+                                             approver=approver, context=context)
+                    if note:
+                        handled.append(note)
+                    else:
+                        # 没答、或发卡失败。**不能继续干等**—— 无人答的
+                        # 提问下去，就会在一个人根本不知道的事实上继续改代码。
+                        handled.append(f"提问未答（{q.summary}）—— 已停下会话")
+                        unanswered = True
                         break
+                    continue
+                if kind != "permission.asked":
+                    # 其它事件（进度、消息）不处理。
                     continue
                 req = permission_from_event(props)
                 if req is None:
@@ -735,6 +777,15 @@ def run_with_tool_gate(
             tool_calls=tuple(handled),
         )
 
+    if unanswered:
+        # 显式报失败。不把它装成「完成」—— 那会让一次
+        # 无人答课的委派在记录里看起来和正常完成一样。
+        return DispatchOutcome(
+            ok=False,
+            summary="执行期有提问没箅到答案 —— 已停下会话"
+                    "（已答的部分不会被重放）",
+            session_id=session_id or None, tool_calls=tuple(handled),
+        )
     note = (f"执行期问了 {len(handled)} 次，允许 {granted} 次"
             if handled else "未触发授权请求")
     return DispatchOutcome(
@@ -766,6 +817,110 @@ def task_requester(task, fallback: str = "") -> str:
     同理，对象缺少这个属性时也不应撞（旧对象、别的实现）。
     """
     return (getattr(task, "delegate_requested_by", None) or "").strip() or fallback
+
+
+def _ask_one_question(
+    oc,
+    req,
+    *,
+    store: "ApprovalStore",
+    sender: "QuestionCardSender",
+    approver: str,
+    context: "ApprovalContext",
+) -> str:
+    """问一次（一次问一个），把答复送回 opencode。**返回一句话摘要**。
+
+    与 :func:`_ask_one_tool` 的差别在两个地方：
+
+    1. **答复是文本而不是 allow/deny**，因此等的是
+       :meth:`~ApprovalStore.wait_complete` 而不是 :meth:`~ApprovalStore.wait`。
+    2. **卡不带按钮**，因此发卡失败不能降级成「那就自己回答了」。
+
+    第二点很重要：发卡失败必须返回失败，而不是自己给一个答案。
+    一个人根本没看见的问题，若由程序自己回答，那就是一个
+    **伪装成人答案**的提问单（它确实会驱动 agent 继续干活）。
+    """
+    policy = context.policy
+    # 只登记一次、所有问题共用一个凭据，最终只发**一次**答复给 opencode。
+    pending = store.request_question(
+        subject=req.questions[0],
+        detail=_question_detail(req, 0, ttl_seconds=policy.ttl_seconds),
+        questions=req.questions,
+        # 凭据**交给 store 生成**（它默认就是 q 前缀）。不自己传：
+        # 一旦自己传了，就多了一个凭据的来源。
+        ttl_seconds=policy.ttl_seconds,
+        requested_by=context.who,
+    )
+
+    # **一问一卡，发完立刻等那一问。**
+    #
+    # 卡必须在循环**里**发。我第一版把「等」挪进循环却把「发」留在循环外，
+    # 于是第 2 张卡永远发不出去 —— 死锁原因没变，只是挪了一层。
+    collected: list[list[str]] = []
+    for slot in range(len(req.questions)):
+        try:
+            message_id = sender.send_question_card(
+                open_id=approver,
+                subject=req.questions[slot],
+                detail=_question_detail(
+                    req, slot, ttl_seconds=policy.ttl_seconds),
+                credential=pending.credential,
+                ttl_seconds=policy.ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成失败
+            # 不自己回答：一个人没看见的问题若由程序代答，那是**伪装成人的
+            # 答案**，而它确实会驱动 agent 继续改代码。
+            log.warning("【执行期】发提问卡失败（%s）—— 不自己回答", exc)
+            return ""
+        store.record_card(pending.credential, message_id)
+        got = store.wait_answer(
+            pending.credential, slot, timeout_seconds=policy.ttl_seconds,
+        )
+        if got is None:
+            # 这一问没答 → 整个提问算未完成。**不部分回传**：那会让 agent
+            # 拿着一个欠缺的答案继续干活。
+            log.info("【执行期】提问第 %d 问超时或过期", slot + 1)
+            return ""
+        collected.append(got)
+
+    answers = collected
+    try:
+        oc.reply_question(req.request_id, answers)
+    except ServerError as exc:
+        return f"答案已收到，但送回 opencode 失败：{exc}"
+    return f"提问 {len(answers)}/{len(req.questions)} 已答"
+
+
+def _question_detail(
+    req, current: int = 0, *, ttl_seconds: int = 0
+) -> str:
+    """提问卡的正文。**逐轮渲染**：第 ``current`` 张卡只讲当前那一问。
+
+    ## 选项不会被写成「这题的选项」
+
+    我们没有验明 opencode 的 ``options`` 是「全部问题的选项池」还是
+    「每题各一组」—— 两者都是数组，但粒度未验。因此这里只说「可选项」。
+
+    写成「选择一个」是一个**靠猜**的声称：若它实际按问题分组，那第 1 张卡上
+    列出的可选项里就有一部分属于第 2 题。人照着选，选到的是另一个问题的
+    答案 —— 而那会被 agent 当成对的答案用下去。
+    """
+    total = len(req.questions)
+    lines = [f"**{current + 1}/{total}、{req.questions[current]}**"]
+    if req.options:
+        lines.append("")
+        lines.append("可选项（" + "、".join(req.options) + "）")
+    rest = req.questions[current + 1:]
+    if rest:
+        nxt = "、".join(
+            f"{current + i + 2}. {q}" for i, q in enumerate(rest)
+        )
+        lines.append("")
+        lines.append(f"_一次问一个，这一张卡下还有：{nxt}_")
+    if ttl_seconds:
+        lines.append("")
+        lines.append(f"_{ttl_seconds}s 内不答按超时处理。_")
+    return "\n".join(lines)
 
 
 def _ask_one_tool(

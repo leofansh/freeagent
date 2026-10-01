@@ -660,6 +660,42 @@ class ApprovalStore:
                 return None
             time.sleep(poll_seconds)
 
+    def wait_answer(
+        self,
+        credential: str,
+        slot: int,
+        *,
+        poll_seconds: float = 0.5,
+        timeout_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> list[str] | None:
+        """等**某一个问**的答案。**超时或过期返回 ``None``。
+
+        为什么不能只用 :meth:`wait_complete`：**一次问一个**的流程里，
+        第 2 张卡要等第 1 个答案存进来才能发出。而 ``wait_complete`` 等的是
+        「全部答完」，配上「卡只在等完之后才发」就死锁。
+        那个锁一张卡都发出去。
+
+        本方法对 ``slot`` 下标过度：非法下标直接返回 ``None``，不负数循环
+        取写一个不存在的槽位。
+        """
+        if slot < 0:
+            return None
+        import time
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            item = self.get(credential)
+            if item is None or not item.is_question:
+                return None
+            answers = item.spec["answers"]
+            if slot < len(answers) and answers[slot]:
+                return list(answers[slot])
+            if self._clock() >= item.expires_at:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_seconds)
+
     # -- 兼容：单问场景的旧读法 -------------------------------------------- #
     def text_answer(self, credential: str) -> str | None:
         """已收到的答复**扁平文本**；一个字都没收到时返回 None。
@@ -802,6 +838,40 @@ class ApprovalStore:
         ).fetchone()
         return _row_to_obj(row) if row is not None else None
 
+
+    def pending_question_for(self, who: str) -> PendingApproval | None:
+        """还在等**这个人**报答的提问，没完成的那一条。没有返回 ``None``。
+
+        用于桥接判断「这条消息该不该当成答案」——一条消息
+        可能既是答案又是命令，必须有一个判据。
+
+        ## 为什么只返回**最新**一条
+
+        一个人可能同时被两个委派问题（上一个还在等，新的又开始）。
+        返回旧的会把答案写进已经派醒的旧事务里，而新的继续无人答。
+        所以取**最新**一条 —— 对人来说也才是他刚那个要回答的。
+
+        终端发起的无法被提问（它记的是**谁发起的委派**）——那不是遗漏，
+        而是**正确**：那条路径上根本没有人在飞书里等它。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM pending_approvals"
+            " WHERE kind = 'question' AND decision IS NULL"
+            " ORDER BY asked_at DESC, rowid DESC"
+        ).fetchall()
+        for row in rows:
+            item = _row_to_obj(row)
+            if item is None or not item.is_question:
+                continue
+            if self._clock() >= item.expires_at:
+                continue                      # 过期的等于没存在
+            if self.is_complete(item.credential):
+                continue                      # 全部答完了，不再等人
+            requester = item.may_be_answered_by
+            if requester and not _same_person(requester, who):
+                continue                      # 不是发起人 → 不路由给他
+            return item
+        return None
     def decide(self, credential: str) -> Decision | None:
         """读结论。**这是唯一该被调用方使用的读法。**
 

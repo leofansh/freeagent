@@ -200,6 +200,61 @@ class FeishuBridge:
             finally:
                 self._queue.task_done()
 
+    def _route_answer(self, msg) -> str | None:
+        """这条消息是否应该当作提问的**答案**。不是则返回 ``None``。
+
+        返回值一律是“要回给人的话”（空字符串 = 已记下，不回话）。
+
+        ## 这里是**新增的远程输入路径** —— 所以两个硬约束
+
+        1. **命令永远优先**：以 ``/`` 开头的不当答案。否则用户被逼着
+           回答问题，连命令都打不上 —— 而 ``/skip-question`` 这个退出通道
+           依赖它能被识别。
+        2. **只能写问答槽位**：调用的是 ``put_answer``，它只填答案槽位。
+           打字**绝不能**回到 ``resolve``（那才是批准授权）——两路之间
+           没有任何连线，所以一条消息最多能「回答问题」，绝不能
+           「批准授权」。
+        """
+        if msg.unsupported_type:
+            return None                      # 非文字不当答案
+        text = (msg.text or "").strip()
+        if not text:
+            return None
+        if text.startswith("/") and not text.startswith(SKIP_QUESTION):
+            return None                      # 命令优先 —— 退出通道
+
+        if _card_conn is None:
+            return None                      # 没带库 = 不能落盘，不能猜
+        from ..services.approval import ApprovalStore
+
+        store = ApprovalStore(_card_conn, clock=_card_clock)
+        who = msg.sender_open_id or ""
+        pending = store.pending_question_for(who)
+        if pending is None:
+            return None                      # 没有挂起的提问 → 不拦
+
+        skipping = text.startswith(SKIP_QUESTION)
+        slot = store.put_answer(
+            pending.credential,
+            SKIP_ANSWER_TEXT if skipping else text,
+            answered_by=who,
+        )
+        if slot is None:
+            log.info("【提问】记不上（凭据=%s）", pending.credential)
+            return ("这条答案没记上 —— 可能已过期，"
+                    "或不是发起那条委派的人。")
+
+        total = len(pending.spec["questions"])
+        done = store.is_complete(pending.credential)
+        log.info("【提问】凭据=%s 第 %d/%d 问：%s（%s）",
+                 pending.credential, slot + 1, total,
+                 "跳过" if skipping else "已收到答案", who)
+        if done:
+            return (f"收到了，这 {total} 个问题全部答完。"
+                    "opencode 继续干活。")
+        return (f"收到了（第 {slot + 1}/{total} 问）。还有 "
+                f"{total - slot - 1} 个问题，直接回消息答。")
+
     def _process(self, msg: IncomingMessage) -> None:
         if msg.unsupported_type:
             # 不支持的消息类型：回一句提示，但**绝不进派发逻辑**。
@@ -229,6 +284,17 @@ class FeishuBridge:
                 "若被飞书重投，会重复处理（chat=%s，event_id=%r message_id=%r）",
                 msg.chat_id, msg.event_id, msg.message_id,
             )
+        # 先问：这条是不是回答提问的文字。命令优先，非文字不答。
+        answered = self._route_answer(msg)
+        if answered is not None:
+            if answered:
+                # 走现有的发送口径，不自己新建一个。
+                try:
+                    self.sender.send_text(msg.chat_id, answered)
+                except Exception:  # noqa: BLE001 - 回复失败不得拖垮处理
+                    log.exception("回复提问回执失败（chat=%s）", msg.chat_id)
+            return
+
         reply = self.channel.handle(
             msg.chat_id, msg.sender_ids, msg.text,
             event_id=key or None,
@@ -585,6 +651,11 @@ CARD_ACTION_EVENT = "card.action.trigger"
 #: 同一处的 ``_card_action.conn: Any = None`` 会在名字绑定之前就求值，
 #: 直接 ``NameError`` 把整个模块打挂。挂函数属性必须**放在 def 之后**。
 _card_conn: Any = None
+#: 退出通道。以 ``/`` 开头，并被当成答案，所以它不会被当命令。
+SKIP_QUESTION = "/skip-question"
+#: 跳过时填入槽位的内容。必须让 agent 能区分「本人答了」与「本人跳过了」。
+SKIP_ANSWER_TEXT = "（用户跳过了这个问题，没有作答）"
+
 
 #: 卡片处理器的钟。``None`` = 用真钟。
 #:

@@ -279,6 +279,54 @@ class FeishuSender:
             )
         return str(((body.get("data") or {}).get("message_id")) or "")
 
+    def send_question_card(
+        self,
+        *,
+        open_id: str,
+        subject: str,
+        detail: str,
+        credential: str,
+        ttl_seconds: int,
+    ) -> str:
+        """发一张**提问卡**（agent 在问你），返回 ``message_id``。
+
+        与前两张卡的关键差别：**没有按钮**。
+
+        因为提问的答复是**打字**，不是点钮。而且若把
+        ``allow_once`` 挂在提问卡上，点一下就会调 ``resolve()`` 落到
+        一行 **question** 记录上 —— 那是答复不是得出的判定。
+
+        因此这张卡的唯一职责是**告诉人问了什么**；答案走普通文本消息，
+        由桥接路由到 ``put_answer``。
+
+        卡上**必须写出退出通道**（下面那个 note）。只说「回答这个」
+        而不说「不回答也行」的卡，就是一条死路 —— agent 等着，TTL 走完，
+        而人根本不知道自己可以拒绝。
+        """
+        if not open_id:
+            raise ValueError("发提问卡必须给收件人标识")
+        id_type = self._receive_id_type(open_id)
+        card = _question_card(subject, detail, ttl_seconds)
+        raw = self._transport(
+            f"{self.config.base_url}/open-apis/im/v1/messages"
+            f"?receive_id_type={id_type}",
+            {
+                "receive_id": open_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            },
+            {"Authorization": f"Bearer {self.token()}"},
+            self.timeout,
+        )
+        body = _decode_twice(raw)
+        if body.get("code") != 0:
+            raise FeishuError(
+                f"发提问卡失败：code={body.get('code')} "
+                f"msg={body.get('msg')}（收件人={open_id!r} "
+                f"形态={id_type}）"
+            )
+        return str(((body.get("data") or {}).get("message_id")) or "")
+
     def send_to_allowlist_entry(self, entry: str, text: str) -> None:
         """按白名单条目的**形状**选 ``receive_id_type`` 发私聊。
 
@@ -368,6 +416,33 @@ def _approval_card(subject: str, detail: str, credential: str) -> dict[str, Any]
 #: 不可篡改……而那整套机制是为「授权」设计的，用在这里是**错配**，
 #: 而且凭空多出「卡片过期了但用户还没点」这类失败模式。
 VIEW_CHOICE_ACTION = "run_view"
+
+
+def _question_card(subject: str, detail: str, ttl_seconds: int) -> dict[str, Any]:
+    """agent 的提问卡。**故意不包含 ``action`` 元素**。
+
+    为什么不包含：可点的卡在飞书里会被人当成可执行的动作，
+    而这里没有“批准答案”这个动作。挂一个按钮存在即使它没有意义。
+
+    额外说明：``ttl_seconds`` 只用于把“你有多少时间”写在卡上。
+    它不决定任何判定（判定在 ``ApprovalStore``）——但必须在卡上说出来，
+    否则用户会以为不限时。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "turquoise",
+            "title": {"tag": "plain_text", "content": subject},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": detail}},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content":
+                  "这不是确认卡，没有允许/拒绝按钮。"
+                  f"直接回消息回答就行，{ttl_seconds}s 内不答按超时处理。"}]},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content":
+                  "不想回答可以回 `/skip-question` 跳过。"}]},
+        ],
+    }
 
 
 def _tool_card(subject: str, detail: str, credential: str) -> dict[str, Any]:
