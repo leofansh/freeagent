@@ -40,17 +40,21 @@ from typing import Any, Iterable, Iterator, Mapping
 from .executors import (
     ExecutorAdapter,
     ToolPermission,
+    ToolQuestion,
     adapter_for,
 )
 
 __all__ = [
     "ToolPermission",
+    "ToolQuestion",
     "ServerError",
     "delegation_permission_config",
     "build_isolated_config",
     "parse_sse_event",
     "permission_from_event",
     "reply_payload",
+    "question_from_event",
+    "question_reply_payload",
     "build_child_env",
     "child_env_visibility",
     "OpenCodeServer",
@@ -314,6 +318,27 @@ def reply_payload(decision: str) -> dict[str, str]:
     return current_adapter().build_reply(decision)
 
 
+def question_from_event(properties: Any) -> ToolQuestion | None:
+    """当前适配器对 ``question.asked`` 事件的解析。
+
+    与 :func:`permission_from_event` 同一约定：**返回 ``None`` 表示这不是
+    一条能回应的提问**，绝不用半截形状凑 —— 那会让上层把「不认识」当成
+    「用户没答」，而这两件事该走的处置完全不同（前者不该发任何东西，
+    后者该按超时处理）。
+    """
+    return current_adapter().parse_question(properties)
+
+
+def question_reply_payload(answers: list[list[str]]) -> dict[str, Any]:
+    """把逐轮积累的答复翻成**当前适配器**的提问答复载荷。
+
+    V1 实测只接受**嵌套数组** ``{"answers": [["…"]]}``，扁平字符串被拒。
+    形状与「空答复不许发」的校验都在适配器里，所以这里只做委托 ——
+    与 :func:`reply_payload` 同一层，不在这里内联任何版本形状。
+    """
+    return current_adapter().build_question_reply(answers)
+
+
 class ServerError(RuntimeError):
     """opencode 服务起不来 / 调用失败。**必须让派发失败，不能当成功。**"""
 
@@ -550,6 +575,44 @@ class OpenCodeServer:
         if directory:
             path += f"?directory={urllib.parse.quote(directory, safe='')}"
         self._must(path, "POST", reply_payload(decision))
+
+    def pending_questions(
+        self, *, directory: str | None = None
+    ) -> list[Any]:
+        """列出**当前挂起**的提问。
+
+        与 :meth:`pending_permissions` 同一个理由：**恢复现场**。执行器重启后
+        靠它把「上次问过但没人答」的那些捞出来，而不是让 opencode 一直
+        等一个不会来的答复。
+
+        刻意**不轮询它**当主路径 —— 主路径走事件流，轮询只是重启后的兜底。
+        """
+        path = "/question"
+        if directory:
+            path += f"?directory={urllib.parse.quote(directory, safe='')}"
+        got = self._must(path)
+        return list(got) if isinstance(got, list) else []
+
+    def reply_question(
+        self,
+        request_id: str,
+        answers: list[list[str]],
+        *,
+        directory: str | None = None,
+    ) -> None:
+        """把人的答复送回 opencode（**一次问一个**攒起来的那份）。
+
+        端点是 ``POST /question/{id}/reply``，与 permission 那条**不是同一个**
+        —— 实测过，别把两条路径合并成一个方法：形状不同、失败含义也不同。
+
+        ``request_id`` 必须 URL 转义：它是执行器给的串，我们不保证它不含
+        斜杠之类需要转义的字符，而未转义的路径会被 ``/`` 切成多段，
+        打到**别的端点**上 —— 那种失败看起来像「服务端说不行」。
+        """
+        path = f"/question/{urllib.parse.quote(request_id, safe='')}/reply"
+        if directory:
+            path += f"?directory={urllib.parse.quote(directory, safe='')}"
+        self._must(path, "POST", question_reply_payload(answers))
 
     def abort(self, session_id: str) -> None:
         """叫停。失败只记不抛 —— 叫停是尽力而为，不是必须成功。"""
