@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -112,6 +112,15 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 可空：历史行没有。判据是「is_question 且 answer_text 非空 = 已答」，
         # 空字符串**不算已答** —— 「用户打了一行空白」不是答案。
         "ALTER TABLE pending_approvals ADD COLUMN answer_text TEXT",
+    ),
+    (
+        "10 → 11：pending_approvals 加 question_spec（一次问一个、逐轮积累）",
+        # 一列装下 {questions, answers}：问题数 = len(questions)（不另存），
+        # 发给 opencode 的载荷 = answers（形状天然是 string[][]）。
+        #
+        # 原来只有一个 answer_text 文本，N>1 时**只回答了第一个问题** ——
+        # 而 agent 是会一次问两问的。详见 ApprovalStore.request_question。
+        "ALTER TABLE pending_approvals ADD COLUMN question_spec TEXT",
     ),
 )
 

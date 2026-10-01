@@ -374,6 +374,39 @@ class PendingApproval:
     #: **库里不会出现空串** —— :meth:`ApprovalStore.answer_text` 挡掉了
     #: 空白答复。所以这里用 ``is not None`` 判「已答」是安全的。
     answer_text: str | None = None
+    #: 一次问一个、逐轮积累的**权威结构**（JSON 文本）：
+    #: ``{"questions": ["问题1", ...], "answers": [[], ...]}``
+    #:
+    #: 问题数 = ``len(questions)``，**不另存**；下一个待答 = 第一个空槽；
+    #: 发给 opencode 的载荷 = ``answers``，形状天然是 ``string[][]``。
+    #:
+    #: 为什么不拆成 questions_json + question_count + answers_json 三列：
+    #: 那是把同一份事实存三处，任何一处漂移都不太好查。**只存一次。**
+    question_spec: str | None = None
+
+    @property
+    def spec(self) -> dict:
+        """``question_spec`` 解开后的结构。**坏 JSON 当空结构**。
+
+        坏 JSON 不抛：这一列是**我们自己**写进去的，而一个写坏了的
+        待答项不该把整条消息处理搞崩 —— 那等于让一条坏数据
+        掀翻整个桥接。它退化成「没有问题」= 没人会答，等过期清理。
+        """
+        import json as _json
+
+        if not self.question_spec:
+            return {"questions": [], "answers": []}
+        try:
+            data = _json.loads(self.question_spec)
+        except (ValueError, TypeError):
+            return {"questions": [], "answers": []}
+        if not isinstance(data, dict):
+            return {"questions": [], "answers": []}
+        questions = [str(q) for q in (data.get("questions") or [])
+                     if isinstance(q, str)]
+        answers = [list(a) if isinstance(a, list) else []
+                   for a in (data.get("answers") or [])]
+        return {"questions": questions, "answers": answers}
 
     @property
     def is_decided(self) -> bool:
@@ -456,11 +489,24 @@ class ApprovalStore:
         subject: str,
         *,
         detail: str | None = None,
+        questions: Sequence[str] = (),
         credential: str | None = None,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         requested_by: str | None = None,
     ) -> PendingApproval:
-        """登记一条「agent 在提问」，等用户给一段文本答复。
+        """登记一条「agent 在提问」，等用户给文本答复。
+
+        ``questions`` 是这次要问的**全部**问题（实测载荷里那个数组）。
+        存储策略是**一次问一个**：执行器只把 ``questions[0]`` 发给用户，
+        用户答完再发下一个，攒齐了才调 opencode 的 reply 端点。
+
+        为什么不做「一次全发出去」：一条消息无法可靠地对应到多个问题 ——
+        序号？分屏？都没有好办法。opencode-feishu 就是在这上面做成了
+        切分 + 序号匹配，然后被我实测的**绝对路径**答复打穿
+        （``C:/Users/...`` 按空白切碎后匹配不上任何 label，整条被丢弃）。
+
+        所以 N=1（实测到的常见情形）与 N>1 走**同一条路径**，
+        只是轮数不同 —— 不写两套逻辑。
 
         刻意**复用同一张表**而不是另开 ``pending_questions``：
         凭据、TTL、只有发起人能答、过期处理、跨进程 wait 全部现成，
@@ -474,13 +520,20 @@ class ApprovalStore:
         cred = credential or new_credential(prefix="q")
         now = self._clock()
         expires = now + datetime.timedelta(seconds=ttl_seconds)
+        import json as _json
+
+        asked = [str(q) for q in questions if str(q).strip()]
+        spec = _json.dumps(
+            {"questions": asked, "answers": [[] for _ in asked]},
+            ensure_ascii=False,
+        )
         self._conn.execute(
             "INSERT INTO pending_approvals"
             " (credential, subject, detail, asked_at, expires_at,"
-            "  requested_by, kind)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'question')",
+            "  requested_by, kind, question_spec)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'question', ?)",
             (cred, subject, detail, now.isoformat(), expires.isoformat(),
-             requested_by),
+             requested_by, spec),
         )
         self._conn.commit()
         got = self.get(cred)
@@ -488,58 +541,134 @@ class ApprovalStore:
             raise RuntimeError(f"刚写入的提问行读不回来：{cred}")
         return got
 
-    def answer_text(
+    def put_answer(
         self, credential: str, text: str, *, answered_by: str | None = None
-    ) -> bool:
-        """写入提问的答复。**成功返回 True**，被拒/过期返回 False。
+    ) -> int | None:
+        """把一段答复填进**下一个空槽**。返回填的是第几题（从 0 起）。
 
-        与 :meth:`resolve` 并列的第二种答复通道，刻意不合并：
-        一个写 allow/deny，一个写文本，混进一个方法里会让返回值
-        出现「既是 False 又不是拒绝」这种歧义。
+        返回 ``None`` 表示没填上：不是问题、已过期、全部答完、
+        空白答复、或**不是发起人**。五种原因给用户看的文案不同，
+        所以调用方想知道具体是哪一种时用 :meth:`can_answer` 自己判断 ——
+        判定本身在这里，和 :meth:`resolve` 同一个惯例。
 
-        拒绝「非发起人」与「已过期」两件事，和授权走**同一把尺**
-        （:meth:`can_answer`）——「只有发起人能批」那条规则
-        对提问同样成立，否则别人能往你的会话里塞答案。
+        每轮都重新校验发起人：第 2 轮是**另一条消息**，
+        不能因为第 1 轮验过就放行。
         """
-        # **空白答复不写进库。** 它不含信息，而写进去会把 agent 从
-        # 「还在等」推到「拿到一个空答案」—— 用户主观上还没回答，
-        # 这一轮就白等了。留在 pending 里，他还能再答一次。
-        #
-        # 所以上面那句「空字符串不算已答」不是描述，是**这里**保证的：
-        # is_answered 只看 ``is not None``，因此库里不会出现空串。
         if not text or not text.strip():
-            return False
+            return None                     # 空白不是答复（见类文档）
         if not self.can_answer(credential, answered_by or ""):
-            return False
+            return None
         item = self.get(credential)
         if item is None or not item.is_question:
-            return False
+            return None
         if self._clock() >= item.expires_at:
-            return False
-        if item.answer_text is not None:
-            return False                     # 已答，不覆盖（与授权同规则）
-        now = self._clock()
+            return None
+        spec = item.spec
+        answers = spec["answers"]
+        slot = next((i for i, a in enumerate(answers) if not a), None)
+        if slot is None:
+            return None                     # 全部答完，不再收
+        answers[slot] = [text.strip()]
+        self._write_spec(credential, spec["questions"], answers)
+        # 扁平渲染：给日志与执行器的完成摘要看，**不参与判定**。
+        flat = "\n".join(a[0] for a in answers if a)
+        #
+        # decided_by / decided_at 一并写：对提问来说这就是「谁答的、
+        # 什么时候答的」。没有它，一次挂起的会话被人冒名答复也查不出来
+        # —— 而设计要求「谁批的必须事后查得到」。第一版重写时漏了这两列，
+        # 回归测试 ``test_answered_by_recorded`` 当场抓住。
         self._conn.execute(
             "UPDATE pending_approvals"
             " SET answer_text = ?, decided_by = ?, decided_at = ?"
             " WHERE credential = ?",
-            (text, answered_by, now.isoformat(), credential),
+            (flat, answered_by, self._clock().isoformat(), credential),
         )
         self._conn.commit()
-        return True
+        return slot
 
-    def text_answer(self, credential: str) -> str | None:
-        """读提问的答复。**没答（含已过期）返回 None。**
+    def _write_spec(
+        self, credential: str, questions: Sequence[str],
+        answers: Sequence[Sequence[str]],
+    ) -> None:
+        import json as _json
 
-        刻意不给「过期」单独一种返回值：调用方（执行器）拿到 None
-        时的动作是同一个 —— 告诉 opencode「没人答」。
-        要区分「过期没答」与「还在等」由 :attr:`PendingApproval.is_expired`
-        自己看，不必塞进返回值里。
+        self._conn.execute(
+            "UPDATE pending_approvals SET question_spec = ? WHERE credential = ?",
+            (_json.dumps({"questions": list(questions),
+                          "answers": [list(a) for a in answers]},
+                         ensure_ascii=False), credential),
+        )
+        self._conn.commit()
+
+    def answers_of(self, credential: str) -> list[list[str]]:
+        """发给 opencode 的那个载荷。**没答完就是空槽。**
+
+        刻意不「补齐」空槽：空槽是「这一问还没答」的诚实表示，
+        补成 ``[""]`` 会被当成「用户答了空的」而让 agent 拿到一个空答案。
+        """
+        item = self.get(credential)
+        if item is None or not item.is_question:
+            return []
+        return [list(a) for a in item.spec["answers"]]
+
+    def next_question(self, credential: str) -> str | None:
+        """下一个该问的问题。**全答完返回 None。**
+
+        执行器靠它决定「下一轮该发什么」；返回 None 就该收尾了。
         """
         item = self.get(credential)
         if item is None or not item.is_question:
             return None
-        if item.answer_text is None:
+        spec = item.spec
+        for i, answer in enumerate(spec["answers"]):
+            if not answer:
+                if i < len(spec["questions"]):
+                    return spec["questions"][i]
+                return None
+        return None
+
+    def is_complete(self, credential: str) -> bool:
+        """全部问题都答完了吗。"""
+        item = self.get(credential)
+        if item is None or not item.is_question:
+            return False
+        answers = item.spec["answers"]
+        return bool(answers) and all(a for a in answers)
+
+    def wait_complete(
+        self,
+        credential: str,
+        *,
+        poll_seconds: float = 0.5,
+        timeout_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> list[list[str]] | None:
+        """轮询等**全部**答完。**超时或过期返回 None。**
+
+        与 :meth:`wait` 同理用轮询而不是内存原语：等待方（执行器）
+        与答复方（桥接）**是两个进程**。
+        """
+        import time
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self.is_complete(credential):
+                return self.answers_of(credential)
+            item = self.get(credential)
+            if item is None or self._clock() >= item.expires_at:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_seconds)
+
+    # -- 兼容：单问场景的旧读法 -------------------------------------------- #
+    def text_answer(self, credential: str) -> str | None:
+        """已收到的答复**扁平文本**；一个字都没收到时返回 None。
+
+        给「N=1 就够了」的场景留的便捷读法。**判「全部答完」用
+        :meth:`is_complete`** —— 这个在 N>1 时会给出误导性的真。
+        """
+        item = self.get(credential)
+        if item is None or not item.is_question:
             return None
         return item.answer_text
 
@@ -550,10 +679,10 @@ class ApprovalStore:
         poll_seconds: float = 0.5,
         timeout_seconds: int = DEFAULT_TTL_SECONDS,
     ) -> str | None:
-        """轮询等文本答复。**超时返回 None。**
+        """等**第一段**答复。超时返回 None。
 
-        与 :meth:`wait` 同理刻意用轮询而不是内存原语：
-        等待方（执行器）与答复方（桥接）**是两个进程**。
+        只适合 N=1。N>1 请用 :meth:`wait_complete` ——
+        否则会在第一轮就返回，剩下的问题没人等。
         """
         import time
 
@@ -563,8 +692,8 @@ class ApprovalStore:
             if got is not None:
                 return got
             item = self.get(credential)
-            if item is not None and self._clock() >= item.expires_at:
-                return None                   # 过期：不答复也是一种答复
+            if item is None or self._clock() >= item.expires_at:
+                return None
             if time.monotonic() >= deadline:
                 return None
             time.sleep(poll_seconds)
@@ -863,5 +992,8 @@ def _row_to_obj(row) -> PendingApproval:
         kind=(row["kind"] if "kind" in row.keys() else None) or "approval",
         answer_text=(
             row["answer_text"] if "answer_text" in row.keys() else None
+        ),
+        question_spec=(
+            row["question_spec"] if "question_spec" in row.keys() else None
         ),
     )
