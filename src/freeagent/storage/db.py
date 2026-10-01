@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -89,6 +89,29 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 用 INTEGER 而不是时间戳，是因为并发控制要的是**单调计数**，
         # 不是「什么时候改的」。
         "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "7 → 8：占位 —— v8 的真实步骤是多语句（虚拟表 + 触发器），走 _DOMAIN_STEPS。",
+        # 为什么要占位：_MIGRATIONS 按「源版本 − 1」**位置索引**，所以这条
+        # 必须在**索引 6** 上。不占位的话，下面两条会整体前移一格 ——
+        # 「8→9」会被当成「7→8」执行，而版本号照样往上涨，
+        # 于是**迁移记录与版本号对不上**。看起来跑通了，其实做过一遍。
+        #
+        # 而不能简单留空：_run_idempotent 会 conn.execute(sql)，空语句直接炸。
+        "SELECT 1",
+    ),
+    (
+        "8 → 9：pending_approvals 加 kind（授权 / 提问，桥接要分清）",
+        # 为什么必须有这一列，不能靠 credential 前缀推：执行器的循环要按它分
+        # 两条 wait 臂（等 allow/deny 与等文本）。前缀是一种**隐式契约** ——
+        # 哪天 new_credential 换了前缀，两处一起悄悄坏掉。
+        "ALTER TABLE pending_approvals ADD COLUMN kind TEXT",
+    ),
+    (
+        "9 → 10：pending_approvals 加 answer_text（提问的答复是文本）",
+        # 可空：历史行没有。判据是「is_question 且 answer_text 非空 = 已答」，
+        # 空字符串**不算已答** —— 「用户打了一行空白」不是答案。
+        "ALTER TABLE pending_approvals ADD COLUMN answer_text TEXT",
     ),
 )
 

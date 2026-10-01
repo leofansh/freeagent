@@ -363,10 +363,36 @@ class PendingApproval:
     decided_at: datetime.datetime | None
     open_message_id: str | None
     requested_by: str | None = None
+    #: ``"approval"``（默认，兼容历史行）或 ``"question"``。
+    #:
+    #: 刻意**可空且给默认值**而不是 NOT NULL：加这一列时旧行没有值，
+    #: 而迁移只加列不回填（回填要写 UPDATE，那又是一条迁移）；
+    #: 读侧把「空」当 ``approval``，历史行的行为因此完全不变。
+    kind: str = "approval"
+    #: 提问的答复正文。
+    #:
+    #: **库里不会出现空串** —— :meth:`ApprovalStore.answer_text` 挡掉了
+    #: 空白答复。所以这里用 ``is not None`` 判「已答」是安全的。
+    answer_text: str | None = None
 
     @property
     def is_decided(self) -> bool:
         return self.decision is not None
+
+    @property
+    def is_question(self) -> bool:
+        """这条待决项是不是「等一个文本答复」。
+
+        **空 kind 当 approval** —— 加列前的历史行没有这个值，
+        而它们全是授权。若反过来把空当 question，那些行会突然开始
+        拦「打字」并期待文本答复。
+        """
+        return self.kind == "question"
+
+    @property
+    def is_answered(self) -> bool:
+        """有没有拿到答复。**授权看 decision，提问看 answer_text。**"""
+        return self.answer_text is not None if self.is_question else self.is_decided
 
     @property
     def is_expired(self) -> bool:
@@ -422,6 +448,126 @@ class ApprovalStore:
             # 这类真问题。这里显式炸，且信息里带上凭据，便于对账。
             raise RuntimeError(f"刚写入的待确认行读不回来：{cred}")
         return got
+
+    # -- 提问：等一个**文本**答复 ----------------------------------------- #
+
+    def request_question(
+        self,
+        subject: str,
+        *,
+        detail: str | None = None,
+        credential: str | None = None,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        requested_by: str | None = None,
+    ) -> PendingApproval:
+        """登记一条「agent 在提问」，等用户给一段文本答复。
+
+        刻意**复用同一张表**而不是另开 ``pending_questions``：
+        凭据、TTL、只有发起人能答、过期处理、跨进程 wait 全部现成，
+        另开一张表等于把迁移、清扫、purge、索引各复制一遍，
+        只为了换一个字段存放答复。
+
+        ``detail`` 放选项之类的补充说明 —— **不是**机器 id。
+        路由目标（opencode 的 ``que_…``）只登记它的执行器需要，
+        留在**进程内存**里即可；写进库反而暗示它需要被共享。
+        """
+        cred = credential or new_credential(prefix="q")
+        now = self._clock()
+        expires = now + datetime.timedelta(seconds=ttl_seconds)
+        self._conn.execute(
+            "INSERT INTO pending_approvals"
+            " (credential, subject, detail, asked_at, expires_at,"
+            "  requested_by, kind)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'question')",
+            (cred, subject, detail, now.isoformat(), expires.isoformat(),
+             requested_by),
+        )
+        self._conn.commit()
+        got = self.get(cred)
+        if got is None:  # pragma: no cover - 刚 INSERT 的行不可能读不回来
+            raise RuntimeError(f"刚写入的提问行读不回来：{cred}")
+        return got
+
+    def answer_text(
+        self, credential: str, text: str, *, answered_by: str | None = None
+    ) -> bool:
+        """写入提问的答复。**成功返回 True**，被拒/过期返回 False。
+
+        与 :meth:`resolve` 并列的第二种答复通道，刻意不合并：
+        一个写 allow/deny，一个写文本，混进一个方法里会让返回值
+        出现「既是 False 又不是拒绝」这种歧义。
+
+        拒绝「非发起人」与「已过期」两件事，和授权走**同一把尺**
+        （:meth:`can_answer`）——「只有发起人能批」那条规则
+        对提问同样成立，否则别人能往你的会话里塞答案。
+        """
+        # **空白答复不写进库。** 它不含信息，而写进去会把 agent 从
+        # 「还在等」推到「拿到一个空答案」—— 用户主观上还没回答，
+        # 这一轮就白等了。留在 pending 里，他还能再答一次。
+        #
+        # 所以上面那句「空字符串不算已答」不是描述，是**这里**保证的：
+        # is_answered 只看 ``is not None``，因此库里不会出现空串。
+        if not text or not text.strip():
+            return False
+        if not self.can_answer(credential, answered_by or ""):
+            return False
+        item = self.get(credential)
+        if item is None or not item.is_question:
+            return False
+        if self._clock() >= item.expires_at:
+            return False
+        if item.answer_text is not None:
+            return False                     # 已答，不覆盖（与授权同规则）
+        now = self._clock()
+        self._conn.execute(
+            "UPDATE pending_approvals"
+            " SET answer_text = ?, decided_by = ?, decided_at = ?"
+            " WHERE credential = ?",
+            (text, answered_by, now.isoformat(), credential),
+        )
+        self._conn.commit()
+        return True
+
+    def text_answer(self, credential: str) -> str | None:
+        """读提问的答复。**没答（含已过期）返回 None。**
+
+        刻意不给「过期」单独一种返回值：调用方（执行器）拿到 None
+        时的动作是同一个 —— 告诉 opencode「没人答」。
+        要区分「过期没答」与「还在等」由 :attr:`PendingApproval.is_expired`
+        自己看，不必塞进返回值里。
+        """
+        item = self.get(credential)
+        if item is None or not item.is_question:
+            return None
+        if item.answer_text is None:
+            return None
+        return item.answer_text
+
+    def wait_text(
+        self,
+        credential: str,
+        *,
+        poll_seconds: float = 0.5,
+        timeout_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> str | None:
+        """轮询等文本答复。**超时返回 None。**
+
+        与 :meth:`wait` 同理刻意用轮询而不是内存原语：
+        等待方（执行器）与答复方（桥接）**是两个进程**。
+        """
+        import time
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            got = self.text_answer(credential)
+            if got is not None:
+                return got
+            item = self.get(credential)
+            if item is not None and self._clock() >= item.expires_at:
+                return None                   # 过期：不答复也是一种答复
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_seconds)
 
     def record_card(self, credential: str, open_message_id: str) -> None:
         """记下卡片 id —— 拿到答复后要把**那张卡**改成「已允许」。
@@ -712,5 +858,10 @@ def _row_to_obj(row) -> PendingApproval:
         # 别让加列这件事反过来把老库读炸。
         requested_by=(
             row["requested_by"] if "requested_by" in row.keys() else None
+        ),
+        # 同上：旧库没有这两列时 row 里也没这些键。
+        kind=(row["kind"] if "kind" in row.keys() else None) or "approval",
+        answer_text=(
+            row["answer_text"] if "answer_text" in row.keys() else None
         ),
     )
