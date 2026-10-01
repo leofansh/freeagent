@@ -234,22 +234,40 @@ class FeishuBridge:
             return None                      # 没有挂起的提问 → 不拦
 
         skipping = text.startswith(SKIP_QUESTION)
+        total = len(pending.spec["questions"])
         slot = store.put_answer(
             pending.credential,
             SKIP_ANSWER_TEXT if skipping else text,
             answered_by=who,
         )
+        # 跳过必须**填满所有尚空的槽位**。
+        #
+        # 端到端测试等到的：`put_answer` 只填一个槽，所以两问的提问
+        # 跳过一次只留下第 2 个空槽，执行器仍然卡在 `wait_answer(1)`。
+        # 而卡上写着「不想回答可以回 /skip-question」—— 三个问题就得打三次，
+        # 那不是退出通道，是小型得到。
+        while skipping and slot is not None and slot < total - 1:
+            slot = store.put_answer(
+                pending.credential, SKIP_ANSWER_TEXT, answered_by=who,
+            )
         if slot is None:
             log.info("【提问】记不上（凭据=%s）", pending.credential)
             return ("这条答案没记上 —— 可能已过期，"
                     "或不是发起那条委派的人。")
 
-        total = len(pending.spec["questions"])
         done = store.is_complete(pending.credential)
         log.info("【提问】凭据=%s 第 %d/%d 问：%s（%s）",
                  pending.credential, slot + 1, total,
                  "跳过" if skipping else "已收到答案", who)
+        # 跳过与回答必须**分开说**。
+        #
+        # `is_complete` 的含义是「没有空槽位」，**不是「人回答过」**。
+        # 用它选文案，就会对一个全部跳过的提问说「全部答完」——
+        # 那与卡上承诺了退出通道又不给人说是跳过，属于同一类夸大。
         if done:
+            if skipping:
+                return (f"已跳过这 {total} 个问题，不阻它。"
+                        "它会按「没有答案」继续（或自己放弃）。")
             return (f"收到了，这 {total} 个问题全部答完。"
                     "opencode 继续干活。")
         return (f"收到了（第 {slot + 1}/{total} 问）。还有 "
