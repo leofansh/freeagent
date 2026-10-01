@@ -60,7 +60,7 @@ def store(conn):
 
 class TestMigration:
     def test_version(self):
-        assert SCHEMA_VERSION == 11
+        assert SCHEMA_VERSION == 12
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

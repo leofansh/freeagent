@@ -43,7 +43,7 @@ class _AllowAllGate:
         self.reason = reason
         self.calls: list[tuple] = []
 
-    def check(self, *, task_id, project, brief):
+    def check(self, *, task_id, project, brief, requester=""):
         self.calls.append((task_id, project, brief))
         return None   # None = 放行
 

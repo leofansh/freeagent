@@ -153,6 +153,15 @@ class Task:
     #: 「在飞书里派一件事，然后结果自己飞回来」这件事就不成立。
     #: ``None`` = 从终端发起的，结果只进产物链与日志（终端本来就能看）。
     delegate_chat_id: str | None = None
+    #: **谁**发起的这条委派（飞书 ``open_id``）。
+    #:
+    #: 与 :attr:`delegate_chat_id` 是两回事：那是「发到哪」（会话），
+    #: 这是「谁发起的」（人）。而**后者才是「只有发起人能批」那条规则的输入**。
+    #:
+    #: 可空：终端发起的委派没有飞书身份，那是**正常情况**；
+    #: 不该为了非空而填一个「随便某个人」——
+    #: 那等于凭空造一个越权面。
+    delegate_requested_by: str | None = None
     current_artifact_id: str | None = None
 
     @property

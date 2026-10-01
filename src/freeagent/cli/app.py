@@ -818,6 +818,13 @@ class Repl:
             delegate_chat_id=(
                 self.channel_ctx.chat_id if self.channel_ctx else None
             ),
+            # 「谁发起的」—— 与上面那个「发到哪」取自**同一个** channel_ctx，
+            # 所以两者天然一致：不会出现「A 发起的、
+            # 结果却推给 B 的会话」。终端发起时 channel_ctx 是 None。
+            delegate_requested_by=(
+                (self.channel_ctx.sender_open_id or None)
+                if self.channel_ctx else None
+            ),
         )
         self._say(f"已建委派事务 {task.id[:8]}")
         self._say(f"  项目：{project}")

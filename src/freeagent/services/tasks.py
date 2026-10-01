@@ -120,6 +120,7 @@ class TaskService:
         task_id: str | None = None,
         project_path: str | None = None,
         delegate_chat_id: str | None = None,
+        delegate_requested_by: str | None = None,
     ) -> Task:
         now = self._clock.now()
         state = TaskState.BLOCKED if kind is TaskKind.WAIT else TaskState.INBOX
@@ -141,6 +142,7 @@ class TaskService:
             updated_at=now,
             project_path=project_path,
             delegate_chat_id=delegate_chat_id,
+            delegate_requested_by=delegate_requested_by,
         )
         validate_task(task)
         saved = self._tasks.add(task)

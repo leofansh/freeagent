@@ -62,6 +62,7 @@ _TASK_COLUMNS = (
     "progress_note",
     "project_path",
     "delegate_chat_id",
+    "delegate_requested_by",
     "current_artifact_id",
 )
 
@@ -657,6 +658,7 @@ class TaskRepo(_RepoBase):
             progress_note=row["progress_note"],
             project_path=row["project_path"],
             delegate_chat_id=row["delegate_chat_id"],
+            delegate_requested_by=row["delegate_requested_by"],
             current_artifact_id=row["current_artifact_id"],
         )
 
@@ -686,6 +688,7 @@ class TaskRepo(_RepoBase):
             task.progress_note,
             task.project_path,
             task.delegate_chat_id,
+            task.delegate_requested_by,
             task.current_artifact_id,
         )
 

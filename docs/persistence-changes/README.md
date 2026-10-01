@@ -31,7 +31,12 @@
 | 7 | `tasks.revision` | 读-改-写要能发现「我读到的已经不是最新的」；`updated_at` 是时间戳，同一秒内分不出先后 | `_MIGRATIONS[5]` |
 | 8 | `role_knowledge` + FTS5 索引 | 角色脉络知识要**可检索**（3.6）。`Role.note` 是自由文本，能读不能搜 | `_DOMAIN_STEPS[0]` |
 
-`SCHEMA_VERSION = 8`（`storage/db.py`）。
+| 9 | `pending_approvals.kind` | 档道要分清「等 allow/deny」与「等文本」两条每循。**不能靠凭据前缀推**（隐式契约）| `_MIGRATIONS[7]` |
+| 10 | `pending_approvals.answer_text` | 提问的答复是**文本**而不是 allow/reject 枚举 | `_MIGRATIONS[8]` |
+| 11 | `pending_approvals.question_spec` | agent 一次能问两问，而原来只有一个 `answer_text` → **只回答了第一个** | `_MIGRATIONS[9]` |
+| 12 | `tasks.delegate_requested_by` | 「只有发起人能批」的**输入**：tasks 只有 `delegate_chat_id`（会话）而没有「人」 | `_MIGRATIONS[10]` |
+
+`SCHEMA_VERSION = 12`（`storage/db.py`）。
 
 > **v8 是第一个「多语句」迁移。** `_MIGRATIONS` 一步只跑一条 `conn.execute`，
 > 而 v8 要建一张表 + 一个索引 + 一个**虚拟表** + 三个触发器，塞不进一条语句。
@@ -84,4 +89,6 @@
    `historical-formats/` 下补一页，说明旧数据怎么解释
 
 > **V1.16（2026-10-01）更正**：`pending_approvals.requested_by` 这一列**已落地、判定已实现且有测试**，但执行器喂进去的值是「白名单里排序第一的人」而不是委派的发起人 —— 所以「只有发起人能批」的实际效果与描述相反。
-> 本表记录的是**当时的迁移事实**，所以不改写；当前状态见设计文档 11.8.1「取值错在哪」。
+> 本表记录的是**当时的迁移事实**，所以不改写。
+>
+> **V1.17（2026-10-02）已修**：新增版本 **12** 补上了缺的入口 —— `tasks.delegate_requested_by`。当前状态见设计文档 11.8.1「取值错在哪」。

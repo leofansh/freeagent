@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -121,6 +121,17 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 原来只有一个 answer_text 文本，N>1 时**只回答了第一个问题** ——
         # 而 agent 是会一次问两问的。详见 ApprovalStore.request_question。
         "ALTER TABLE pending_approvals ADD COLUMN question_spec TEXT",
+    ),
+    (
+        "11 → 12：tasks 加 delegate_requested_by（「只有发起人能批」的输入）",
+        # 之前 tasks 只有 delegate_chat_id（**会话**），没有「**人**」——
+        # 于是闸门拿不到发起人，「只有发起人能批」
+        # 实际退化成「白名单里排序第一的人能批」
+        # （见设计文档 11.8.1「取值错在哪」）。
+        #
+        # 可空：终端发起的没有飞书身份，那是正常情况——
+        # 不该为了非空而填一个「随便某个人」。
+        "ALTER TABLE tasks ADD COLUMN delegate_requested_by TEXT",
     ),
 )
 
@@ -251,6 +262,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     progress_note        TEXT,
     project_path         TEXT,
     delegate_chat_id     TEXT,
+    delegate_requested_by TEXT,   -- 「谁发起的」；可空（终端发起没有飞书身份）
     reminder_rule        TEXT,
     revision             INTEGER NOT NULL DEFAULT 0,
     current_artifact_id  TEXT REFERENCES artifacts(id) ON DELETE SET NULL

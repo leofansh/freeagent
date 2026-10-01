@@ -363,7 +363,9 @@ def run_once_with_tool_gate(
                         task, project,
                         build_brief(task, task.intent, task.definition_of_done),
                         policy=the_policy, store=store, sender=sender,
-                        approver=approver, server_factory=server_factory,
+                        # 同理：执行期的每一次授权也得知道**谁发起的这条委派**。
+                        approver=task_requester(task, approver),
+                        server_factory=server_factory,
                     )
                 except FreeAgentError as exc:
                     outcome = DispatchOutcome(
@@ -420,7 +422,8 @@ class Gate(Protocol):
     返回原因而不是 bool，是为了让用户看到「是自己没点，还是被安全规则挡了」。
     """
 
-    def check(self, *, task_id: str, project: str, brief: str) -> str | None: ...
+    def check(self, *, task_id: str, project: str, brief: str,
+               requester: str = "") -> str | None: ...
 
 
 class ApprovalGate:
@@ -493,14 +496,27 @@ class ApprovalGate:
         return ApprovalPolicy.for_context(self._context).ttl_seconds
 
     def check(
-        self, *, task_id: str, project: str, brief: str
+        self, *, task_id: str, project: str, brief: str,
+        requester: str = "",
     ) -> str | None:
         """返回 ``None`` = 放行；返回**字符串** = 拒绝原因。
 
         刻意返回「原因」而不是 bool：拒绝时必须能说清是哪一层拦的，
         否则用户只会看到「失败了」而无法判断是自己没点、还是被安全规则挡了。
         """
-        ctx = self.context
+        # 「谁发起的」是**本次调用**的参数，不是闸门的状态。
+        #
+        # 原因：闸门是**一次构造、多条事务共用**的，而不同事务的发起人不同——
+        # 一个共用的 approver 装不下。它被用在**三处**处：
+        # pending 行的 requested_by、卡片的收件人、
+        # 以及 context.who。
+        #
+        # 优先级：有身份（飞书发起）用它；没有（终端发起）
+        # 落回 ``self._approver``，**行为与今天完全一致**。
+        who = requester or self._approver
+        ctx = ApprovalContext(
+            self._context, who=who, argv=self._argv, env=self._env
+        )
 
         # 1) 绕过态。**有就是拒绝**，不设「容忍绕过」这档。
         if ctx.is_bypassing:
@@ -531,7 +547,7 @@ class ApprovalGate:
             project=str(project), brief=brief, context=ctx
         )
         try:
-            card = self._send_card(pending)
+            card = self._send_card(pending, to=who)
         except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成拒绝
             # 发卡失败**绝不**降级成「那就直接跑吧」—— 那正是闸门形同虚设
             # 的样子：通道坏了 = 无人监督 = 拒绝。
@@ -574,7 +590,7 @@ class ApprovalGate:
         self._record_card(pending, card)
         return None
 
-    def _send_card(self, pending: PendingApproval) -> str | None:
+    def _send_card(self, pending: PendingApproval, *, to: str = "") -> str | None:
         """发确认卡，返回 message_id。
 
         走的是 :class:`~freeagent.services.localops.CardSender` **协议**
@@ -592,7 +608,10 @@ class ApprovalGate:
         if self._sender is None:
             raise RuntimeError("没有发卡通道（sender=None）—— 无法请求批准")
         return self._sender.send_approval_card(
-            open_id=self._approver,
+            # 收件人用 ``to``（本次的发起人）而不是 ``self._approver``。
+            # 否则卡发给了一个人、库里记的发起人却是另一个，
+            # 两边不一致又变成另一种错。
+            open_id=to or self._approver,
             subject=pending.subject,
             detail=pending.detail or "",
             credential=pending.credential,
@@ -724,6 +743,31 @@ def run_with_tool_gate(
     )
 
 
+def task_requester(task, fallback: str = "") -> str:
+    """这条委派的**发起人**，没有就落回 ``fallback``。
+
+    ## 为什么需要这个函数
+
+    V1.16 之前，闸门拿到的是「白名单里**排序第一的人**」（
+    ``sorted(cfg.allowed_users)`` 的首个，空白名单时为空串）。
+    因此「只有发起人能批」的实际效果与文档描述**相反**：
+    真正的发起人点不动，没发起的人反而能批。
+
+    现在**优先**用事务上真的记着那个人（``delegate_requested_by``，
+    飞书发起时由 ``_cmd_delegate`` 从 ``channel_ctx.sender_open_id`` 落下）。
+
+    ## ``fallback`` 是兜底而不是规则
+
+    只有**终端发起**的委派会走到它 —— 那条路径没有飞书身份，
+    是**正常情况**。把「没有身份」当成「随便某个人」等于凭空造一个越权面，
+    所以宁可落回旧行为，也不填一个假身份。
+
+    另外：空串与 ``None`` 必须同等对待——空串不是「有身份」。
+    同理，对象缺少这个属性时也不应撞（旧对象、别的实现）。
+    """
+    return (getattr(task, "delegate_requested_by", None) or "").strip() or fallback
+
+
 def _ask_one_tool(
     oc,
     req,
@@ -801,7 +845,13 @@ def _dispatch_one(
     # 顺序刻意在「记派发出去了」**之前** —— 一条被拒绝的委派不该留下
     # 「已派出」的痕迹，否则日志会骗人，而且重跑时看不出它到底跑没跑。
     if gate is not None:
-        refusal = gate.check(task_id=task.id, project=str(project), brief=brief)
+        # 只传事务上真的发起人；「没有就落回闸门自己的」由 check() 内部管
+        # （``who = requester or self._approver``）。
+        # 所以这条规则**只有一处**，调用点不需要知道兜底逻辑。
+        refusal = gate.check(
+            task_id=task.id, project=str(project), brief=brief,
+            requester=task_requester(task),
+        )
         if refusal is not None:
             outcome = DispatchOutcome(
                 ok=False,

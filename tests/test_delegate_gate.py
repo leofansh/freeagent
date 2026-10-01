@@ -44,7 +44,7 @@ class _RecordingRunner:
 class _AllowAllGate:
     """放行闸门（对照组）。**只在要证明「闸门放行时确实会跑」时用。**"""
 
-    def check(self, *, task_id, project, brief):
+    def check(self, *, task_id, project, brief, requester=""):
         return None
 
 
@@ -124,7 +124,7 @@ class TestAttacksThatMustFail:
     # -- 攻击 2：闸门拒绝（人没点） ----------------------------------------- #
     def test_refused_gate_means_no_run(self, wired):
         class _DenyGate:
-            def check(self, *, task_id, project, brief):
+            def check(self, *, task_id, project, brief, requester=""):
                 return "用户点了拒绝"
 
         runner = _RecordingRunner()
@@ -401,7 +401,7 @@ class TestControlGroup:
         calls: list[str] = []
 
         class _SpyGate:
-            def check(self, *, task_id, project, brief):
+            def check(self, *, task_id, project, brief, requester=""):
                 calls.append(task_id)
                 return None
 
@@ -416,7 +416,7 @@ class TestControlGroup:
         calls: list[str] = []
 
         class _SpyGate:
-            def check(self, *, task_id, project, brief):
+            def check(self, *, task_id, project, brief, requester=""):
                 calls.append(task_id)
                 return None
 
