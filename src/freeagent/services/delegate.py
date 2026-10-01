@@ -125,6 +125,16 @@ class DispatchOutcome:
     detail: str = ""
     session_id: str | None = None
     tool_calls: tuple[str, ...] = ()
+    #: 这次**实际**用的 ``provider/model``，形如 ``deepseek/deepseek-v4-pro``。
+    #:
+    #: 为什么必须记：委派**不继承**你 ``~/.config/opencode/`` 里的 provider 配置
+    #: （设计文档 11.8.1 配置隔离），所以「用哪个模型」由 ``--model`` 显式决定、
+    #: 否则由 opencode 自己挑。**两者都会静默变化** ——
+    #: 实测加了环境白名单之后，委派从 ``deepseek/deepseek-v4-pro``
+    #: 悄悄换成了 ``opencode/big-pickle``，而产物里**一个字都没留**。
+    #:
+    #: 记下来，它就从「事后没人知道」变成「一眼可查」。
+    model: str = ""
 
 
 #: 一次委派在日志里可能留下的三种记录。**按出现顺序**看最后一条，
@@ -310,6 +320,7 @@ def parse_opencode_output(stdout: str) -> DispatchOutcome:
     errors: list[str] = []
     session_id: str | None = None
     tools: list[str] = []
+    model = ""
 
     for line in stdout.splitlines():
         if not _JSON_LINE.match(line):
@@ -321,6 +332,16 @@ def parse_opencode_output(stdout: str) -> DispatchOutcome:
         if not isinstance(event, dict):
             continue
         session_id = event.get("sessionID") or session_id
+        # **实际用的模型**。取**第一个**带 model 的那条，不追着最后一条 ——
+        # 中途换模型时要能回答「它是怎么开跑的」，那才是「我以为我配的是哪个」
+        # 这个问题的答案。（第一版写成无条件覆盖，结果拿到的是最后一个，
+        # 与下面这句注释矛盾 —— 是回归测试把两者对出来的。）
+        if not model:
+            info = event.get("info")
+            if isinstance(info, dict):
+                m = info.get("model")
+                if isinstance(m, dict) and m.get("providerID") and m.get("modelID"):
+                    model = f"{m['providerID']}/{m['modelID']}"
         data = _payload(event)
         kind = data.get("type") or event.get("type")
         if kind in _TEXT_TYPES:
@@ -361,4 +382,5 @@ def parse_opencode_output(stdout: str) -> DispatchOutcome:
         summary="\n\n".join(texts)[:4000],
         session_id=session_id,
         tool_calls=tuple(tools),
+        model=model,
     )

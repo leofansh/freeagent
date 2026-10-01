@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 from .executors import (
     ExecutorAdapter,
@@ -51,6 +51,8 @@ __all__ = [
     "parse_sse_event",
     "permission_from_event",
     "reply_payload",
+    "build_child_env",
+    "child_env_visibility",
     "OpenCodeServer",
     "free_port",
     "current_adapter",
@@ -120,6 +122,148 @@ def build_isolated_config(config: dict[str, Any] | None = None) -> str:
         config if config is not None else delegation_permission_config(),
         ensure_ascii=False, indent=2,
     )
+
+
+# ── 子进程环境白名单（规范性）───────────────────────────────────────────── #
+#
+# 原来这里是 ``env = dict(os.environ)`` —— **全量继承**。改的理由不是「更干净」，
+# 而是它与本项目自己的安全声明矛盾：
+#
+# - 11.8.1 说未命中规则时 V1 默认 ``allow``，所以本项目靠**显式配置**当闸门；
+# - SAFETY.md 说「不要把本项目当成不可信负载的唯一安全控制」。
+#
+# 而全量继承意味着：**委派出去的 opencode 子进程看得到本机全部环境变量** ——
+# 云凭据、CI token、``SSH_AUTH_SOCK``、其它项目的 API Key 全在里面。它跑着
+# 完整 LLM 工具链，而默认配置里读与检索是放行的。
+#
+# 参照 ``D:\GitHub\qm`` 的 ``cleanEnv``：**9 键白名单、从零构造、什么都不继承**。
+# 但不能照抄它那份 —— 它把真实 provider key 塞进 opencode 配置，
+# 那一点上本项目更严（配置里只有 permission，见 :func:`build_isolated_config`）。
+
+#: OS 必需：**缺任何一个都可能让服务起不来**，不是「不安全」而是「不工作」。
+#: ``SYSTEMROOT`` 尤其关键 —— 缺了它 Winsock 都初始化不了，监听端口直接失败。
+_OS_REQUIRED_ENV: frozenset[str] = frozenset({
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "PROCESSOR_IDENTIFIER",
+    # shell 与编码：opencode 的 bash 工具起子进程要 COMSPEC/PATHEXT
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    # Windows 上 Python 与多数库仍会读这两个，置空会让部分调用炸在
+    # 「找不到临时目录」而不是失败在真正的原因上
+    "TEMP", "TMP",
+})
+
+#: 会被**重定向进 jail** 的家目录 / 配置目录类变量。
+#:
+#: 原来只改了 ``XDG_CONFIG_HOME``，于是配置隔开了但**数据与缓存仍写回真实家目录**，
+#: 而 ``HOME``/``USERPROFILE`` 更是让 opencode 能读 ``~/.ssh``、``~/.aws``。
+#: 全部指向一次性目录，随 close 一起删掉。
+_JAILLED_ENV: frozenset[str] = frozenset({
+    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "TMPDIR", "TEMP", "TMP",
+})
+
+
+def _model_credential_env_names() -> frozenset[str]:
+    """允许透传的**模型凭据**变量名。
+
+    为什么这类必须放行：:func:`build_isolated_config` **只写 permission 配置**，
+    不写 provider 也不写 key —— 所以模型凭据唯一的来路就是继承的环境。
+    一刀切掉，委派会直接 401/402（实测：探针里 ``deepseek-v4-pro`` 就是靠
+    环境里的 key 跑通的）。
+
+    基取本项目 LLM 注册表 :func:`freeagent.services.llm.providers.all_key_env_vars`
+    —— 那是仓库内唯一的权威列表，不另编一份（另编必然漂移）。
+    再补 opencode 自己常用、而本项目 LLM 层没有的那几个。
+
+    刻意**只放行模型凭据**：像 ``GITHUB_TOKEN``、``AWS_*``、``SSH_AUTH_SOCK``
+    这类与「让 opencode 调模型」无关的**一律不传**。
+    """
+    names = {
+        # opencode 常用、本项目 LLM 层没有的
+        "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY",
+        "GEMINI_API_KEY", "GROQ_API_KEY", "XAI_API_KEY",
+        "MISTRAL_API_KEY", "COHERE_API_KEY", "DEEPSEEK_API_KEY",
+        "AZURE_OPENAI_API_KEY", "CEREBRAS_API_KEY", "OPENCODE_API_KEY",
+    }
+    try:
+        from .llm.providers import all_key_env_vars
+    except Exception:                               # noqa: BLE001 - 缺了也能跑
+        pass
+    else:
+        names.update(all_key_env_vars())
+    return frozenset(names)
+
+
+def build_child_env(
+    *,
+    jail: pathlib.Path,
+    exe: str | None = None,
+    extra: Mapping[str, str] | None = None,
+    credential_names: Iterable[str] | None = None,
+) -> dict[str, str]:
+    """构造子进程环境。**白名单式：不继承 :data:`os.environ`。**
+
+    纯函数（无 IO、无 spawn）所以能直接测「子进程能看到什么」。
+
+    :param jail: 一次性家目录。``HOME`` 与各类 XDG/缓存/临时目录**全部**指向它。
+    :param exe: opencode 可执行文件路径。把它所在目录放进 ``PATH`` ——
+        替身方案里常用自造脚本，得能找得到。
+    :param extra: 显式追加（``OPENCODE_SERVER_USERNAME`` / ``_PASSWORD`` 等）。
+    :param credential_names: 覆盖「放行哪些模型凭据」，给测试用。
+    """
+    env: dict[str, str] = {}
+
+    # 1) OS 必需
+    for name in _OS_REQUIRED_ENV:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+
+    # 2) PATH：**白名单**，不是继承。
+    #    只给系统目录 + opencode 所在目录（替身方案常见自造脚本）。
+    parts = [str(pathlib.Path(exe).parent)] if exe else []
+    parts += [r"C:\Windows\System32", r"C:\Windows", r"C:\Windows\System32\Wbem"]
+    env["PATH"] = os.pathsep.join(parts)
+
+    # 3) 家目录 / 缓存 / 临时目录：全部关进 jail
+    for name in _JAILLED_ENV:
+        env[name] = str(jail)
+    env["TMPDIR"] = str(jail)
+    env["TEMP"] = str(jail)
+    env["TMP"] = str(jail)
+
+    # 4) 模型凭据：功能必需，但**只放行这一类**
+    names = (frozenset(credential_names) if credential_names is not None
+             else _model_credential_env_names())
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
+
+    # 5) 显式追加（优先级最高，会覆盖上面同名项）
+    if extra:
+        env.update(extra)
+    return env
+
+
+def child_env_visibility(
+    env: Mapping[str, str], *, secret_names: Iterable[str] = ()
+) -> dict[str, list[str]]:
+    """给「子进程能看到什么」出一份可断言的对照（测试与诊断用）。
+
+    只回**名字**与「是否非空」，**不回值** —— 凭据的值不进日志。
+    """
+    secrets = set(secret_names)
+    visible = sorted(env)
+    return {
+        "可见变量": visible,
+        "其中非空": sorted(k for k, v in env.items() if v != ""),
+        "凭据类（已隐去值）": sorted(
+            f"{k}{'（非空）' if env[k] else '（空）'}" for k in visible if k in secrets
+        ),
+    }
+
 
 
 def permission_from_event(properties: Any) -> ToolPermission | None:
@@ -228,14 +372,15 @@ class OpenCodeServer:
             build_isolated_config(), encoding="utf-8"
         )
 
-        env = dict(os.environ)
-        env.update({
-            "OPENCODE_SERVER_USERNAME": "opencode",
-            "OPENCODE_SERVER_PASSWORD": self._password,
-            # 完全替换，不是合并（实测：OPENCODE_CONFIG 会漏进用户配置）
-            "XDG_CONFIG_HOME": str(self._home),
-        })
-        env.update(self._extra_env)
+        env = build_child_env(
+            jail=self._home,
+            exe=shutil.which(self._exe) or self._exe,
+            extra={
+                "OPENCODE_SERVER_USERNAME": "opencode",
+                "OPENCODE_SERVER_PASSWORD": self._password,
+                **self._extra_env,
+            },
+        )
 
         # 进程组参数**两个平台不同**（Windows 要 creationflags、POSIX 要
         # start_new_session）。刻意用显式分支而不是
@@ -250,8 +395,12 @@ class OpenCodeServer:
             popen_kwargs["start_new_session"] = True
         try:
             self._proc = subprocess.Popen(
+                # ``--hostname`` **显式给回环**，不靠默认值。随机密码已经在了，
+                # 但「只在回环监听」是更靠前的一层 —— 它决定同机别的进程
+                # 能不能看见这个端口。参照 qm 的 ``--hostname=127.0.0.1``。
                 [shutil.which(self._exe) or self._exe,
-                 "serve", "--port", str(self._port)],
+                 "serve", "--hostname", "127.0.0.1",
+                 "--port", str(self._port)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 cwd=str(self._project), env=env, shell=False,
                 **popen_kwargs,

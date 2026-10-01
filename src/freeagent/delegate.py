@@ -907,6 +907,11 @@ def _record_result(app, task, outcome: DispatchOutcome) -> None:
         body += f"\n\n**失败详情**\n\n```\n{detail[:4000]}\n```"
     if outcome.session_id:
         body += f"\n\n<!-- opencode session: {outcome.session_id} -->"
+    if outcome.model:
+        # **实际用的模型**。刻意写进产物正文而不是只打日志 ——
+        # 实测过委派从 deepseek 悄悄换成 opencode/big-pickle 而库里一个字都没有；
+        # 写进产物，`/artifact` 就能一眼看见「这次到底谁干的」。
+        body += f"\n<!-- 模型：{outcome.model} -->"
     if outcome.tool_calls:
         body += "\n<!-- 用到的工具：" + "、".join(outcome.tool_calls) + " -->"
 
