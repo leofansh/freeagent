@@ -118,7 +118,10 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge_mod, "_card_conn", app.conn)
     monkeypatch.setattr(bridge_mod, "_card_sender", sender, raising=False)
     monkeypatch.setattr(bridge_mod, "_card_channel", channel, raising=False)
-    monkeypatch.setattr(bridge_mod, "send_menu_card", _Cards())
+    # 记录器挂在 sender 上：它是被 yield 出去的对象，测试才拿得到。
+    # 之前 patch 完就丢，`sent_cards` 那种写法只能是幻觉。
+    sender.cards = _Cards()
+    monkeypatch.setattr(bridge_mod, "send_menu_card", sender.cards)
     yield sender, channel, app
     app.close()
 
@@ -208,6 +211,118 @@ def test_empty_choice_is_refused(wired):
 # --------------------------------------------------------------------------- #
 # A menu click must not be mistaken for a permission decision
 # --------------------------------------------------------------------------- #
+def test_roles_button_sends_a_card_not_a_text_list(wired):
+    """点「我有哪些角色」必须**发角色卡**，不是发文本列表。
+
+    这是本轮修的那处分叉：第一版这里退回纯文本 + 一句「发 /role <名字>」，
+    于是同一件事在打字路上给卡片、按钮路上给文本。
+
+    单测只覆盖 `_run_menu` 时**抓不到**这个洞 —— 它看起来完全正常。
+    要抓它必须断言「发的是卡」，也就是下面这一条。
+    """
+    sender, channel, app = wired
+    app.roles.create("工作")          # fixture 已建了「默认脉络」
+
+    out = bridge_mod._card_action(
+        _click({"action": MENU_ACTION, "choice": "roles", "chat": CHAT})
+    )
+
+    # 发的是卡，不是文字
+    assert not sender.sent, "又退回纯文本了：角色列表该给可点的按钮"
+    assert sender.cards.calls, "没发出角色卡"
+    assert out["toast"]["type"] == "success"
+
+
+def test_today_button_actually_runs_the_view(wired):
+    """点「今天该做什么」要**真的跑**视图，不是回一句「发 /today」。
+
+    转手 `_run_view_choice` 的收益就在这里：菜单与直接打 `/today` 的输出
+    逐字一致，因为走的是同一份渲染（12.1.1 的硬约束）。
+    """
+    sender, channel, _ = wired
+    bridge_mod._card_action(
+        _click({"action": MENU_ACTION, "choice": "today", "chat": CHAT})
+    )
+    assert channel.seen == (CHAT, ALICE, "/today"), "没走只读视图路径"
+    assert not any("发 /today" in t for _, t in sender.sent), (
+        "又把人踢回去打字了"
+    )
+
+
+def test_role_query_and_role_button_agree(wired):
+    """打字问角色与点角色按钮，**必须发出同一张卡**。
+
+    这是「一张分派表 + 一份发卡实现」的可观测后果。第一版它们漂过
+    （卡 vs 文本），而两边各自的单测都绿 —— 因为没有任何一条断言
+    「两条路发的东西相同」。
+    """
+    sender, channel, app = wired
+    app.roles.create("工作")
+
+    # 按钮路
+    bridge_mod._card_action(
+        _click({"action": MENU_ACTION, "choice": "roles", "chat": CHAT})
+    )
+    from_button = [c["items"] for c in sender.cards.calls]
+
+    # 打字路：走同一个 _send_role_card_via
+    sender.cards.calls.clear()
+    bridge = bridge_mod.FeishuBridge.__new__(bridge_mod.FeishuBridge)
+    bridge.sender = sender
+    bridge._send_role_card(_FakeMsg())
+    from_text = [c["items"] for c in sender.cards.calls]
+
+    assert from_button, "按钮路没发卡"
+    assert from_button == from_text, (
+        f"两条路发出的角色卡不同：按钮={from_button} 打字={from_text}"
+    )
+
+
+class _FakeMsg:
+    """`_send_role_card` 读的就这两个字段。"""
+
+    sender_open_id = ALICE
+    chat_id = CHAT
+
+
+def test_menu_never_ends_by_asking_you_to_type(wired):
+    """规范性：菜单项**不许以「发 /xxx ……」把人踢回打字**（12.1.3）。
+
+    菜单的意义是「识别优于回忆」。回一句命令让用户自己去打，等于把菜单
+    刚省掉的那一步又塞回去。
+
+    `help` 与 `delegate` 允许出现命令，但必须是**可直接照着发的那一条**
+    （带反引号的完整命令），而不是「你去发 /xxx」这种指路。
+
+    判据刻意只用「正文里有没有一条可直接照发的命令」。原先还想断言
+    「不许以句号收尾」，那是坏判据 —— `完整命令表发 /help。` 收尾完全正当，
+    而它确实让那条测试红了。**测试自己写错，比代码有 bug 更需要记下来。**
+    """
+    for choice in ("help", "delegate", "today", "roles"):
+        plan = bridge_mod._menu_dispatch(choice)
+        if plan.get("view") or plan.get("roles"):
+            # 走视图或发卡：根本没有正文，不构成死胡同
+            continue
+        text = plan.get("text") or ""
+        assert "`/" in text, (
+            f"{choice} 的正文里没有一条可直接照发的命令：{text!r}"
+        )
+
+
+def test_view_and_card_choices_have_no_text_at_all(wired):
+    """``today`` / ``roles`` 是**两条路都给结果**的菜单项：一条正文都不发。
+
+    这是 12.1.3 那条规范最容易被绕开的地方 —— 表里有 ``text`` 兜底，实现
+    就可能顺手「text 为空也给点什么」。明确断言它们**没有正文**，比断言
+    正文内容更能守住结构。
+    """
+    for choice in ("today", "roles"):
+        plan = bridge_mod._menu_dispatch(choice)
+        assert not plan.get("text"), (
+            f"{choice} 不该有正文：它要么跑视图要么发卡，两种都不需要文字"
+        )
+
+
 def test_non_allowlisted_clicker_gets_nothing(wired, monkeypatch):
     """白名单外点菜单按钮：**什么也拿不到**。
 

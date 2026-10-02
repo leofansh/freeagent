@@ -408,29 +408,29 @@ class FeishuBridge:
                 msg.event_id, msg.message_id,
             )
 
-        if kind == "roles":
+        plan = _menu_dispatch(kind)
+        if plan.get("roles"):
             return self._send_role_card(msg)
+        text = plan.get("text")
+        if text:
+            # 入口卡那一项在表里是空的（它只给按钮、不给正文），所以这里
+            # 实际只会有将来的表项落进来。留着是为了加新项时不必改这里。
+            return text
         self._send_entry_menu(msg)
         return ""                            # 卡已说明一切，不必再回文字
 
-    def _send_role_card(self, msg) -> str:
-        """发「选一个角色」卡。返回要回给用户的话（空串 = 不用回）。"""
-        names = _role_names()
-        if not names:
-            return "读不到角色（助手可能没连上数据库），稍后再试。"
-        try:
-            send_menu_card(
-                self.sender,
-                open_id=msg.sender_open_id,
-                subject="选一个角色",
-                items=[(n, f"role:{n}") for n in names[:20]],
-                note="点一个看它下面的事务；名字已经按角色列在上面了。",
-                chat_id=msg.chat_id,
-            )
-        except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
-            log.warning("【菜单】发角色卡失败", exc_info=True)
-            return "你的角色：" + "、".join(names[:20])
-        return ""
+    def _send_role_card(self, msg, *, open_id=None, chat_id=None) -> str:
+        """打字路径的入口。**转手** :func:`_send_role_card_via`，不自己实现。
+
+        刻意薄到只有一行：这一层存在的唯一理由是打字路径手里有 ``msg``、
+        而那份共享实现要的是 ``open_id`` / ``chat_id``。一旦在这里再写一遍
+        发卡逻辑，就又是第二份实现（设计文档 12.1.3）。
+        """
+        return _send_role_card_via(
+            sender=self.sender,
+            open_id=open_id if open_id is not None else msg.sender_open_id,
+            chat_id=chat_id if chat_id is not None else msg.chat_id,
+        )
 
     def _process(self, msg: IncomingMessage) -> None:
         if msg.unsupported_type:
@@ -1173,10 +1173,38 @@ def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
             return _no_card_change("选项不完整，未处理")
         return _run_view_choice({"view": f"/role {name}", "chat": chat_id}, who=who)
 
-    if choice in ("today", "help", "delegate", "roles"):
-        text = _menu_reply(choice, chat_id)
-    else:
+    # **从这一行往下，查的是 :func:`_menu_dispatch` 那张表**——
+    # 与打字路径同一个来源（设计文档 12.1.3）。第一版这里写的是自己的
+    # if/else，于是「我有哪些角色」在两条路上长成两副面孔。
+    plan = _menu_dispatch(choice)
+    if not plan:
         return _no_card_change(f"未知的菜单项：{choice[:20]}")
+
+    if plan.get("roles"):
+        # 发角色卡需要 sender，而这里只有模块级的 ``_card_sender``。
+        # **不新建第二个发卡实现**——复用 :meth:`FeishuBridge._send_role_card`，
+        # 它已经支持显式传 open_id/chat_id。第一版就是在这里「没有卡片能力
+        # 可用」而退回文本的，代价是同一个动作两种行为。
+        text = _send_role_card_via(
+            open_id=who, chat_id=chat_id,
+        )
+    elif plan.get("view"):
+        # 有现成只读渲染的一律转手 _run_view_choice，菜单只是把它送进去 ——
+        # 于是输出与「直接打那条命令」逐字一致（12.1.1 的硬约束）。
+        return _run_view_choice(
+            {"view": plan["view"], "chat": chat_id}, who=who,
+        )
+    else:
+        text = plan.get("text") or ""
+
+    if not text:
+        # 表里这一项既没有可点角色也没有正文：说明它该给的是卡片而不是文字，
+        # 而卡片已经在上面发过了。刻意**不说话**，别用一句废话填掉。
+        return _card_action_response(
+            _decided_card("已打开", "**卡已经发在上面了**，点一下就行。",
+                          granted=True),
+            "success", "已打开",
+        )
 
     try:
         _card_sender.send_text(chat_id, text)
@@ -1194,37 +1222,123 @@ def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     )
 
 
-def _menu_reply(choice: str, chat_id: str) -> str:
-    """菜单项对应的正文。**纯函数**，便于逐项断言。"""
-    if choice == "today":
-        return "看今天该做什么：发 /today"
-    if choice == "help":
-        return (
-            "常用命令：\n"
-            "· /today 今天该做什么\n"
-            "· /new <角色> | <描述> 记一件事\n"
-            "· /roles 有哪些角色\n"
-            "· /delegate <项目路径> | <角色> | <需求> 交给 opencode 改代码\n"
-            "完整列表发 /help。"
-        )
-    if choice == "roles":
-        names = _role_names()
-        if not names:
-            return (
-                "读不到角色（助手可能没连上数据库）。"
-                "稍后再试，或发 /roles 走正常查询。"
-            )
-        listed = "、".join(names[:20])
-        more = f"（共 {len(names)} 个）" if len(names) > 20 else ""
-        return f"你的角色{more}：{listed}\n\n发 /role <名字> 看某个角色下的事务。"
-    # delegate
+def _menu_help_text() -> str:
+    """「我能做什么」。**给命令本身，不教命令。**
+
+    规范性约束（设计文档 12.1.3）：菜单项**不许以「发 /xxx ……」结束**——
+    菜单存在的意义是「识别优于回忆」，回一句命令让用户自己去打，等于把菜单
+    刚省掉的那一步又塞回去。
+
+    所以下面每一行都是**可以直接照着发的那句话**，不是说明书。
+    """
+    return (
+        "常用操作（**照着发就行**）：\n"
+        "· 今天该做什么 → 发 `/today`\n"
+        "· 记一件事 → 发 `/new <角色> | <描述>`\n"
+        "· 有哪些角色 → 点上面「我有哪些角色」那张卡里的角色名\n"
+        "· 交给 opencode 改代码 → 点「委派给 opencode」，会给你要改的东西\n"
+        "\n完整命令表发 `/help`。"
+    )
+
+
+def _menu_today_text() -> str:
+    """「今天该做什么」。
+
+    刻意**不**在这里直接调视图渲染：那份渲染属于 :class:`ChannelService`，
+    而 12.1.1 规定同一能力只能有一份实现。这里转成 `/today` 再走
+    :func:`_run_view_choice`，于是菜单与「直接打 /today」的输出**逐字一致**——
+    分叉的表现极隐蔽（设计文档 12.1.1 记录过一次真实分叉）。
+    """
+    return "__VIEW__/today"
+
+
+def _menu_role_names() -> list[str]:
+    return _role_names()
+
+
+def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str:
+    """发「选一个角色」卡。**唯一一份发卡实现**（设计文档 12.1.3）。
+
+    两条入口都调它：打字路径经 :meth:`FeishuBridge._send_role_card` 转手，
+    按钮路径直接调。第一版没有这个函数——发卡逻辑长在 :class:`FeishuBridge`
+    上、只能用 ``self.sender``，而按钮路径是模块级函数、手里只有模块级的
+    ``_card_sender``，于是那一支「没有卡片能力可用」就退回了纯文本。
+
+    结构性差异值得说明白：``self.sender`` 与模块级 ``_card_sender`` 是**两个
+    实例**（第一个进程里由 bridge 注入，第二个由 ``_card_action`` 侧注入）。
+    所以这个函数**必须显式收 sender**，不能自己去摸某个全局 —— 否则又变成
+    「谁先跑谁说了算」，而那种分叉只在特定启动顺序下出现，极难查。
+
+    返回要回给用户的话；空串 = 不用回（卡已经说明一切）。
+    """
+    target = sender if sender is not None else _card_sender
+    if target is None:
+        return "没连上通道，暂时发不了卡，稍后再试。"
     names = _role_names()
+    if not names:
+        return "读不到角色（助手可能没连上数据库），稍后再试。"
+    try:
+        send_menu_card(
+            target,
+            open_id=open_id,
+            subject="选一个角色",
+            items=[(n, f"role:{n}") for n in names[:20]],
+            note="点一个看它下面的事务；名字已经按角色列在上面了。",
+            chat_id=chat_id,
+        )
+    except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
+        log.warning("【菜单】发角色卡失败", exc_info=True)
+        return "你的角色：" + "、".join(names[:20])
+    return ""
+
+
+def _menu_dispatch(choice: str) -> dict[str, Any]:
+    """菜单动作 → **行为**的唯一分派表（规范性，设计文档 12.1.3）。
+
+    打字路径（:meth:`FeishuBridge._route_menu`）与按钮路径
+    (:func:`_run_menu`) **查同一张表**。加一个菜单项 = 加一行，不是加两处。
+
+    第一版没有这张表，于是「我有哪些角色」有两副面孔：打字问得到**卡片**，
+    点按钮得到**文本 + 一句「发 /role <名字>」**。两条路的单测各自都绿——
+    因为各自的测试只覆盖自己那条路。这正是 12.1.1「入口不得自建第二份判流
+    逻辑」要防的东西。
+
+    形态只有两种，因为它们对应两件本质不同的事：
+
+    - ``{"view": ...}`` —— 有现成只读渲染，走 :func:`_run_view_choice`。
+      菜单只是把它送进去，于是输出与「直接打那条命令」逐字一致。
+    - ``{"text": ...}`` —— 没有现成渲染，只能给文字。**但必须直接给结果**，
+      不许教用户去打字。
+    """
+    if choice == "today":
+        return {"view": "/today"}
+    if choice == "help":
+        return {"text": _menu_help_text()}
+    if choice == "roles":
+        # 角色**列表**没有现成视图（/roles 的渲染在 ChannelService 里），
+        # 所以给按钮而不是文字：点角色名 → /role <名字> → 走只读视图。
+        # 12.1.3 明确不做「角色少就发文本」的自适应——那会让「点角色」这个
+        # 能力随数据量时有时无，而那次突变不会被任何测试撞到。
+        return {"roles": True}
+    if choice == "delegate":
+        return {"text": _menu_delegate_text()}
+    return {}
+
+
+def _menu_delegate_text() -> str:
+    """「委派给 opencode」。
+
+    给的是**一条填好真实角色名、只留两处尖括号待填**的可复制命令，不是
+    命令语法说明。仍然要说清「白名单」和「单行」这两件踩过坑的事 ——
+    那是会直接导致失败的事实，不是可以省的客套。
+    """
+    names = _menu_role_names()
     role = names[0] if names else "<角色>"
     return (
-        "把下面这行的尖括号内容替换掉，整条发给我就行：\n\n"
-        f"/delegate <项目绝对路径> | {role} | <你要它做的事，写成一句话>\n\n"
-        "三处都要换：项目路径必须在 config.json 的 delegate.projects 白名单里；"
-        "角色名照上面给的填；需求写成**单行**（换行会被 opencode 判成复杂任务而失败）。"
+        "把下面这条发给我（`<>` 里的换成你要的）：\n\n"
+        f"`/delegate <项目绝对路径> | {role} | <要做的事，一句话>`\n\n"
+        "两处要换：项目路径得在 `config.json` 的 `delegate.projects` 白名单里；"
+        "需求写成**单行**（换行会被 opencode 判成复杂任务而失败）。"
     )
 
 
