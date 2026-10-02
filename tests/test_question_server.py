@@ -109,12 +109,31 @@ class TestReplyQuestion:
 
     def test_request_id_is_url_escaped(self) -> None:
         """An unescaped ``/`` would split the path and hit a **different**
-        endpoint -- and the failure would look like "the server said no"."""
+        endpoint -- and the failure would look like "the server said no".
+
+        真正要防的是「request_id 变成多段路径」，而不是「路径里出现 ``..``
+        这三个字符」。``..`` 只有在**自己独占一段**时才危险，而这需要有一个
+        未转义的 ``/`` 跟在旁边。把 ``/`` 转成 ``%2F`` 之后，整个 id 就是
+        一个不透明段，``..`` 再怎么出现都不构成穿越。
+
+        原断言 ``".." not in path.split("/")[2]`` 是在测「字面上有没有
+        ``..``」，而它测的路径里本来就有 ``..`` —— 那条断言测错了对象，
+        于是一份**安全**的实现被报成失败。改成下面三条，它们才是那个
+        安全性质本身，并且比原来更强。
+        """
         s = self._server()
-        s.reply_question("que/../admin", [["x"]])
+        original = "que/../admin"
+        s.reply_question(original, [["x"]])
         path = s.calls[0][0]
+
+        # ① 斜杠没有裸奔（这是第一条，也是原来就有的那条）
         assert "/" not in path[len("/question/"):-len("/reply")]
-        assert ".." not in path.split("/")[2]
+
+        # ② request_id 仍然**只占一段** —— 没被拆开，就没打到别的端点
+        assert path.split("/") == ["", "question", "que%2F..%2Fadmin", "reply"]
+
+        # ③ 反解回来就是调用方给的那个 id（没丢信息、没被改写）
+        assert urllib.parse.unquote(path.split("/")[2]) == original
 
     def test_directory_is_appended_as_query(self) -> None:
         s = self._server()

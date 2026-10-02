@@ -296,7 +296,28 @@ def _v1_build_question_reply(answers: Sequence[Sequence[str]]) -> dict[str, Any]
     空答复也拒：没人答就**不该**造一个答复发回去。超时的处置在调用方
     （记日志、不给答案），不在这里伪造一个空数组。
     """
-    rows = [list(a) for a in answers]
+    rows: list[list[str]] = []
+    for a in answers:
+        # **先挡字符串，再 list()。**
+        #
+        # 踩过的坑（红测抓到的）：原先写 ``rows = [list(a) for a in answers]``，
+        # 而 ``list("答案") == ['答', '案']`` —— 扁平列表于是被**按字符拆开**，
+        # 一个两字答复变成「第一题答了『答』、第二题答了『案』」。
+        # 后果是两种静默错误：单题被记成两题（看起来答完了，其实没有），
+        # 或者把一个答复塞进错误的问题槽位。
+        #
+        # 放在 ``list()`` **之后**判就晚了：那会儿字符串早已变成字符列表，
+        # 每一个元素都是合法 str，再也认不出它本来是个字符串。
+        #
+        # 线上路径不受影响：:meth:`ApprovalStore.answers_of` 返回的已经是
+        # ``[[...], [...]]``，顶层元素是 list 而非 str。
+        if isinstance(a, str):
+            raise ValueError(
+                "提问答复必须是嵌套数组（形如 [[第一题], [第二题]]），"
+                f"却收到扁平字符串 {a!r}：扁平形状会被按字符拆开，"
+                "把一问变成多答案。"
+            )
+        rows.append(list(a))
     if not rows:
         raise ValueError("提问答复不能是空的：没人答就不该发答复")
     for i, row in enumerate(rows):
