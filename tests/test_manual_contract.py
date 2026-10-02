@@ -40,6 +40,21 @@ def manual() -> str:
 #: 手册必须提到它（用户在提示里会看到），但它不算漏文档。
 CONVERSATIONAL_ESCAPES = {"/skip"}
 
+#: **只在飞书通道存在**的命令：它们不在 ``_USAGE`` 里，因为终端没有
+#: 交互卡片，敲了确实没反应 —— 但在飞书里是真实可用的，所以手册必须写。
+#:
+#: 与 :data:`CONVERSATIONAL_ESCAPES` 是两回事，区别要说清楚：
+#: ``/skip`` 是「**有**注册命令表、但只在追问这个状态下才认」；
+#: ``/menu`` 是「**任何时候都认，但只在飞书通道里」—— 它压根不进终端。
+#:
+#: 为什么不能把它塞进 ``_USAGE``：那会让 ``/help`` 和命令速查表声称
+#: 终端有个 ``/menu``，而终端里按下去是静默无响应 —— 那恰好是本文件
+#: 想防的「让用户敲一个永远没反应的东西」。
+#:
+#: 为什么不从手册里删掉：它是真实功能，删了等于让用户不知道它存在。
+#: 手册同时覆盖终端与飞书通道（见飞书通道那几节），所以列它是诚实的。
+CHANNEL_ONLY_COMMANDS = {"/menu"}
+
 
 def _commands_in(text: str) -> set[str]:
     """抽出手册里所有反引号包裹的斜杠命令 token。"""
@@ -52,7 +67,7 @@ def _commands_in(text: str) -> set[str]:
 
 def test_manual_has_no_unknown_commands(manual: str) -> None:
     """手册不能提到不存在的命令 —— 那会让用户敲一个永远没反应的东西。"""
-    known = set(_USAGE) | CONVERSATIONAL_ESCAPES
+    known = set(_USAGE) | CONVERSATIONAL_ESCAPES | CHANNEL_ONLY_COMMANDS
     unknown = sorted(_commands_in(manual) - known)
     assert not unknown, f"手册提到不存在的命令：{unknown}"
 

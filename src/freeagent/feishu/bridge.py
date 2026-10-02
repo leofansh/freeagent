@@ -23,6 +23,7 @@ import argparse
 import logging
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -48,6 +49,8 @@ from .sender import (  # noqa: E402
     _card_action_response,
     _decided_card,
     VIEW_CHOICE_ACTION,
+    MENU_ACTION,
+    send_menu_card,
 )
 from .status import (
     SEEN_SENDERS_KEY,
@@ -273,6 +276,162 @@ class FeishuBridge:
         return (f"收到了（第 {slot + 1}/{total} 问）。还有 "
                 f"{total - slot - 1} 个问题，直接回消息答。")
 
+    #: 显式要菜单的说法。**刻意不含 ``/help``** —— 它是文档里写明的
+    #: 权威命令表，覆盖它等于用一个更差的版本换掉已经能用的东西。
+    _MENU_COMMANDS = ("/menu", "/菜单", "/start-menu")
+
+    #: 打招呼 / 问「你能做什么」的说法。
+    #:
+    #: **匹配方式按语言分开**，这是实测踩出来的：
+    #: 中文没有词边界，所以「你好啊，今天有什么」该按**包含**匹配；
+    #: 但英文必须按**词边界**匹配 —— 用包含的话，``hi`` 会命中
+    #: ``chip``／``this``／``while``，于是「把 chip 寄存器改一下」这种
+    #: 正经任务会被当成人打招呼，弹一张菜单卡出来。
+    #: 一个把 chip 当成打招呼的助手，比没有菜单更糟。
+    _MENU_WORDS_CJK = (
+        "你好", "您好", "哈喽", "在吗", "在不在",
+        "帮助", "怎么用", "你能做什么", "能做什么", "菜单",
+    )
+    _MENU_WORDS_ASCII = ("hi", "hello")
+
+    #: 英文词边界用的预编译式。正则里只出现上面那几个字面量，
+    #: 所以内联编译一次存在类属性上是安全的（不是逐请求构造）。
+    _MENU_RE_ASCII = re.compile(
+        r"\b(?:" + "|".join(re.escape(w) for w in _MENU_WORDS_ASCII) + r")\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_greeting(cls, text: str) -> bool:
+        """这句话像不像在打招呼／问「你能做什么」。"""
+        if any(w in text for w in cls._MENU_WORDS_CJK):
+            return True
+        # 纯中文消息里不该出现裸英文词，但混排是常态，所以仍然只按词边界判。
+        return cls._MENU_RE_ASCII.search(text) is not None
+
+    def _send_entry_menu(self, msg) -> None:
+        """把入口菜单卡发进聊天窗口。发卡失败只记日志，不抛。"""
+        try:
+            send_menu_card(
+                self.sender,
+                open_id=msg.sender_open_id,
+                subject="要做什么？",
+                items=_menu_entries(),
+                note="点一个就行；也可以直接把话说给我听。",
+                chat_id=msg.chat_id,
+            )
+            log.info("【菜单】已发入口卡：chat=%s", msg.chat_id)
+        except Exception:
+            log.warning("【菜单】发入口卡失败", exc_info=True)
+
+    @classmethod
+    def _menu_kind(cls, text: str) -> str | None:
+        """这句话要不要走菜单。``None`` = 不是菜单消息。
+
+        **纯判断，不碰任何外部状态。** 这一步刻意放在白名单与去重之前：
+        若对「不是菜单」的消息也去调 :meth:`Deduplicator.is_duplicate`，
+        那条事件就被提前记下了，接着 ``channel.handle`` 会把自己刚记的那条
+        当成重投而拒掉 —— 于是**每一条普通消息都会被当重复事件拒绝**。
+        所以「先分类，再过闸门」的顺序是硬要求，不是风格问题。
+        """
+        low = text.lower()
+        if low in cls._MENU_COMMANDS:
+            return "menu"
+        if "角色" in text and any(
+            k in text for k in ("有什么", "有哪些", "都有", "什么", "列表", "哪个")
+        ):
+            return "roles"
+        if cls._is_greeting(low):
+            return "menu"
+        return None
+
+    def _route_menu(self, msg) -> str | None:
+        """这句话是否应该在进派发逻辑**之前**被菜单接走。
+
+        返回值口径与 :meth:`_route_answer` 一致：``None`` = 不拦，
+        空串 = 已处理且不用再回话，非空 = 已处理且要把这段话回过去。
+
+        ## 为什么必须在这里拦，而不是让 ``channel.handle`` 自己处理
+
+        实测踩到的：用户说「你有什么角色？」，而当时挂着一条待答的提问，
+        于是这句话被 :meth:`_route_answer` **当成答案吃掉**了 ——
+        用户问的是「有哪些角色」，系统收到的是「答案：你有什么角色？」。
+        而「你好」则落到 ``channel.handle``，被判成「请补充角色」，
+        把角色名做成按钮发出去，像在填一张它从没申请过的表。
+
+        也就是说这两句用户**没有一次是在派发**，却都被派发 machinery 处理了。
+        菜单的第一职责就是给「我没在派发」一个明确的落点。
+
+        ## 白名单与去重：菜单插在前面，所以这两道闸门要自己补
+
+        两道闸门原本都在 :meth:`ChannelService.handle` 里面，而菜单插在它
+        **前面** —— 于是菜单路径把它们一起绕过了。两个实测后果：
+
+        1. **白名单外的人发「你好」也会收到菜单卡。** 回一句就等于向陌生人
+           确认「这里有个 bot 在跑」，而那正是白名单要挡的泄露面。
+        2. **飞书重连重投同一事件时，菜单卡会再发一遍。** 去重表是在
+           ``handle`` 里写的，菜单压根没走到那里。
+
+        所以这里显式补上，与 :meth:`_reply_unsupported` 同一把尺子 ——
+        不能因为「这条路径不发敏感内容」就省掉闸门：泄露面不取决于内容，
+        取决于「对方知道这里有个东西在回话」。
+        """
+        if msg.unsupported_type:
+            return None
+        text = (msg.text or "").strip()
+        if not text:
+            return None
+
+        kind = self._menu_kind(text)
+        if kind is None:
+            return None                      # 不是菜单消息：一个字都不记
+
+        # ── 到这里已确定要发菜单，以下两道闸门必须在**发任何东西之前** ──
+        if not self.channel.is_allowed(msg.sender_ids):
+            log.info(
+                "发送者不在白名单，菜单不回：%s",
+                self.channel.allowlist_mismatch(msg.sender_ids),
+            )
+            # 交回 ``channel.handle`` 走标准拒绝路径：它会拒，而且**不说话**
+            #（不在白名单的人连提示都不该收，见 :meth:`_reply_unsupported`）。
+            return None
+
+        key = msg.dedup_key
+        if key and self.channel.dedup.is_duplicate(key):
+            log.info("重复事件（%r），不重复发菜单", key)
+            return ""                        # 已处理过，静默
+        if not key:
+            # 绝不能静默跳过：没有键就无法去重，重投会把菜单卡再发一遍。
+            log.warning(
+                "这条菜单消息既无 event_id 也无 message_id，**无法去重**；"
+                "若被飞书重投，菜单卡会重复发出（event_id=%r message_id=%r）",
+                msg.event_id, msg.message_id,
+            )
+
+        if kind == "roles":
+            return self._send_role_card(msg)
+        self._send_entry_menu(msg)
+        return ""                            # 卡已说明一切，不必再回文字
+
+    def _send_role_card(self, msg) -> str:
+        """发「选一个角色」卡。返回要回给用户的话（空串 = 不用回）。"""
+        names = _role_names()
+        if not names:
+            return "读不到角色（助手可能没连上数据库），稍后再试。"
+        try:
+            send_menu_card(
+                self.sender,
+                open_id=msg.sender_open_id,
+                subject="选一个角色",
+                items=[(n, f"role:{n}") for n in names[:20]],
+                note="点一个看它下面的事务；名字已经按角色列在上面了。",
+                chat_id=msg.chat_id,
+            )
+        except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
+            log.warning("【菜单】发角色卡失败", exc_info=True)
+            return "你的角色：" + "、".join(names[:20])
+        return ""
+
     def _process(self, msg: IncomingMessage) -> None:
         if msg.unsupported_type:
             # 不支持的消息类型：回一句提示，但**绝不进派发逻辑**。
@@ -313,6 +472,18 @@ class FeishuBridge:
                     log.exception("回复提问回执失败（chat=%s）", msg.chat_id)
             return
 
+        # 再问：这句话要不要走菜单。**必须在 channel.handle 之前** ——
+        # 「你好」「你有什么角色」都不是派发；让派发 machinery 去处理，
+        # 换来的就是一张用户从没申请过的表（详见 :meth:`_route_menu`）。
+        menu = self._route_menu(msg)
+        if menu is not None:
+            if menu:
+                try:
+                    self.sender.send_text(msg.chat_id, menu)
+                except Exception:  # noqa: BLE001 - 回复失败不得拖垮处理
+                    log.exception("回菜单提示失败（chat=%s）", msg.chat_id)
+            return
+
         reply = self.channel.handle(
             msg.chat_id, msg.sender_ids, msg.text,
             event_id=key or None,
@@ -325,17 +496,29 @@ class FeishuBridge:
             # 飞书应用之后 open_id 变了，光看它无法判断「是它变了」还是
             # 「我配错了」。把双方的对照一起打出来，这一行就成了自证。
             #
-            # 仍然**不打消息正文** —— 正文可能有隐私内容，而排查「谁被拒了」
-            # 只需要身份。
+            # 仍然**不打用户的消息正文** —— 正文可能有隐私内容，而排查
+            # 「谁被拒了」只需要身份。
+            #
+            # 但要把**bot 自己那句回复**带上：``denied`` 有四种来源
+            # （白名单 / 重复事件 / 空输入 / 通道不支持 ``/quit``），
+            # 而这一行原来一律写成「发送者不在白名单」—— 四种里只有一种
+            # 真是白名单。排查空输入时看到「不在白名单」，会误判成白名单
+            # 配错了，而那与白名单毫无关系（实测踩过：日志与原因不符，
+            # 查的方向整个是错的）。
+            #
+            # 带上之后一眼可分：``没有权限。``= 白名单，``''``= 重复事件，
+            # ``说点什么吧。``= 空输入。记的是**回复**不是用户输入，
+            # 所以不违反上面那条隐私规矩。
             detail = self.channel.allowlist_mismatch(msg.sender_ids)
             if msg.event_id:
                 log.info(
-                    "发送者不在白名单：%s（%s，event_id=%s）",
-                    msg.sender_label, detail, msg.event_id,
+                    "未派发（bot 回复=%r）：%s（%s，event_id=%s）",
+                    reply.text[:40], msg.sender_label, detail, msg.event_id,
                 )
             else:
                 log.info(
-                    "发送者不在白名单：%s（%s）", msg.sender_label, detail,
+                    "未派发（bot 回复=%r）：%s（%s）",
+                    reply.text[:40], msg.sender_label, detail,
                 )
             if not reply.text:
                 return                    # 重复事件：静默，不打扰
@@ -781,6 +964,13 @@ def _card_action(data: Any = None) -> dict[str, Any]:
             # 才会炸成 NameError。
             return _run_view_choice(value, who=who)
 
+        # **菜单**：同样无状态、同样不查库，但它比只读选项多一步 ——
+        # 它要**回一句话或另一张卡**到聊天窗口，所以依赖通道而不是就地渲染。
+        # 放在只读选项之后、批准流程之前，理由与它相同：菜单没有
+        # 「过期即拒」的安全含义，混进凭据流程是错配。
+        if value.get("action") == MENU_ACTION:
+            return _run_menu(value, who=who)
+
         credential = value.get("id")
         choice = value.get("action")
 
@@ -911,6 +1101,131 @@ _card_channel: Any = None
 
 #: 模块级持有 sender，供 :func:`_run_view_choice` 把结果发成**聊天消息**。
 _card_sender: Any = None
+
+
+def _role_names() -> list[str]:
+    """当前角色名（不含已合并的）。**读不到就返回空，不猜。**"""
+    if _card_conn is None:
+        return []
+    from ..storage.repos import RoleRepo
+
+    try:
+        return [r.name for r in RoleRepo(_card_conn).list_all(include_inactive=True)]
+    except Exception:
+        log.exception("【菜单】列角色失败")
+        return []
+
+
+def _menu_entries() -> list[tuple[str, str]]:
+    """入口菜单项。
+
+    **刻意只4 项。** 选项越多越没人选（选择过载），而这四项覆盖了
+    「我现在到底想干什么」的全部常见答案。每加一项都要问一句
+    「真的会有人点它吗」。
+    """
+    return [
+        ("委派给 opencode", "delegate"),
+        ("我有哪些角色", "roles"),
+        ("今天该做什么", "today"),
+        ("我能做什么", "help"),
+    ]
+
+
+def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
+    """点了菜单项 → 把对应的内容发回聊天窗口，然后把按钮收掉。
+
+    与 :func:`_run_view_choice` 同构（发气泡 + 收按钮），但多���个分支：
+    菜单项不全是视图，有些是「给你一段该发的话」。
+
+    「角色」那一支刻意**转手交给** :func:`_run_view_choice`，而不是自己查库
+    渲染 —— 角色视图的语义必须与直接打 ``/role <名字>`` 逐字一致，
+    另写一套就是第二份实现（设计文档 12.1.1：一份能力一份实现）。
+    """
+    choice = str(value.get("choice") or "").strip()
+    chat_id = str(value.get("chat") or "").strip()
+    if not choice:
+        return _no_card_change("选项不完整，未处理")
+    if _card_sender is None:
+        return _no_card_change("没连上通道，未处理")
+
+    # **白名单必须在这里问一次**（这是我自己的漏洞，不是原有代码的问题）。
+    #
+    # 下面除 ``role:`` 那一支外，其余分支都直接调 ``_card_sender.send_text``，
+    # **不经过 :meth:`ChannelService.handle`** —— 而白名单判定住在那里。
+    # 于是菜单卡在**群里**是全员可见的，群里非白名单成员点一下「我能做什么」
+    # 就收到了回话。
+    #
+    # 后果不只是体验差：回一句话就等于向白名单外确认「这里有个 bot 在跑」，
+    # 那正是白名单要挡的泄露面 —— 与 :meth:`_reply_unsupported` 同一把尺子。
+    #
+    # ``role:`` 那支转手 :func:`_run_view_choice`，它内部会过 ``handle()``，
+    # 所以本来就安全；这里**照样先问**：白名单只在一处判定，将来改分支才
+    # 不会漏掉这一处。
+    if _card_channel is None:
+        return _no_card_change("没连上通道，未处理")
+    if not _card_channel.is_allowed(who):
+        log.info("【菜单】点击者不在白名单，不回话也不执行（who=%r）", who)
+        return _no_card_change("没权限，未处理")
+
+    if choice.startswith("role:"):
+        name = choice[len("role:"):].strip()
+        if not name:
+            return _no_card_change("选项不完整，未处理")
+        return _run_view_choice({"view": f"/role {name}", "chat": chat_id}, who=who)
+
+    if choice in ("today", "help", "delegate", "roles"):
+        text = _menu_reply(choice, chat_id)
+    else:
+        return _no_card_change(f"未知的菜单项：{choice[:20]}")
+
+    try:
+        _card_sender.send_text(chat_id, text)
+    except Exception:
+        # 气泡发不出去**不能**掀翻整个点击：卡面回写照旧，用户至少看得见。
+        log.warning("【菜单】内容发不进聊天（choice=%r）", choice, exc_info=True)
+        return _card_action_response(
+            _decided_card("没发出去", "**没能把内容发到聊天里**，请直接发消息。",
+                          granted=False),
+            "error", "没发出去",
+        )
+    return _card_action_response(
+        _decided_card("已打开", "**已发在上面**，照着做就行。", granted=True),
+        "success", "已打开",
+    )
+
+
+def _menu_reply(choice: str, chat_id: str) -> str:
+    """菜单项对应的正文。**纯函数**，便于逐项断言。"""
+    if choice == "today":
+        return "看今天该做什么：发 /today"
+    if choice == "help":
+        return (
+            "常用命令：\n"
+            "· /today 今天该做什么\n"
+            "· /new <角色> | <描述> 记一件事\n"
+            "· /roles 有哪些角色\n"
+            "· /delegate <项目路径> | <角色> | <需求> 交给 opencode 改代码\n"
+            "完整列表发 /help。"
+        )
+    if choice == "roles":
+        names = _role_names()
+        if not names:
+            return (
+                "读不到角色（助手可能没连上数据库）。"
+                "稍后再试，或发 /roles 走正常查询。"
+            )
+        listed = "、".join(names[:20])
+        more = f"（共 {len(names)} 个）" if len(names) > 20 else ""
+        return f"你的角色{more}：{listed}\n\n发 /role <名字> 看某个角色下的事务。"
+    # delegate
+    names = _role_names()
+    role = names[0] if names else "<角色>"
+    return (
+        "把下面这行的尖括号内容替换掉，整条发给我就行：\n\n"
+        f"/delegate <项目绝对路径> | {role} | <你要它做的事，写成一句话>\n\n"
+        "三处都要换：项目路径必须在 config.json 的 delegate.projects 白名单里；"
+        "角色名照上面给的填；需求写成**单行**（换行会被 opencode 判成复杂任务而失败）。"
+    )
 
 
 def _run_view_choice(value: dict[str, Any], *, who: str) -> dict[str, Any]:

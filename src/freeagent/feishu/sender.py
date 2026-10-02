@@ -562,6 +562,112 @@ def send_view_choice_card(
     return str(((body.get("data") or {}).get("message_id")) or "")
 
 
+#: 菜单按钮的回传动作名。
+#:
+#: 与 :data:`VIEW_CHOICE_ACTION` **同族**：都是「点了就执行，不落库、
+#: 不等回复」的即时动作。菜单不需要 pending 记录，因为菜单项本身
+#: 没有「过期即拒」的安全含义 —— 点错了顶多跑一次只读视图或重发一张卡。
+#: 真要审批的那类动作走 :func:`_question_card` / 批准卡，两条路不混。
+MENU_ACTION = "menu"
+
+
+def menu_card(
+    subject: str,
+    items: Sequence[tuple[str, str]],
+    *,
+    note: str = "",
+    chat_id: str = "",
+) -> dict[str, Any]:
+    """入口菜单卡。**无状态**，与 :func:`view_choice_card` 同一套理由。
+
+    ``items`` 是 ``(按钮文案, 回传 choice)`` 对。刻意做成参数而不是
+    把菜单内容写死在这里：菜单项依赖运行时状态（角色名、项目白名单），
+    而卡片结构是固定的 —— 分开之后同一个结构能被入口菜单、角色选择、
+    委派向导三处复用，不至于三份JSON 各写一遍。
+
+    ``chat_id`` 会进 ``value``，让点击处理知道**回哪个会话**。
+    与 :func:`view_choice_card` 同一做法：不依赖回调载荷里的
+    ``open_chat_id``（那字段在实测载荷里存在，但把它当唯一来源
+    就等于把「点了有反应」押在一个我们没验过的字段上）。
+
+    ## 为什么是 JSON 1.0 而不是 2.0
+
+    官方错误码 200830 规定 **2.0 卡不能更新成 1.0，反之亦然**。
+    批准卡与选项卡这一族全是 1.0（顶层 ``elements`` + ``tag:"action"``），
+    菜单会走同一条更新回写路径，所以**必须**是 1.0。
+    2.0 的 ``behaviors`` 更好看，但在这里换不来任何东西，只会让
+    「点一下按钮」直接失败。
+    """
+    if not items:
+        raise ValueError("菜单卡至少要一个菜单项")
+    buttons = []
+    for label, choice in items:
+        # 按钮文案有长度上限，超了会被飞书截成看不懂的样子。
+        buttons.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": str(label)[:40]},
+                "type": "primary" if not buttons else "default",
+                "value": {
+                    "action": MENU_ACTION,
+                    "choice": str(choice),
+                    "chat": str(chat_id),
+                },
+            }
+        )
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": note or "点一个就行。"}}
+    ]
+    elements.append({"tag": "action", "actions": buttons})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": subject},
+        },
+        "elements": elements,
+    }
+
+
+def send_menu_card(
+    sender: Any,
+    *,
+    open_id: str,
+    subject: str,
+    items: Sequence[tuple[str, str]],
+    note: str = "",
+    chat_id: str = "",
+) -> str:
+    """发菜单卡，返回 message_id。
+
+    发卡失败**由调用方决定**怎么办 —— 这里只抛，与
+    :func:`send_view_choice_card` 同一口径：静默降级会让「点了没反应」
+    比「多点一次」糟得多，而降级成什么文字是路由层的判断，不是发卡层的。
+    """
+    if not open_id:
+        raise ValueError("发菜单卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = menu_card(subject, items, note=note, chat_id=chat_id)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发菜单卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
+
 def _decided_card(subject: str, line: str, *, granted: bool) -> dict[str, Any]:
     """**已处理完**的卡片：绿头/红头，**且没有按钮**。
 
