@@ -44,6 +44,20 @@ def env(monkeypatch, tmp_path):
     app.close()
 
 
+def _norm(p: str) -> str:
+    """按 ``load_config`` 的同一套规则归一化，用于**比较**。
+
+    刻意不比字面量：写进文件的是反斜杠还是正斜杠取决于平台与读写顺序，
+    断言那个字符串等于把实现细节钉死—— 而上一版就是这么把斜杠漂移放过去的。
+    """
+    import pathlib
+    return str(pathlib.Path(p))
+
+
+def _has(paths, want: str) -> bool:
+    return any(_norm(p) == _norm(want) for p in paths)
+
+
 def _save(app, body):
     return mod.delegate_projects_save(app, body)
 
@@ -60,7 +74,8 @@ def _cfg(app):
 def test_allow_adds_path(env):
     app, _ = env
     out = _save(app, {"allow": "OpenMOS"})
-    assert "D:/PycharmProjects/openmos" in _cfg(app)["delegate"]["projects"]
+    assert _has(_cfg(app)["delegate"]["projects"],
+                "D:/PycharmProjects/openmos")
     by = {i["name"]: i for i in out["items"]}
     assert by["OpenMOS"]["allowed"] is True
     assert by["FreeAgent"]["allowed"] is False, "只该授权被点的那一个"
@@ -69,7 +84,8 @@ def test_allow_adds_path(env):
 def test_allow_is_case_insensitive(env):
     app, _ = env
     _save(app, {"allow": "openmos"})
-    assert "D:/PycharmProjects/openmos" in _cfg(app)["delegate"]["projects"]
+    assert _has(_cfg(app)["delegate"]["projects"],
+                "D:/PycharmProjects/openmos")
 
 
 def test_listing_alone_does_not_authorise(env):
@@ -107,15 +123,15 @@ def test_duplicate_allow_is_refused(env):
     _save(app, {"allow": "OpenMOS"})
     with pytest.raises(FreeAgentError):
         _save(app, {"allow": "OpenMOS"})
-    assert _cfg(app)["delegate"]["projects"].count(
-        "D:/PycharmProjects/openmos") == 1
+    assert len(_cfg(app)["delegate"]["projects"]) == 1
 
 
 def test_revoke_removes(env):
     app, _ = env
     _save(app, {"allow": "OpenMOS"})
     out = _save(app, {"revoke": "OpenMOS"})
-    assert "D:/PycharmProjects/openmos" not in _cfg(app)["delegate"]["projects"]
+    assert not _has(_cfg(app)["delegate"]["projects"],
+                    "D:/PycharmProjects/openmos")
     by = {i["name"]: i for i in out["items"]}
     assert by["OpenMOS"]["allowed"] is False
 
@@ -157,8 +173,8 @@ def test_revoke_does_not_match_a_different_project(env):
     out = _save(app, {"revoke": "openmos-fork"})
 
     left = _cfg(app)["delegate"]["projects"]
-    assert [p.replace("\\", "/") for p in left] == \
-        ["D:/PycharmProjects/openmos"], f"只该删掉被点的那一个，却剩 {left}"
+    assert len(left) == 1 and _norm(left[0]) == _norm(
+        "D:/PycharmProjects/openmos"), f"只该删掉被点的那一个，却剩 {left}"
     by = {i["name"]: i["allowed"] for i in out["items"]}
     assert by["OpenMOS"] is True, "兄弟项目不该被顺手删掉"
 
@@ -196,4 +212,38 @@ def test_other_settings_survive(env):
     _save(app, {"allow": "OpenMOS"})
     assert _cfg(app)["delegate"]["model"] == "opencode/big-pickle", (
         "改白名单顺手把 model 抹掉了"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 幂等：连续保存不产生无意义 diff
+# --------------------------------------------------------------------------- #
+def test_saved_paths_use_one_separator_style(env):
+    """写入的路径必须与 ``load_config`` 读出来的一致（斜杠方向统一）。
+
+    踩过的坑：``load_config`` 在 Windows 上经 ``str(Path(...))`` 把 ``/``
+    转成 ``\\``，而从 OpenCode 新加的那条还是原样 —— 于是两次授权之后文件里
+    就成了「一条反斜杠、一条正斜杠」。功能无害，但它是要被人手改和 review 的
+    文件，每授权一次就全体换一次方向，纯噪音。
+    """
+    app, _ = env
+    _save(app, {"allow": "OpenMOS"})
+    _save(app, {"allow": "XiaoYuan"})
+    paths = _cfg(app)["delegate"]["projects"]
+    assert len({p.count("/") for p in paths}) == 1 or \
+        len({("\\" in p) for p in paths}) == 1, (
+        f"斜杠方向不一致：{paths}"
+    )
+
+
+def test_repeated_writes_are_idempotent(env):
+    """读→写是幂等的：再保存一次，文件不该变。"""
+    app, _ = env
+    _save(app, {"allow": "OpenMOS"})
+    first = _cfg(app)["delegate"]["projects"]
+    _save(app, {"allow": "XiaoYuan"})
+    second = _cfg(app)["delegate"]["projects"]
+    # 第一条不许被第二次保存顺手改写（那正是斜杠漂移的机制）
+    assert second[:1] == first[:1], (
+        f"先写的那条被后续保存改了：{first} -> {second}"
     )

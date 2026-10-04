@@ -64,4 +64,9 @@ def test_allow_really_writes_config(env):
     cfg = json.loads(
         (__import__("pathlib").Path(env.config.home) / "config.json")
         .read_text(encoding="utf-8"))
-    assert cfg["delegate"]["projects"] == ["D:/PycharmProjects/openmos"]
+    from pathlib import Path
+    got = cfg["delegate"]["projects"]
+    # 比归一化后的形式，不比字面量：斜杠方向由平台与读写顺序决定，
+    # 断言字符串等于把实现细节钉死（上一版就是这么把斜杠漂移放过去的）。
+    assert [str(Path(p)) for p in got] == [str(Path("D:/PycharmProjects/openmos"))], \
+        f"授权没写进 config.json：{got}"

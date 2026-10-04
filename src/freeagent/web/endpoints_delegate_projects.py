@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from ..app import App
@@ -93,12 +94,26 @@ def _norm(path: str) -> str:
     return path.replace("\\", "/").rstrip("/").casefold()
 
 
+def _canon(path: str) -> str:
+    """**写入前**按 ``load_config`` 的同一套规则归一化。
+
+    不这么做就会攒出「一条反斜杠、一条正斜杠」的花名册：``load_config`` 读盘时
+    经 ``str(Path(...))`` 在 Windows 上把 ``/`` 转成 ``\\``，而从 OpenCode
+    新加的那条还是原样。两次授权之后文件就花了，而它是要被人手改和 review 的。
+
+    关键是**与读取用同一个函数**：这样读→写是幂等的，连续保存不产生 diff。
+    比对仍用 :func:`_norm`（大小写不敏感），两者分工不同、不能互换。
+    """
+    return str(Path(path).expanduser())
+
+
 def _add(cfg, path: str):
     """加一个路径。**已在白名单里就返回 False**，不重复写。"""
     if any(_norm(p) == _norm(path) for p in cfg.delegate_projects):
         return cfg, False
     return replace(
-        cfg, delegate_projects=tuple(cfg.delegate_projects) + (path,)
+        cfg,
+        delegate_projects=tuple(cfg.delegate_projects) + (_canon(path),),
     ), True
 
 
