@@ -135,11 +135,22 @@ def bridge_state(home: str | Path | None = None) -> dict[str, Any]:
     # 状态文件的作用是回答「它连上飞书了吗」（见 feishu_status），不是回答
     # 「进程活着吗」。这两件事由两个字段分别说，不混。
     alive = supervised and returncode is None
+    # 「活着」与「是我们启的」是两件事（设计文档 12.7.1），所以分两个字段。
+    #
+    # ``running`` 依赖内存里的进程句柄，而句柄只在**本进程没重启过**时存在。
+    # 于是计划任务拉起的、别的终端手开的、以及本 Web 重启后仍在跑的桥接，
+    # ``running`` 全是 False —— 界面会在一个完全正常的系统上持续报故障。
+    #
+    # ``alive_observed`` 只问心跳新鲜度，**不问是谁拉起来的**：它拿``is_stale``
+    # 的否定，语义与判定都**未改动**，只是把它作为独立旁证报出来。
+    alive_observed = raw is not None and not stale
     return {
         "supervised": supervised,
         "returncode": returncode,
         "pid": child.pid if (alive and child is not None) else None,
         "running": bool(alive),
+        # 在跑，但不是本界面启的（如开机自启 / 别的终端 / Web 重启前就起的）
+        "alive_observed": bool(alive_observed),
         "port_held": probe["running"],
         "lock_port": probe["lock_port"],
         "stale": stale,

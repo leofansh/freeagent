@@ -273,6 +273,49 @@ def test_a_fresh_status_alone_does_not_mean_running(home):
     assert s["running"] is False, "没有句柄就不该说运行中"
 
 
+def test_fresh_status_from_an_unsupervised_bridge_is_alive_observed(home):
+    """**回归**：心跳新鲜、但不是本界面启的桥接，必须报 ``alive_observed``。
+
+    这就是开机自启 / 别的终端手开 / **Web 自己重启过一次**之后的那三种情形。
+    修之前界面只有 ``running``，而它依赖内存里的进程句柄，于是这三种全被
+    报成「没在跑」—— 用户明明在正常收发消息，界面却持续报故障。
+
+    刻意**不改** ``running``（见
+    :func:`test_a_fresh_status_alone_does_not_mean_running`）：那个字段回答的
+    是「我们 spawn 的那个还在吗」，与本条是两件事。
+    """
+    from freeagent.feishu.status import write_status, status_path
+
+    write_status(status_path(home), {
+        "state": "ready", "connected": True, "updated_at": 1e18,
+    })
+    s = bridge_state(home)
+    assert s["alive_observed"] is True, (
+        "心跳新鲜就该承认它在跑——哪怕不是本界面启的"
+    )
+    assert s["running"] is False, "仍然不许说「是我们启的」"
+
+
+def test_dead_bridge_is_not_alive_observed(home):
+    """心跳陈旧 → ``alive_observed`` 必须为假（否定的另一半）。"""
+    from freeagent.feishu.status import write_status, status_path
+
+    write_status(status_path(home), {
+        "state": "ready", "connected": True, "updated_at": 1.0,
+    })
+    assert bridge_state(home)["alive_observed"] is False
+
+
+def test_no_status_file_is_not_alive_observed(home):
+    """从没跑过 → 没有心跳可谈，旁证必须为假。"""
+    from freeagent.feishu.status import status_path
+
+    status_path(home).unlink(missing_ok=True)
+    s = bridge_state(home)
+    assert s["alive_observed"] is False
+    assert s["running"] is False
+
+
 def test_freshly_spawned_child_counts_as_running(home, monkeypatch, started):
     """**回归**：刚 spawn 出来、还没写心跳的桥接，必须已经算「在跑」。
 
