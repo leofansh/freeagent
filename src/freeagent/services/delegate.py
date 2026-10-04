@@ -65,7 +65,9 @@ class DelegationPolicy:
         return bool(self.projects)
 
 
-def check_project_allowed(policy: DelegationPolicy, raw: str) -> Path:
+def check_project_allowed(
+    policy: DelegationPolicy, raw: str, *, known_names: Sequence[str] = ()
+) -> Path:
     """校验项目路径在白名单里，返回**规范化**后的绝对路径。
 
     三层校验，缺一不可：
@@ -74,6 +76,16 @@ def check_project_allowed(policy: DelegationPolicy, raw: str) -> Path:
     2. **必须绝对路径** —— 相对路径的基准会随工作目录变，是绕过白名单的经典手法
     3. **必须落在某个白名单目录内** —— 用 ``resolve`` + ``relative_to`` 判断，
        不用字符串前缀（``/data/proj`` 会匹配 ``/data/project-x``）
+
+    ## ``known_names`` 是**提示**，不是准入
+
+    它只出现在错误文案里，用来告诉用户「可以填这些名字」。它**不参与**任何
+    判定：准入只看 ``policy.projects``。这一点必须写死—— 一旦让提示里的
+    名字影响到放行，白名单就成了摆设。
+
+    刻意做成**入参**而不是在这里调 ``opencode db``：这个函数是闸门，
+    闸门里不该有一个会起子进程的调用（慢、且失败方式会变得不可预测）。
+    查项目列表由调用方做，查询失败就不给提示、不影响判定。
     """
     if not policy.enabled:
         raise FreeAgentError(
@@ -82,13 +94,17 @@ def check_project_allowed(policy: DelegationPolicy, raw: str) -> Path:
         )
     text = raw.strip().strip('"').strip("'")
     if not text:
-        raise FreeAgentError("要委派到哪个项目？给一个绝对路径。")
+        raise FreeAgentError(
+            "要委派到哪个项目？给一个绝对路径。"
+            + _names_hint(known_names)
+        )
 
     candidate = Path(text)
     if not candidate.is_absolute():
         raise FreeAgentError(
             f"项目路径必须是绝对路径，收到「{text}」。"
             "相对路径会随工作目录变化，是绕过白名单的常见手法。"
+            + _names_hint(known_names)
         )
     resolved = candidate.resolve()
     for allowed in policy.projects:
@@ -103,6 +119,23 @@ def check_project_allowed(policy: DelegationPolicy, raw: str) -> Path:
     raise FreeAgentError(
         f"「{resolved}」不在允许委派的项目白名单里。"
         f"当前白名单：{', '.join(policy.projects) or '（空）'}"
+        + _names_hint(known_names)
+    )
+
+
+def _names_hint(known_names: Sequence[str]) -> str:
+    """「可以填这些名字」的一句提示。
+
+    只在**真的有**可授权的项目时出现。空列表下加一句「没有可授权的项目」
+    是噪音——那种情况下用户要解决的是授权，不是选名字。
+    """
+    names = [n for n in known_names if n and n.strip()]
+    if not names:
+        return ""
+    return (
+        "在界面上授权后，可以用项目名代替路径："
+        + "、".join(names)
+        + "（只在本仓配置里授权过的才能用）"
     )
 
 

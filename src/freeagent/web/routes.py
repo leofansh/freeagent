@@ -16,6 +16,7 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_delegate_projects,
     endpoints_feishu,
     endpoints_feishu_config,
     endpoints_feishu_control,
@@ -42,6 +43,9 @@ def feishu_routes() -> dict[str, Callable[..., Any]]:
         "/api/feishu/config": endpoints_feishu_config.feishu_config,
         # 启停现状（只读）。动作在 POST 侧，见 routes_write。
         "/api/feishu/bridge": endpoints_feishu_control.feishu_bridge,
+        # 委派白名单候选（只读）。**授权动作另走 POST** —— 查是纯观测、
+        # 可以随手做；授权是安全边界，得单独一步。见设计文档 12.7.1。
+        "/api/delegate/projects": endpoints_delegate_projects.delegate_projects,
     }
 
 

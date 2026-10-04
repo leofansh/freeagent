@@ -159,6 +159,19 @@ function renderFeishu(s, log, cfg, ctl) {
       "配置读不出来，所以改不了。下面是状态和日志。"));
   }
 
+  // --- 委派白名单：项目清单 + 授权（设计文档 12.7.1）---
+  // 单独取、单独渲染，不塞进 cfg：它是**另一份数据**（OpenCode 的项目注册表），
+  // 而 cfg 只描述通道配置。混在一起会让「改了授权」看起来像「改了凭据」。
+  const dpBox = el("div");
+  root.appendChild(dpBox);
+  // 自引用：授权后回调就是重画自己，避免每次成功都去重新拉整个 cfg。
+  const paintDelegate = (dp) =>
+    dpBox.replaceChildren(delegateProjectsView(dp, paintDelegate));
+  api("/api/delegate/projects").then(paintDelegate, (e) => {
+    dpBox.appendChild(el("div", "note",
+      "读不到可委派项目清单，所以没法在这里授权：" + e.message));
+  });
+
   // --- 启停 ---
   if (ctl) {
     root.appendChild(feishuControlCard(

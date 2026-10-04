@@ -24,6 +24,7 @@ from .js_core import JS_CORE
 from .js_detail import JS_DETAIL
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
+from .js_delegate_projects import JS_DELEGATE_PROJECTS
 from .js_feishu_control import JS_FEISHU_CONTROL
 from .js_settings import JS_SETTINGS
 from .js_settings_llm import JS_SETTINGS_LLM
@@ -51,6 +52,10 @@ INDEX_HTML = (
             JS_FEISHU,
             JS_FEISHU_CONFIG,
             JS_FEISHU_CONTROL,
+            # delegate_projects 只用 JS_FEISHU_* 里已有的 el/esc/api/toast，
+            # 但它自己提供 delegateProjectsView / delegateRestartBanner，
+            # 必须在 JS_BOOT 之前进页面 —— boot 里会调用它们。
+            JS_DELEGATE_PROJECTS,
             JS_BOOT,
         )
     )

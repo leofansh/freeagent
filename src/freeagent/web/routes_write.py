@@ -24,6 +24,7 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_delegate_projects,
     endpoints_feishu_config,
     endpoints_feishu_control,
     endpoints_read,
@@ -71,6 +72,13 @@ def dispatch_post(
 
     if parts == ["api", "feishu", "config"]:
         return HTTPStatus.OK, endpoints_feishu_config.feishu_config_save(
+            app, read_body()
+        )
+
+    if parts == ["api", "delegate", "projects"]:
+        # **授权**动作，只走 POST：能改权限的操作不该有「顺手 GET 一下就
+        # 触发」的路径（浏览器预取、爬虫、`<img src>` 都会自动发 GET）。
+        return HTTPStatus.OK, endpoints_delegate_projects.delegate_projects_save(
             app, read_body()
         )
 
