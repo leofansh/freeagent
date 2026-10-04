@@ -457,3 +457,40 @@ def test_role_card_note_does_not_teach_the_user_to_click(wired):
         assert bad not in note, f"角色卡 note 在教用户操作：{note!r}"
     # 名字就是按钮，不在「上面」——那句话会把人引到错的地方去找
     assert "上面" not in note, f"note 指向了错误位置：{note!r}"
+
+
+def test_menu_fallback_never_teaches_the_user_to_click(wired, monkeypatch):
+    """兜底分支也不许教用户点按钮 —— 上一轮的空测在这里被修好。
+
+    ## 上一版为什么是空测
+
+    当时把 :func:`_menu_dispatch` 打桩成 ``lambda choice: {}``，而
+    ``_run_menu`` 里有一句 ``if not plan: return _no_card_change(...)``。
+    **空 dict 是falsy**，所以它在到达兜底分支**之前**就返回了
+    「未知的菜单项」—— 断言里当然搜不到指示语，于是**改回旧文案也不转红**。
+    一个无法失败的测试比没有测试更坏：它制造「已覆盖」的错觉。
+
+    ## 这一版的桩
+
+    必须是**真值**但**无输出**的 plan：有键、值都不产生内容。这样才穿得过
+    ``if not plan``，真正落到 ``text = plan.get("text") or ""`` 那一步，
+    再由 ``if not text:`` 带进兜底分支。
+    """
+    sender, channel, app = wired
+    monkeypatch.setattr(bridge_mod, "_menu_dispatch",
+                        lambda choice: {"text": "", "roles": False,
+                                        "view": None})
+
+    out = bridge_mod._run_menu(
+        {"action": MENU_ACTION, "choice": "today", "chat": CHAT},
+        who=ALICE,
+    )
+
+    #先确认真的落到兜底分支了，否则下面都是空断言
+    blob = repr(out)
+    assert "没有可显示的内容" in blob, (
+        f"没走到兜底分支，桩仍被更早的闸门挡掉了：{blob}"
+    )
+    for bad in BANNED_IN_CARD:
+        assert bad not in blob, f"兜底分支在教用户操作：{blob}"
+    assert not sender.sent, "兜底分支不该发文字气泡"

@@ -15,6 +15,49 @@
 
 ## 快速开始
 
+**日常只需要一个入口**：飞书里跟助手说话。开机自启已经配好（见下），登录后
+桥接自动拉起，**不用开任何终端窗口**。
+
+### 最省事的三条
+
+| 想做什么 | 怎么做 |
+|---|---|
+| 记一笔、看今天 | 直接在**飞书**里说 |
+| 管理事务 | 开 <http://127.0.0.1:8770/> |
+| 临时用终端 | `set PYTHONIOENCODING=utf-8` + `set PYTHONPATH=src` + `python -m freeagent.cli.app` |
+
+### 开机自动运行
+
+桥接**登录后自动拉起**，不用手敲命令。做法是把 `tools\_svc_bridge.cmd`
+复制一份到 Windows 的**启动文件夹**：
+
+```
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
+```
+
+再复制一份进去即可（**零权限**，不用管理员）：
+
+```bat
+copy /y tools\_svc_bridge.cmd "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\FreeAgent-bridge.cmd"
+```
+
+**为什么不用「计划任务」**：`schtasks /create` 即使配`/sc onlogon` 也需要
+**管理员权限**，报错「拒绝访问」。启动文件夹是**按用户**生效的，零权限，
+对个人助手够用。
+
+⚠️ **触发时机是「登录」，不是「开机」**——开机但没登录不会起。你的飞书通道
+只在你登录后才有用，所以这不构成问题。
+
+启动后想确认它到底在不在，**别看状态文件**（进程死后它会留在盘上、仍写着
+`connected: true`）。用这条命令，它按**命令行**找进程，不靠 pid：
+
+```bat
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select-Object ProcessId,CommandLine | Format-List"
+```
+
+日志在 `data\bridge.log`。手动启动用 `tools\run_feishu.bat`（它会先跑
+doctor 自检凭据，错了当场说清原因）。
+
 **两个入口**（共用同一套服务层，规则不会漂移）。
 
 ### 终端
