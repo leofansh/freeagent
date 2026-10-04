@@ -390,3 +390,36 @@ def test_view_choice_click_still_works(wired):
     )
     assert channel.seen == (CHAT, ALICE, "/today")
     assert sender.sent
+
+
+def test_retired_card_never_tells_you_to_click(wired):
+    """退役卡面**不许教用户操作**——真机上被抓出来的缺陷。
+
+    点「我有哪些角色」后，入口卡回绿并写「**卡已经发在上面了**，点一下就行」，
+    而下面紧接着就是那张角色卡。也就是**教用户去点一张他已经在看的卡**，
+    还违反本项目自己定的「菜单不教用户操作」。
+
+    ## 为什么之前没抓住
+
+    `test_roles_button_sends_a_card_not_a_text_list` 断言的是
+    ``not sender.sent`` —— 那是「没发**文字气泡**」。可这句话**根本不是气泡**，
+    它是**退役卡的正文**，装在回调响应里。于是那条断言一直是绿的，缺陷从
+    断言的缝里漏了过去，还顺手改对了 ``_send_role_card_via`` 的返回类型
+    却没让任何一条测试变红。
+
+    教训：**断言要落在真正出问题的那个通道上。** 这里断言整份响应里没有
+    「点一下」这类指示语——比逐字匹配文案更抗改写，又比 ``not sender.sent``
+    抓得住真缺陷。
+    """
+    sender, channel, app = wired
+    app.roles.create("工作")
+
+    out = bridge_mod._card_action(
+        _click({"action": MENU_ACTION, "choice": "roles", "chat": CHAT})
+    )
+
+    blob = repr(out)
+    assert "点一下" not in blob, f"退役卡面在教用户操作：{blob}"
+    assert "点一下就行" not in blob, f"退役卡面在指路：{blob}"
+    # 角色卡本身照发——修掉废话不等于把结果也删了
+    assert sender.cards.calls, "角色卡没发出去"

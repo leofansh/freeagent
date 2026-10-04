@@ -422,15 +422,33 @@ class FeishuBridge:
     def _send_role_card(self, msg, *, open_id=None, chat_id=None) -> str:
         """打字路径的入口。**转手** :func:`_send_role_card_via`，不自己实现。
 
-        刻意薄到只有一行：这一层存在的唯一理由是打字路径手里有 ``msg``、
+        刻意薄到只有一次调用：这一层存在的唯一理由是打字路径手里有 ``msg``、
         而那份共享实现要的是 ``open_id`` / ``chat_id``。一旦在这里再写一遍
         发卡逻辑，就又是第二份实现（设计文档 12.1.3）。
+
+        ## 这里必须做一次 ``None`` → ``""`` 的转换
+
+        两层的「不说话」约定**不一样**，而这个差异是有原因的：
+
+        - 按钮路径（:func:`_run_menu`）拿到 ``None`` 就 return，**不回话**
+        - 打字路径（:meth:`_route_menu`）用 ``""`` 表示「已处理、不用回话」，
+          而 ``None`` 在那一层是**「没拦到」** —— 会继续往下走、交给
+          ``channel.handle``
+
+        所以这里若直接把 ``None`` 透传上去，「你有什么角色？」就会**穿透
+        菜单回到派发 machinery** —— 也就是 12.1.3 修的那个分叉原样复发。
+        两条既有测试当场抓住了它（`test_role_query_becomes_a_role_card`、
+        `test_menu_short_circuits_before_dispatch`）。
+
+        教训记下来：**在注释里写下「要做什么」不等于做了。** 上一版我把
+        这句转换写进了 docstring 却没实现，而测试抓到的正是这个缺口。
         """
-        return _send_role_card_via(
+        problem = _send_role_card_via(
             sender=self.sender,
             open_id=open_id if open_id is not None else msg.sender_open_id,
             chat_id=chat_id if chat_id is not None else msg.chat_id,
         )
+        return "" if problem is None else problem
 
     def _process(self, msg: IncomingMessage) -> None:
         if msg.unsupported_type:
@@ -1182,12 +1200,21 @@ def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
 
     if plan.get("roles"):
         # 发角色卡需要 sender，而这里只有模块级的 ``_card_sender``。
-        # **不新建第二个发卡实现**——复用 :meth:`FeishuBridge._send_role_card`，
-        # 它已经支持显式传 open_id/chat_id。第一版就是在这里「没有卡片能力
-        # 可用」而退回文本的，代价是同一个动作两种行为。
-        text = _send_role_card_via(
-            open_id=who, chat_id=chat_id,
-        )
+        # **不新建第二个发卡实现**——复用 :func:`_send_role_card_via`。
+        # 第一版就是在这里「没有卡片能力可用」而退回文本的，代价是同一个
+        # 动作两种行为。
+        #
+        # 返回 ``None`` = 卡已发出。这时候**一个字都不再说**：新卡就在下面，
+        # 再补一句「点一下就行」既教用户操作、又指向他已经在看的那张卡。
+        # 卡面照旧回写成「已打开」，让点击有反馈、按钮不再可点。
+        problem = _send_role_card_via(open_id=who, chat_id=chat_id)
+        if problem is None:
+            return _card_action_response(
+                _decided_card("已打开", "**已收到**，角色列表在下面。",
+                              granted=True),
+                "success", "已打开",
+            )
+        text = problem                      # 发卡失败：把原因回给用户
     elif plan.get("view"):
         # 有现成只读渲染的一律转手 _run_view_choice，菜单只是把它送进去 ——
         # 于是输出与「直接打那条命令」逐字一致（12.1.1 的硬约束）。
@@ -1256,7 +1283,7 @@ def _menu_role_names() -> list[str]:
     return _role_names()
 
 
-def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str:
+def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str | None:
     """发「选一个角色」卡。**唯一一份发卡实现**（设计文档 12.1.3）。
 
     两条入口都调它：打字路径经 :meth:`FeishuBridge._send_role_card` 转手，
@@ -1269,7 +1296,27 @@ def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str:
     所以这个函数**必须显式收 sender**，不能自己去摸某个全局 —— 否则又变成
     「谁先跑谁说了算」，而那种分叉只在特定启动顺序下出现，极难查。
 
-    返回要回给用户的话；空串 = 不用回（卡已经说明一切）。
+    返回值刻意用 ``str | None`` **在类型上区分两件事**：
+
+    - ``None`` —— 卡片**已发出**，调用方不该再回任何文字
+    - ``str``  —— 发卡失败，这句是要回给用户的话
+
+    ## 为什么不用空串当「成功」
+
+    第一版返回 ``""`` 表示「卡已发出、不用回话」，而调用方写的是
+    ``if not text: 回一句兜底``。于是 ``""`` 既是成功哨兵、又被当成
+    「意外为空」——**一个值两种含义**，成功路径和处理失败长得一模一样。
+
+    真机上的表现：点「我有哪些角色」后，入口卡回绿并写「卡已经发在上面了，
+    点一下就行」，而下面就是那张角色卡。**教用户去点一张他已经在看的卡。**
+
+    而且它违反了本项目自己定的两条规范：菜单不教用户操作、菜单不许把人踢回
+    打字。写成 ``None`` 之后，「卡已发出」这件事**根本没法**被误当成需要
+    回话的情况。
+
+    两处的约定不同，这里刻意保持清楚：按钮路径要 ``None``（不发言），
+    打字路径的 :meth:`FeishuBridge._send_role_card` 转成 ``""``——
+    那个位置用 ``""`` 表示「不用回话」是**既有**约定，不是同一层语义。
     """
     target = sender if sender is not None else _card_sender
     if target is None:
@@ -1289,7 +1336,7 @@ def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str:
     except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
         log.warning("【菜单】发角色卡失败", exc_info=True)
         return "你的角色：" + "、".join(names[:20])
-    return ""
+    return None
 
 
 def _menu_dispatch(choice: str) -> dict[str, Any]:
