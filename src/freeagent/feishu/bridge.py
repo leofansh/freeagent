@@ -1228,7 +1228,7 @@ def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
         # 表里这一项既没有可点角色也没有正文：说明它该给的是卡片而不是文字，
         # 而卡片已经在上面发过了。刻意**不说话**，别用一句废话填掉。
         return _card_action_response(
-            _decided_card("已打开", "**卡已经发在上面了**，点一下就行。",
+            _decided_card("已打开", "**这一项没有可显示的内容。**",
                           granted=True),
             "success", "已打开",
         )
@@ -1330,7 +1330,7 @@ def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str | Non
             open_id=open_id,
             subject="选一个角色",
             items=[(n, f"role:{n}") for n in names[:20]],
-            note="点一个看它下面的事务；名字已经按角色列在上面了。",
+            note="按角色看它下面的事务。",
             chat_id=chat_id,
         )
     except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应

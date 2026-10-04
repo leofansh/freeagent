@@ -90,7 +90,8 @@ class _Cards:
         self.calls: list[dict] = []
 
     def __call__(self, sender, *, open_id, subject, items, note="", chat_id=""):
-        self.calls.append({"items": list(items), "chat_id": chat_id})
+        self.calls.append({"items": list(items), "chat_id": chat_id,
+                            "subject": subject, "note": note})
         return "om_menu"
 
 
@@ -423,3 +424,36 @@ def test_retired_card_never_tells_you_to_click(wired):
     assert "点一下就行" not in blob, f"退役卡面在指路：{blob}"
     # 角色卡本身照发——修掉废话不等于把结果也删了
     assert sender.cards.calls, "角色卡没发出去"
+
+
+#: 卡片文案里**不许出现**的指示语：它们叫人去点他已经在看的按钮。
+#:
+#: 划线的理由（别扩大到「在下面」这类**位置陈述**）：「结果已发在上面」是
+#: 如实报告内容在哪，而「点一下就行」是**叫人做一个他刚做完的动作**。
+#: 前者有用，后者只是把界面写成了说明书。
+BANNED_IN_CARD = ("点一下", "点一个", "点它")
+
+
+def test_role_card_note_does_not_teach_the_user_to_click(wired):
+    """角色卡**自己的 note** 也不许教用户点按钮 —— 真机截图顶出来的。
+
+    上一轮只守了退役卡那一个位置就宣布「这一类修完了」，结果同一句
+    「点一个看它下面的事务」原封不动留在角色卡的 note 上，而且后半句
+    「名字已经按角色列在上面了」**还是错的**——名字**就是那些按钮**，
+    不在「上面」。用户会低头再找一遍。
+
+    所以这里断言的是**卡面 note 本身**，不是回调响应。
+    """
+    sender, channel, app = wired
+    app.roles.create("工作")
+
+    bridge_mod._card_action(
+        _click({"action": MENU_ACTION, "choice": "roles", "chat": CHAT})
+    )
+
+    assert sender.cards.calls, "角色卡没发出去"
+    note = sender.cards.calls[0]["note"]
+    for bad in BANNED_IN_CARD:
+        assert bad not in note, f"角色卡 note 在教用户操作：{note!r}"
+    # 名字就是按钮，不在「上面」——那句话会把人引到错的地方去找
+    assert "上面" not in note, f"note 指向了错误位置：{note!r}"
