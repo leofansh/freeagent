@@ -645,7 +645,8 @@ class Repl:
                 f"（还没有角色，先归入「{DEFAULT_ROLE_NAME}」；"
                 f"以后可以 /role-rename 改名或 /merge 合并）"
             )
-            role = self.app.roles.create(DEFAULT_ROLE_NAME)
+            with self.app.lock:
+                role = self.app.roles.create(DEFAULT_ROLE_NAME)
             self._say(f"  已建角色脉络「{role.name}」")
             self._create(text, self.app.llm.classify(text, []).kind, [role.name])
             return True
@@ -707,12 +708,16 @@ class Repl:
         return None
 
     def _ensure_role(self, name: str):
-        existing = self.app.roles.find_by_name(name)
-        if existing is not None:
-            return existing
-        role = self.app.roles.create(name)
-        self._say(f"  新建角色脉络「{name}」")
-        return role
+        # 读-改-写：两个线程都「没找到」就会各建一个同名角色。
+        # ``app.lock`` 是 **RLock**，所以 :meth:`_create` 里嵌套调用本方法
+        # 不会自锁。
+        with self.app.lock:
+            existing = self.app.roles.find_by_name(name)
+            if existing is not None:
+                return existing
+            role = self.app.roles.create(name)
+            self._say(f"  新建角色脉络「{name}」")
+            return role
 
     def _require_role(self, key: str):
         role = self._match_role(key) or self._find_role_by_id(key)
@@ -729,17 +734,16 @@ class Repl:
 
     # -- 自然语言建事务 ----------------------------------------------------- #
     def _create(self, text: str, kind: str, role_names: list[str]) -> None:
-        today = self.app.clock.today()
-        scheduled = parse.parse_date_expr(text, today)
-        # 标题保留「下周二」这类时间信息 —— 那是标题的一部分，不是噪声
+        # ── 锁外：网络调用 ────────────────────────────────────────────────
+        #
+        # 标题保留「下周二」这类时间信息 —— 那是标题的一部分，不是噪声。
+        #
+        # **刻意放在锁外**：这是网络往返（配置 20s），而下面那个写入是三条
+        # 语句的序列。锁只该盖住后者（设计文档 12.7.2 的 R1）。
         title = self.app.llm.refine_title(text)
 
-        role_ids: list[str] = []
-        for name in role_names:
-            role = self._match_role(name) or self._ensure_role(name)
-            role_ids.append(role.id)
-        if not role_ids:
-            role_ids = [self._ensure_role("未分类").id]
+        today = self.app.clock.today()
+        scheduled = parse.parse_date_expr(text, today)
 
         task_kind = TaskKind(kind)
         waiting_on = None
@@ -763,16 +767,33 @@ class Repl:
         if scheduled is None and task_kind is TaskKind.REMINDER and reminder is not None:
             scheduled = reminder.date()
 
-        task = self.app.tasks.create(
-            title,
-            role_ids,
-            kind=task_kind,
-            intent=intent,
-            scheduled_for=scheduled,
-            due_time=due,
-            reminder_time=reminder,
-            waiting_on=waiting_on,
-        )
+        # ── 锁内：角色解析 + 建事务的**三条语句** ─────────────────────────
+        #
+        # ``TaskService.create`` 是 ``INSERT tasks`` → ``task_roles`` →
+        # ``task_records``。而 ``sqlite3.threadsafety == 3`` 只保证**语句级**
+        # 串行，不保证**序列**原子 —— 两个线程交错时，一个线程可能在自己的
+        # ``task_roles`` 插入那一刻另一个线程已推进到下一条，于是外键找不到
+        # 父行。实测过：``sqlite3.IntegrityError: FOREIGN KEY constraint
+        # failed``。
+        #
+        # 所以锁必须盖住**整个序列**，而不是「大概包一下」。
+        with self.app.lock:
+            role_ids: list[str] = []
+            for name in role_names:
+                role = self._match_role(name) or self._ensure_role(name)
+                role_ids.append(role.id)
+            if not role_ids:
+                role_ids = [self._ensure_role("未分类").id]
+            task = self.app.tasks.create(
+                title,
+                role_ids,
+                kind=task_kind,
+                intent=intent,
+                scheduled_for=scheduled,
+                due_time=due,
+                reminder_time=reminder,
+                waiting_on=waiting_on,
+            )
         self._say()
         self._say(f"已记下：{task.title}")
         self._say(

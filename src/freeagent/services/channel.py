@@ -33,6 +33,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import io
 import time
 from collections import OrderedDict
@@ -199,6 +201,24 @@ class ChannelService:
         # 都变成类型错误（``object`` 上没有那些属性）。类型标注写窄一点，
         # 换来的是**真实**的检查而不是一堆假错误。
         self._repls: OrderedDict[str, Any] = OrderedDict()
+        #: **每个会话一把锁** —— 只给自由文本用（设计文档 12.7.2 的 R1）。
+        #:
+        #: 为什么要按会话：``app.lock`` 是**进程级**的，而一次飞书往返含网络
+        #: 等待（``classify``、``refine_title``；配置 20s，两次连着来最坏
+        #: 40s）。于是 A 在思考时，B 的 ``/today``、卡片点击回执全排在同一把
+        #: 锁后面 —— 实测 B 至少等了 0.6s，而它只是跑了个本地查询。
+        #:
+        #: 为什么**写入序列**不靠它：``TaskService.create`` 是三条语句，而
+        #: ``sqlite3.threadsafety == 3`` 只保证**语句级**串行。我曾试过把整
+        #: 把锁换成按会话的，结果并发直接炸
+        #: ``sqlite3.IntegrityError: FOREIGN KEY constraint failed``。
+        #: 所以现在**两道锁各管一段**：
+        #:
+        #: - 这里（按会话）：护住 Repl 的**内存可变状态** ——
+        #:   ``_pending`` / ``_plan`` / ``_mode`` / ``_last_items``。
+        #:   同一会话两条消息交错会把答案对错号、把计划搅乱。
+        #: - ``Repl._create`` 内部（进程级）：护住**写入序列**的原子性。
+        self._chat_locks: dict[str, threading.Lock] = {}
         #: 上一条消息附带的只读视图选项。飞书侧据此渲染按钮卡。
         self._last_choices: tuple[str, ...] = ()
         #: 本轮要请人确认的计划行（Plan → Build）。空 = 不发确认卡。
@@ -237,6 +257,17 @@ class ChannelService:
         allow_text = ", ".join(sorted(self.allowed)) or "空"
         return f"事件侧=[{seen_text}]，白名单=[{allow_text}]"
 
+    def _chat_lock(self, chat_id: str) -> threading.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = self._chat_locks[chat_id] = threading.Lock()
+        return lock
+
+    def _has_pending(self, chat_id: str) -> bool:
+        """这个会话正等着用户回答吗？（见上面「追问期走全局锁」的理由）"""
+        repl = self._repls.get(chat_id)
+        return repl is not None and getattr(repl, "_pending", None) is not None
+
     # -- 路由 --------------------------------------------------------------- #
     def handle(
         self,
@@ -268,8 +299,18 @@ class ChannelService:
                 text="这里退不出我 —— 想收尾去终端敲 /quit。", denied=True
             )
 
-        with self.app.lock:
-            reply = self._run(chat_id, self._canonical(sender_ids), text)
+        sender = self._canonical(sender_ids)
+        if text.startswith("/") or self._has_pending(chat_id):
+            # 命令与追问期仍走**进程级**锁：
+            # - 命令是读-改-写的高发区（``/role-rename``、``/merge`` 改的是
+            #   组织结构），交错会真的把数据搞坏；
+            # - 追问期是在接续**上一条**的半截对话。
+            # 而它们通常很快 —— 真正慢的是自由文本里的模型调用。
+            with self.app.lock:
+                reply = self._run(chat_id, sender, text)
+        else:
+            with self._chat_lock(chat_id):
+                reply = self._run(chat_id, sender, text)
         return ChannelReply(
             text=self._clip(reply),
             choices=self._last_choices,
@@ -316,6 +357,9 @@ class ChannelService:
                 pass
             self._repls[chat_id] = repl
             while len(self._repls) > self.max_chats:
+                # 会话锁跟 Repl **一起淘汰**，否则这个字典只增不减。
+                # 刻意不在删除时解锁：可能还有别的线程正持有它。
+                self._chat_locks.pop(next(iter(self._repls)), None)
                 self._repls.popitem(last=False)   # 丢最久没用的那个会话
         else:
             self._repls.move_to_end(chat_id)
