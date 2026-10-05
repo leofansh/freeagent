@@ -50,6 +50,7 @@ from .sender import (  # noqa: E402
     _decided_card,
     VIEW_CHOICE_ACTION,
     MENU_ACTION,
+  PLAN_CONFIRM_ACTION,
     send_menu_card,
 )
 from .status import (
@@ -579,6 +580,26 @@ class FeishuBridge:
         #
         # 卡片里**仍然把正文也发一遍**（``send_text``），因为发卡可能失败，
         # 而「点了没反应」比「多点一次」糟得多。
+        if reply.plan_confirm:
+            # Plan → Build 的确认卡（设计文档 12.7.2）。
+            #
+            # **与下面的选项卡分开**：那张是「我没把握，请选一个」——
+            # 只读、无副作用。这张点了**会建事务**，是写操作。混在一起
+            # 就没法判断该不该走审批凭据，而漏判的后果是「点一下就建了」。
+            from .sender import send_plan_confirm_card
+
+            try:
+                send_plan_confirm_card(
+                    self.sender,
+                    open_id=msg.sender_open_id,
+                    subject="确认执行这些？",
+                    plan_lines=reply.plan_confirm,
+                    chat_id=msg.chat_id,
+                )
+                log.info("已发确认卡：chat=%s，%d 条待确认",
+                         msg.chat_id, len(reply.plan_confirm))
+            except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
+                log.warning("发确认卡失败，回退成纯文本", exc_info=True)
         if reply.choices:
             from .sender import send_view_choice_card
 
@@ -988,6 +1009,11 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         # 「过期即拒」的安全含义，混进凭据流程是错配。
         if value.get("action") == MENU_ACTION:
             return _run_menu(value, who=who)
+
+        # 放在 credential 那段**之前**：确认卡的按钮载荷里**没有** ``id``，
+        # 只有 ``choice`` 与 ``chat`` —— 它不是凭据型卡片。
+        if value.get("action") == PLAN_CONFIRM_ACTION:
+            return _run_plan_confirm(value, who=who)
 
         credential = value.get("id")
         choice = value.get("action")
@@ -1419,6 +1445,71 @@ def _menu_delegate_text() -> str:
         f"`/delegate <项目绝对路径> | {role} | <要做的事，一句话>`\n\n"
         "两处要换：项目路径得在 `config.json` 的 `delegate.projects` 白名单里；"
         "需求写成**单行**（换行会被 opencode 判成复杂任务而失败）。"
+    )
+
+
+def _run_plan_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
+    """点了确认卡 → 路由成 ``/mode-build <choice>``，结果发回窗口并收掉按钮。
+
+    ## 为什么路由回命令，而不是在这里直接建事务
+
+    12.1.1「一份能力一份实现」。这里若自己读计划、自己调
+    ``tasks.create``，那就成了**第二份** Plan→Build 实现，而分叉的表现极
+    隐蔽（飞书正常、终端对，而两边各自都测过）。
+
+    路由成命令的另一个好处是**白送**：``ChannelService`` 会做白名单判定、
+    去重、``_clip`` 截断、追问状态 —— 这些在命令路径上已经是对的，
+    在这里重写一遍只会漏。
+
+    ## 「取消」也走同一条路
+
+    ``cancel`` 同样路由成 ``/mode-build cancel``，由 :class:`Repl` 决定
+    「计划留着」。**不在这里判断** —— 「取消之后计划还在」是那条命令的
+    语义，不该在桥接里复制一份。
+    """
+    choice = str(value.get("choice") or "").strip().lower()
+    chat_id = str(value.get("chat") or "").strip()
+    if not choice or not chat_id:
+        return _no_card_change("确认卡载荷不完整，未处理")
+    if choice not in ("ok", "cancel"):
+        # 不猜。认不出的 choice **只把卡收掉**，不发话 ——
+        # 说「已确认」而实际没做，比什么都不说糟得多。
+        log.info("【确认卡】认不出的 choice=%r（chat=%s）—— 只收卡", choice, chat_id)
+        return _no_card_change("不认识这个操作")
+    if _card_channel is None or _card_sender is None:
+        # 没有通道 = 没人能执行。**不猜**：绝不报「已确认」。
+        log.warning("【确认卡】没连上通道，不处理（choice=%r chat=%r）",
+                    choice, chat_id)
+        return _card_action_response(
+            _decided_card("没法确认", "**没连上，确认不了。**", granted=False),
+            "error", "没连上",
+        )
+
+    try:
+        with _card_channel.app.lock:
+            reply = _card_channel.handle(chat_id, who, f"/mode-build {choice}")
+    except Exception:  # noqa: BLE001 - 点卡不该把桥接带崩
+        log.exception("【确认卡】执行失败（choice=%r chat=%r）", choice, chat_id)
+        return _card_action_response(
+            _decided_card("没能执行", "**没能执行。** 计划还在，稍后再试。",
+                          granted=False),
+            "error", "没能执行",
+        )
+
+    # 1) 聊天气泡 —— 用户在窗口里等的就是这个。
+    #    只靠卡片回写的话，他得自己发现「刚才那张卡变了」。
+    try:
+        _card_sender.send_text(chat_id, reply.text)
+    except Exception:  # noqa: BLE001 - 发不出去不该让「已执行」变成假的
+        log.warning("【确认卡】回话失败（chat=%s）", chat_id, exc_info=True)
+
+    # 2) 卡片回写把按钮**收掉** —— 留着可点的按钮等于骗人（实测过的坑）。
+    heading = "已确认执行" if choice == "ok" else "已取消"
+    body = ("**已按你确认的计划建好事务。**" if choice == "ok"
+            else "**好，先留着。** 计划还在，随时可以再确认。")
+    return _card_action_response(
+        _decided_card(heading, body, granted=(choice == "ok")),
+        "success", heading,
     )
 
 

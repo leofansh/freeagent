@@ -104,69 +104,99 @@ def test_entering_plan_says_it_writes_nothing(repl):
     assert r._mode == MODE_PLAN
 
 
-def test_exit_lists_the_plan_and_admits_no_execution(repl):
-    """``/mode-build`` **必须明说没有执行任何东西**。
+def test_mode_build_requests_confirmation_but_executes_nothing(repl):
+    """``/mode-build`` 必须**发确认卡、且一个字都还没执行**。
 
-    因为确认卡还没实现。如果它说得像执行过了，用户会以为委派已经发起——
-    而这正是本项目反复吃的亏（状态文件假绿灯、``known_names`` 死代码、
-    「点一下就行」）。**说清边界比看起来完整重要。**
+    ## 契约变了（2026-10-05）
+
+    旧契约：``/mode-build`` 立刻切 ``build`` 并清空计划。
+    新契约：**确认之前保持 plan、不清空**。
+
+    理由是「再想想」这个退路：提前切走的话，用户点了「取消」就回不来了 ——
+    而那正是确认卡必须提供的第三个选择。
+
+    「必须明说没有执行任何东西」这条**没变**，而且更重要了：确认卡已经发出，
+    若这时说得像执行过了，用户会以为委派已经发起。
     """
     r, app = repl
     _run(r, "/mode-plan", "第一件事", "第二件事")
     out = _run(r, "/mode-build")
 
-    assert r._mode == MODE_BUILD
+    assert r._mode == MODE_PLAN, (
+        "确认前不该切模式 —— 否则「取消」回不来"
+    )
+    assert r._last_plan_confirm == ("第一件事", "第二件事"), \
+        f"应当存下待确认的快照，实际 {r._last_plan_confirm!r}"
     assert "还没有执行任何东西" in out, (
         "必须承认尚未执行 —— 否则用户会以为委派已发起"
     )
     assert "第一件事" in out and "第二件事" in out
-    assert app.tasks.list_all() == [], "build 也还没实现，不该建任何东西"
+    assert app.tasks.list_all() == [], "确认之前不该建任何东西"
 
 
-def test_exit_with_no_plan_says_already_build(repl):
-    r, _app = repl
-    out = _run(r, "/mode-build")
-    assert "已经在 build" in out, "空计划时要说清，而不是默默切模式"
+def test_mode_build_ok_creates_the_tasks(repl):
+    """``/mode-build ok`` 才真的建事务，且**走正常路径**（角色要有归属）。"""
+    r, app = repl
+    _run(r, "/mode-plan", "第一件事", "第二件事")
+    # **必须先发卡**（`/mode-build` 无参）才能 `ok`。
+    # 参数也要在**同一条命令里**：`_run(r, *lines)` 是逐条 handle，写成
+    # `_run(r, "/mode-build", "ok")` 会变成两次 handle，而 "ok" 会被
+    # Plan 正确地当成自由文本吞掉 —— 那是测试写错，不是实现错。
+    _run(r, "/mode-build")
+    out = _run(r, "/mode-build ok")
+
+    assert r._mode == MODE_BUILD, "确认后才切模式"
+    assert r._plan == [] and r._last_plan_confirm == ()
+    titles = {t.title for t in app.tasks.list_all()}
+    assert len(titles) >= 1, "确认后至少该建一条事务"
+    assert "未分类" not in titles, \
+        "不能掉进「未分类」—— 那说明没走正常路径的角色推断"
 
 
-# --------------------------------------------------------------------------- #
-# 撞名防护
-# --------------------------------------------------------------------------- #
-def test_plan_command_is_still_the_scheduling_one(repl):
-    """``/plan`` **必须仍是「排期参考」**，被我错绑过。
+def test_mode_build_cancel_keeps_the_plan(repl):
+    """``/mode-build cancel`` **保留计划** —— 他可能只是想再想想。"""
+    r, app = repl
+    _run(r, "/mode-plan", "第一件事")
+    out = _run(r, "/mode-build cancel")
 
-    当时把模式入口写成 ``/plan``，Python 类体里后定义覆盖先定义，于是
-    ``self._cmd_plan`` 解析到了拆步骤那个——症状是 ``/plan <id>`` 什么都不做，
-    而 ``/plan`` 也不进模式。
+    assert r._mode == MODE_PLAN
+    assert r._plan == ["第一件事"], "取消不该丢掉计划"
+    assert r._last_plan_confirm == (), "但待确认状态要清掉"
+    assert app.tasks.list_all() == [], "取消不该建任何东西"
+    assert "留着" in out
+
+
+def test_plan_is_frozen_while_the_card_is_out(repl):
+    """确认卡挂着时**不接受新内容** —— 计划被冻结。
+
+    这条**取代**了原来那条「计划变了就拒绝确认」：现在计划根本改不了，
+    所以那个场景不再能发生。留着旧测试只会让人以为还能在挂卡时补计划。
+
+    为什么必须冻结：卡上印的是发出时的计划。若这时追加，卡上印的和实际会
+    执行的对不上 —— 而用户的回复恰恰是「记下了」，**像是成功了**。
     """
     r, app = repl
-    task_id = app.tasks.create("一件事", [app.roles.create("工作").id]).id
-    out = _run(r, f"/plan {task_id}")
-    assert "用法" not in out, "/plan 被模式入口抢走了"
-    assert r._mode == MODE_BUILD, "/plan 不该切模式"
+    _run(r, "/mode-plan", "第一件事")
+    _run(r, "/mode-build")                     # 发出确认卡（冻结）
+    out = _run(r, "第二件事")                   # 挂卡时说的话
+
+    assert r._plan == ["第一件事"], "挂卡时不该接受追加"
+    assert "没有" in out and "加进去" in out, (
+        f"要说清为什么没记进去：{out!r}"
+    )
+    assert app.tasks.list_all() == [], "Plan 期仍不该建事务"
 
 
-def test_slash_still_works_inside_plan(repl):
-    """Plan 里的 ``/`` 仍走命令——Plan 管的是**自由文本**。
+def test_confirm_without_a_card_is_refused(repl):
+    """**没发过卡就不许确认** —— 不许执行一个从没展示过的东西。
 
-    否则用户问着问着想 ``/today`` 看一眼都得先退出 Plan，那不叫规划。
+    这条是上面那个「测试漏了一步」暴露出来的真保护：若 `/mode-build ok`
+    能直接执行，那么「确认」就退化成一句口号，用户从没机会核对计划。
+    确认卡的全部意义就是**他核对过**，所以快照必须先由发卡那一步产生。
     """
     r, app = repl
-    _run(r, "/mode-plan", "先记着")
-    _run(r, "/today")
-    assert r._mode == MODE_PLAN, "/today 不该把模式切走"
-    assert r._plan == ["先记着"], "/today 不该被当成计划内容"
+    _run(r, "/mode-plan", "第一件事")
+    out = _run(r, "/mode-build ok")
 
-
-# --------------------------------------------------------------------------- #
-# 独立性：同型 bug 今日已犯三次，这里必须有测试
-# --------------------------------------------------------------------------- #
-def test_mode_handlers_are_distinct_methods(repl):
-    """Plan 与 build 的处理器**必须是两个不同的方法**。
-
-    这是``_cmd_plan`` 覆盖事件的直接防线：若它们变成同一个名字，Python 会
-    静默让后者生效，而 ``/plan`` 的原功能当场消失。
-    """
-    r, _app = repl
-    assert r._cmd_mode_plan is not r._cmd_mode_build
-    assert r._cmd_mode_plan.__name__ != r._cmd_mode_build.__name__
+    assert app.tasks.list_all() == [], "没发卡就确认 = 批准了没展示过的东西"
+    assert "/mode-build" in out, f"要告诉他怎么走：{out!r}"

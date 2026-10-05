@@ -95,7 +95,10 @@ _USAGE: dict[str, str] = {
     # 它被拿去做「你敲了 X，正确的用法是 X …」这种回话，缺了前缀就成了
     # 一句没有主语的说明。
     "/mode-plan": "/mode-plan —— 进入规划：只沟通、不落库、可多轮",
-    "/mode-build": "/mode-build —— 退出规划（确认卡尚未实现，故尚不执行）",
+    "/mode-build": (
+        "/mode-build —— 退出规划并发确认卡（**还不执行**）；"
+        "/mode-build ok 确认建事务、/mode-build cancel 先留着"
+    ),
     "/tick": "/tick",
     "/llm": "/llm            查看当前智能层与配置（不显示 Key）",
     "/help": "/help",
@@ -276,6 +279,13 @@ class Repl:
         self._mode: str = MODE_BUILD
         #: Plan 模式下累积的计划行。**只进不出，直到退出 Plan**。
         self._plan: list[str] = []
+        #: 已发出、**等待用户点确认**的计划快照（设计文档 12.7.2）。
+        #:
+        #: 非空 = 有一张确认卡在飞书里等着。刻意存**快照**而不是直接用
+        #: ``_plan``：卡片上印的是发出时的计划，用户确认期间可能又说了
+        #: 几句 —— 那时若无条件执行，就是批准了他**没看过的东西**，
+        #: 而确认卡的全部意义就是「他核对过」。
+        self._last_plan_confirm: tuple[str, ...] = ()
         #: 上一轮回答里列出的事务 id，按出现顺序。
         #:
         #: 问句交给 :meth:`ChatService.respond` 后，它靠这个把「第二个」
@@ -385,7 +395,24 @@ class Repl:
         这里**不假装能理解**：本切片还没有 action 维度，所以只回「记下了」并
         原样复述。**说清边界比假装听懂重要** —— 08:01 那次它就是满口答应
         「我去查」，执行时才被拒。
+
+        ## 确认卡挂着的时候不接受新内容
+
+        ``_last_plan_confirm`` 非空 = 有一张卡在等用户点。这时候他打的**任何**
+        自由文本都追加进计划，于是卡片上印的旧版与他以为要批准的内容**不一致**
+        —— 而他看到的回复恰恰是「记下了」，像是成功了。
+
+        所以这里**明确拒绝追加**并说明为什么。实测这个坑是我自己的测试撞出来的：
+        「/mode-build 之后、点确认之前，随便说一句」把那句话吸进了计划。
         """
+        if self._last_plan_confirm:
+            self._say(
+                f"（确认卡还挂着，计划仍是那 {len(self._last_plan_confirm)} 条。）\n"
+                f"  你说的这句**没有**加进去 —— 否则卡上印的和实际会执行的对不上，"
+                f"而你看到的回复却像成功了。\n"
+                f"  先点「确认执行」或「再想想」，或者先 /mode-plan 重新规划。"
+            )
+            return True
         self._plan.append(text)
         self._persist_plan()
         self._say(
@@ -453,26 +480,108 @@ class Repl:
         return True
 
     def _cmd_mode_build(self, args: list[str]) -> bool:
+        """退出规划。**三个形态，不新增命令**：
+
+        - ``/mode-build`` → **发确认卡，不动手**（Plan 仍在，可继续补）
+        - ``/mode-build ok`` → 确认：把计划落成事务
+        - ``/mode-build cancel`` → 取消：计划留着，回到 Plan 继续沟通
+
+        刻意不加 ``/confirm`` / ``/cancel`` 这两个新命令 —— 命令表每多一条，
+        说明书与设计文档的**计数**就跟着漂移一次（上次加 ``/mode-*`` 时刚
+        付过这个代价）。而给已有命令加参数，代价是零。
+        """
         chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
         if not self._plan:
             self._say("（已经在 build 模式，没有待执行的计划。）")
             return True
-        plan = self._plan
-        self._mode = MODE_BUILD
+
+        choice = args[0].strip().lower() if args else ""
+        if choice in ("cancel", "no"):
+            # 计划**留着** —— 他可能只是想再想想，不是想丢掉。
+            self._last_plan_confirm = ()
+            self._say("（好，先留着。想继续补就说 /mode-plan "
+                      "或直接再说一句。）")
+            return True
+
+        if choice in ("ok", "yes", "确认"):
+            return self._confirm_plan()
+
+        # 无参数：**发确认卡**。
+        #
+        # 这里**不切模式、也不清计划**：确认可能不来，也可能来「再想想」。
+        # 提前切走的话，取消就回不来了。
+        #
+        # 快照存一份：卡片上印的是**发出时**的计划，而用户确认期间可能又
+        # 说了几句 —— 那时若无条件执行，就是**批准了他没看过的东西**。
+        # ``_confirm_plan`` 会拿快照与当前计划比对，不一致就要求重新确认。
+        self._last_plan_confirm = tuple(self._plan)
+        self._say(
+            f"（build）{len(self._plan)} 条待确认。"
+            "**还没有执行任何东西** —— 确认之后才动手。"
+        )
+        for line in self._plan:
+            self._say(f"· {line}")
+        return True
+
+    def _confirm_plan(self) -> bool:
+        """真的动手：把计划里的每一行按**正常路径**建成事务。
+
+        ## 为什么复用 ``_create`` 而不是另写一套
+
+        这一刀要落库、要推断角色、要生成标题 —— 那些都在 :meth:`_create`
+        里（含 ``refine_title``）。另写一套就会漂移，而漂移的方向必然是
+        「建得比正常路径少」—— 那正是 Plan→Build 最不能坏的地方。
+
+        ## 为什么比对快照
+
+        卡片上印的是发出时的计划。若用户确认期间又说了几句，无条件执行
+        就是**批准了他没看过的东西** —— 而确认卡的全部意义就是「他核对过」。
+        所以不一致就**要求重新确认**，不猜他想批准哪一版。
+        """
+        shown = self._last_plan_confirm
+        if not shown:
+            self._say("（没有待确认的计划 —— 先说 /mode-build。）")
+            return True
+        if tuple(self._plan) != shown:
+            self._last_plan_confirm = ()
+            self._say(
+                f"（计划在你确认期间变了：确认卡上是 {len(shown)} 条，"
+                f"现在 {len(self._plan)} 条。）\n"
+                f"  已作废那张卡 —— 请重新说 /mode-build 看最新的一版。"
+            )
+            return True
+
+        plan = list(self._plan)
         self._plan = []
+        self._last_plan_confirm = ()
+        self._mode = MODE_BUILD
+        chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
         if chat_id:
-            # 退出规划即清掉持久状态：这份 Plan 已经交出去了（列给用户看了），
-            # 留着会让下次进入本会话时凭空冒出一份「待执行计划」。
             try:
                 self._plan_store().drop(chat_id)
             except Exception:  # noqa: BLE001
                 pass
-        self._say(
-            f"（build）收到 {len(plan)} 条。确认卡尚未实现 —— "
-            "所以**还没有执行任何东西**。"
-        )
+
+        made: list[str] = []
         for line in plan:
-            self._say(f"· {line}")
+            # **走正常路径**，而不是直接调 `_create(line, ACTION, [])`。
+            #
+            # 后者会让每一条都掉进「未分类」—— 那比用户自己在飞书里说
+            # 这句话**差**：`_natural` 里有角色推断、有 kind 判定、有
+            # 日期解析。复用它的意思就是字面上的「当你说这句话时会发生什么」。
+            self._natural(line)
+            if self._pending is not None:
+                # 触发追问就必须**停在这里**：追问会吃掉下一条输入，
+                # 而剩下的计划行会被当成「回答那个追问」——
+                # 于是计划内容被静默改写，而用户以为他批准的是原来那几条。
+                self._say(
+                    f"（{len(made) + 1} 条需要你先回答一个问题，已停下。"
+                    f"剩下的 {len(plan) - len(made) - 1} 条还没建。）"
+                )
+                break
+            made.append(line)
+        else:
+            self._say(f"（已建 {len(made)} 条事务。）")
         return True
 
     # -- 追问状态 ----------------------------------------------------------- #

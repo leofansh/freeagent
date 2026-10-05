@@ -80,10 +80,23 @@ class _Sender:
 
 
 class _Reply:
-    def __init__(self, text: str, *, choices=(), denied: bool = False) -> None:
+    """鸭子类型替身。
+
+    ``plan_confirm`` 必须在这里声明，尽管这个文件测的是菜单路由、
+    一条 Plan 命令都没碰 —— 桥接的文本处理会摸 ``reply.plan_confirm``，
+    缺字段就是 ``AttributeError``。
+
+    刻意**不用** ``getattr(reply, "plan_confirm", ())`` 兜底：那样真正的
+    ``ChannelReply`` 若哪天少了这个字段，也会被悄悄当成「没有要确认的」
+    —— 确认卡**静默不发出**，而用户以为点一下就行。
+    """
+
+    def __init__(self, text: str, *, choices=(), denied: bool = False,
+                 plan_confirm=()) -> None:
         self.text = text
         self.choices = list(choices)
         self.denied = denied
+        self.plan_confirm = tuple(plan_confirm)
 
 
 class _Dedup:

@@ -118,15 +118,37 @@ def test_plan_survives_process_restart(tmp_path):
 # --------------------------------------------------------------------------- #
 # 退出规划要清干净
 # --------------------------------------------------------------------------- #
-def test_exiting_plan_clears_the_stored_state(svc):
-    """退出规划后**不留残影** —— 否则下次进来凭空多出一份计划。"""
+def test_confirming_plan_clears_the_stored_state(svc):
+    """**确认之后**不留残影 —— 否则下次进来凭空多出一份计划。
+
+    注意是「确认之后」而不是「``/mode-build`` 之后」：``/mode-build`` 现在
+    只是**发出确认卡**，此时计划必须还在 —— 否则用户点「取消」就没得取消了，
+    而那道「取消」正是确认卡必须提供的第三个选择。
+    """
+    service, _app = svc
+    _run(service, "chat_A", "/mode-plan")
+    _run(service, "chat_A", "一件事")
+    _run(service, "chat_A", "/mode-build")          # 只发卡，计划留着
+    _run(service, "chat_A", "/mode-build ok")    # 确认后才清（前面已发卡）
+    _run(service, "chat_B", "/mode-plan")          # 挤掉 A，逼它从盘上读
+    _run(service, "chat_A", "你好")
+    assert service._repls["chat_A"]._plan == []
+
+
+def test_plan_survives_a_cancel(svc):
+    """「再想想」之后计划**必须还在** —— 包括跨会话淘汰之后。"""
     service, _app = svc
     _run(service, "chat_A", "/mode-plan")
     _run(service, "chat_A", "一件事")
     _run(service, "chat_A", "/mode-build")
+    _run(service, "chat_A", "/mode-build cancel")
     _run(service, "chat_B", "/mode-plan")     # 挤掉 A，逼它从盘上读
-    _run(service, "chat_A", "你好")
-    assert service._repls["chat_A"]._plan == []
+    # 取消后确认卡已收，所以这句话**会**被接受追加。
+    # 这里只关心「原计划还在」—— 那才是「再想想 ≠ 扔掉」的意思。
+    _run(service, "chat_A", "/mode-build")    # 再发一次卡，好让下一句被冻结
+    got = service._repls["chat_A"]._plan
+    assert "一件事" in got, \
+        f"取消后计划丢了 —— 那就是「再想想」变成「扔掉」：{got!r}"
 
 
 # --------------------------------------------------------------------------- #

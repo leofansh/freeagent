@@ -141,8 +141,15 @@ class ChannelReply:
     #:
     #: 只装**只读**视图。只读没有副作用，因此**不需要审批凭据** ——
     #: 按钮的 value 直接带视图名即可，那张卡是**无状态**的。
-    #: 写操作走文字反问（B 方案），不要塞进这张卡。
     choices: tuple[str, ...] = ()
+
+    #: Plan 模式要确认的计划行（设计文档 12.7.2）。**空 = 本轮不需要确认卡**。
+    #:
+    #: 刻意与 :attr:`choices` 分开而不合并成「带凭据的选项卡」：那张卡的
+    #: 语义是「我没把握，请选一个」—— **只读、无副作用**。而这里点了会
+    #: **建事务**，是写操作。把两者塞进同一个字段，桥接就没法区分该不该
+    #: 走审批凭据，而漏判的后果是「点一下就建了事务」。
+    plan_confirm: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +201,8 @@ class ChannelService:
         self._repls: OrderedDict[str, Any] = OrderedDict()
         #: 上一条消息附带的只读视图选项。飞书侧据此渲染按钮卡。
         self._last_choices: tuple[str, ...] = ()
+        #: 本轮要请人确认的计划行（Plan → Build）。空 = 不发确认卡。
+        self._last_plan_confirm: tuple[str, ...] = ()
 
     # -- 白名单 ------------------------------------------------------------- #
     def is_allowed(self, sender_ids: str | Iterable[str]) -> bool:
@@ -261,7 +270,11 @@ class ChannelService:
 
         with self.app.lock:
             reply = self._run(chat_id, self._canonical(sender_ids), text)
-        return ChannelReply(text=self._clip(reply), choices=self._last_choices)
+        return ChannelReply(
+            text=self._clip(reply),
+            choices=self._last_choices,
+            plan_confirm=self._last_plan_confirm,
+        )
 
     @staticmethod
     def _canonical(sender_ids: str | Iterable[str]) -> str:
@@ -319,6 +332,19 @@ class ChannelService:
         # 清空上一轮的选项：每条消息都要重设，否则上一句触发的按钮卡
         # 会**粘**到这一句上 —— 而这两句可能毫无关系。
         repl._last_choices = ()
+        # ⚠️ **刻意不重置** ``_last_plan_confirm``（与 ``_last_choices`` 相反）。
+        #
+        # 我第一版把它和 ``_last_choices`` 一样每条消息清掉，**结果是确认永远
+        # 失效**：卡片在第 N 条消息发出，点击在第 N+2 条才到 —— 快照先被清空了，
+        # 于是 ``/mode-build ok`` 每次都走「没有待确认的计划」，计划原地不动。
+        #
+        # 区别在**归属**：
+        # - ``_last_choices`` 属于「那一条回复」的按钮卡 —— 粘住就是错的
+        # - ``_last_plan_confirm`` 是「待确认」的**状态** —— 必须活到用户
+        #   点了确认或取消为止，否则「点一下就好」这个设计根本不成立
+        #
+        # 过期由 ``_confirm_plan`` 的快照比对兜底：计划变了就要求重新确认，
+        # 所以「粘住一个过时快照」这个风险已经被覆盖了。
         # 每条消息都重设来源：一个群里多个被授权的人，发送者是会变的。
         # 有了它，``/delegate`` 才能把「结果推回哪个会话」记在事务上 ——
         # 闭环靠的就是这个。
@@ -328,6 +354,8 @@ class ChannelService:
         # 顺带消费的话，一条无关消息就能把提醒吞掉（见模块 docstring）。
         repl.handle(text, check_reminders=False)
         self._last_choices = tuple(getattr(repl, "_last_choices", ()) or ())
+        self._last_plan_confirm = tuple(
+            getattr(repl, "_last_plan_confirm", ()) or ())
         return buffer.getvalue().strip()
 
     @staticmethod
