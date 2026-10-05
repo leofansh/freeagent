@@ -89,6 +89,13 @@ _USAGE: dict[str, str] = {
     "/accept": "/accept <id> [版本号]",
     "/steps": "/steps <id>",
     "/plan": "/plan <id>",
+    # 交互模式（设计文档 12.7.2）。**不叫 /plan** —— 那个名字已经是
+    # 「拆步骤/排期参考」了，撞名的后果是静默错绑（详见 _cmd_mode_plan 的注释）。
+    # 用法文本的值**必须以命令名开头**（test_doc_contract 会查）——
+    # 它被拿去做「你敲了 X，正确的用法是 X …」这种回话，缺了前缀就成了
+    # 一句没有主语的说明。
+    "/mode-plan": "/mode-plan —— 进入规划：只沟通、不落库、可多轮",
+    "/mode-build": "/mode-build —— 退出规划（确认卡尚未实现，故尚不执行）",
     "/tick": "/tick",
     "/llm": "/llm            查看当前智能层与配置（不显示 Key）",
     "/help": "/help",
@@ -114,6 +121,10 @@ _HELP = """\
   /accept <id> [版本]  采纳某一版
   /steps <id>          拆成几步（只拆，不排序）
   /plan <id>           按命中信号给排期参考
+
+  ── 交互模式（设计文档 12.7.2）──
+  /mode-plan           进入规划：只沟通、不落库、可多轮
+  /mode-build          退出规划（确认卡尚未实现，故尚不执行）
 
   ── 状态与调度 ──
   /start <id>         开始做
@@ -216,6 +227,16 @@ class _Pending:
     role_guesses: tuple
 
 
+#: 交互模式（设计文档 12.7.2）。
+#:
+#: ``plan`` = 只沟通、零副作用、可多轮累积；``build`` = 正常执行。
+#:
+#: 刻意只用两个字面量、**不引入第三个模式**：本项目反复吃过「多加一个状态就
+#: 多一处会漂移」的亏（状态文件假绿灯、待批队列、Plan 状态三层各说各话）。
+MODE_PLAN = "plan"
+MODE_BUILD = "build"
+
+
 @dataclass(frozen=True, slots=True)
 class _ChannelCtx:
     """这条命令来自哪个远程会话（飞书等）。
@@ -238,6 +259,17 @@ class Repl:
         self.app = app
         self.out = out
         self._pending: _Pending | None = None
+        #: 当前交互模式（设计文档 12.7.2）。``build`` = 正常，``plan`` = 只沟通、
+        #: **零副作用**。
+        #:
+        #: 刻意与 ``_pending`` 并列放在同一个对象上：它们是同一类东西——
+        #: 「这个会话现在处于什么状态」。但**本字段只活在内存里**，而
+        #: ``ChannelService._repls`` 是 **LRU** 的（``channel.py:292``），
+        #: 所以 Plan 会被**静默丢弃**。规范里已记下这条（要求落盘），
+        #: **本切片尚未实现落盘** —— 别把「会话被淘汰后计划还在」当成已有保证。
+        self._mode: str = MODE_BUILD
+        #: Plan 模式下累积的计划行。**只进不出，直到退出 Plan**。
+        self._plan: list[str] = []
         #: 上一轮回答里列出的事务 id，按出现顺序。
         #:
         #: 问句交给 :meth:`ChatService.respond` 后，它靠这个把「第二个」
@@ -323,12 +355,63 @@ class Repl:
                 return self._handle_pending(line)
             if line.startswith("/"):
                 return self._command(line)
+            if self._mode == MODE_PLAN:
+                # Plan 模式下**自由文本一律不落库**（设计文档 12.7.2）。
+                # 刻意在这里拦、而不是在 _natural 里判：_natural 是「记事」的正路，
+                # 塞一个模式判断进去，它就同时负责两件事，而 Plan 的「零副作用」
+                # 一旦漏判，用户会在规划阶段发现库里多了一条没要过的事务。
+                return self._plan_say(line)
             return self._natural(line)
         except FreeAgentError as exc:
             self._say(f"[出错] {exc}")
             return True
         finally:
             self._report_degradation()
+
+    # -- Plan 模式（设计文档 12.7.2）------------------------------------ #
+    def _plan_say(self, text: str) -> bool:
+        """Plan 模式下的一句话：**只沟通，不落库**。
+
+        刻意**不**复用 :meth:`_natural`：那条路的职责是「判定后建事务」，
+        混进模式判断会让 Plan 的零副作用依赖分支正确 —— 而 Plan 期多出一条
+        没要过的事务，正是这个模式要杜绝的那件事。
+
+        这里**不假装能理解**：本切片还没有 action 维度，所以只回「记下了」并
+        原样复述。**说清边界比假装听懂重要** —— 08:01 那次它就是满口答应
+        「我去查」，执行时才被拒。
+        """
+        self._plan.append(text)
+        self._say(
+            f"（Plan {len(self._plan)}）记下了：{text}\n"
+            f"规划中不建事务、不改文件。要动手时说 /mode-build。"
+        )
+        return True
+
+    # ⚠️ 刻意**不叫** ``_cmd_plan``：本文件第 1169 行已有那个名字（拆步骤，
+    # ``/plan <id>``）。Python 类体里**后定义覆盖先定义**，而我在上文先写了
+    # 同名方法，于是 ``self._cmd_plan`` 解析到的是**它** —— 后果是 Plan 模式
+    # 入口静默接到「拆步骤」上：不报错、不建任何东西、只回一句用法。
+    # **静默的错绑比报错难查得多**，所以这里必须用不同的名字。
+    def _cmd_mode_plan(self, args: list[str]) -> bool:
+        self._mode = MODE_PLAN
+        self._plan = []
+        self._say("（Plan）只沟通、不落库。说完说 /mode-build 再动手。")
+        return True
+
+    def _cmd_mode_build(self, args: list[str]) -> bool:
+        if not self._plan:
+            self._say("（已经在 build 模式，没有待执行的计划。）")
+            return True
+        plan = self._plan
+        self._mode = MODE_BUILD
+        self._plan = []
+        self._say(
+            f"（build）收到 {len(plan)} 条。确认卡尚未实现 —— "
+            "所以**还没有执行任何东西**。"
+        )
+        for line in plan:
+            self._say(f"· {line}")
+        return True
 
     # -- 追问状态 ----------------------------------------------------------- #
     def _natural(self, text: str) -> bool:
@@ -568,6 +651,15 @@ class Repl:
     def _handlers(self) -> dict[str, Callable[[list[str]], None]]:
         return {
             "/help": self._cmd_help,
+            # 刻意**不叫** ``/plan``：那个名字已经被「拆步骤」占用了
+            # （``/plan <id>``）。撞名的后果很难看——实测它既不报「未知
+            # 命令」、也不建任何东西，界面上只剩一句「用法：/plan <id>」，
+            # 用户只会以为这个功能坏了。**沉默的降级比报错更难查。**
+            #
+            # 签名与其它命令一致（都收 ``args``）：``_command`` 无条件调
+            # ``handler(args)``，写成零参lambda 会在运行时 TypeError。
+            "/mode-plan": self._cmd_mode_plan,
+            "/mode-build": self._cmd_mode_build,
             "/today": self._cmd_today,
             "/all": self._cmd_all,
             "/roles": self._cmd_roles,
@@ -598,6 +690,10 @@ class Repl:
             "/artifact": self._cmd_artifact,
             "/accept": self._cmd_accept,
             "/steps": self._cmd_steps,
+            # 这里是「拆步骤」的 /plan（``/plan <id>``），**不是** Plan 模式。
+            # 我曾经把模式入口的 ``/plan`` 写进这一行，于是**静默覆盖**了它：
+            # 症状是 ``/plan <id>`` 报「用法：/plan <id>」之外什么也不做，
+            # 而``/plan`` 自己也不进模式。已挪到 ``/mode-plan``（上方）。
             "/plan": self._cmd_plan,
             "/tick": self._cmd_tick,
             "/llm": self._cmd_llm,
