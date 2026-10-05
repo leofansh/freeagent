@@ -59,6 +59,7 @@ from .services.delegate import (
     eligible_tasks,
     parse_opencode_output,
 )
+from .services.opencode_projects import authorized_names
 from .services.executors import (
     V2_FIELD_RENAMES,
     adapter_for,
@@ -359,7 +360,8 @@ def run_once_with_tool_gate(
                     continue
                 try:
                     project = check_project_allowed(
-                        the_policy, task.project_path or ""
+                        the_policy, task.project_path or "",
+                        known_names=authorized_names(the_policy.projects),
                     )
                     outcome = run_with_tool_gate(
                         task, project,
@@ -987,7 +989,10 @@ def _dispatch_one(
     没有闸门就等于裸奔。测试也依赖这个默认值（``test_no_gate_means_no_run``）。
     """
     try:
-        project = check_project_allowed(policy, task.project_path or "")
+        project = check_project_allowed(
+            policy, task.project_path or "",
+            known_names=authorized_names(policy.projects),
+        )
     except FreeAgentError as exc:
         outcome = DispatchOutcome(ok=False, summary=f"白名单拒绝：{exc}")
         _record_result(app, task, outcome)

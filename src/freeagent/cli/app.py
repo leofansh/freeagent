@@ -783,6 +783,7 @@ class Repl:
         所以「谁能创建委派」必须是显式动作，而不是表单里的一个字段。
         """
         from ..services.delegate import check_project_allowed
+        from ..services.opencode_projects import authorized_names
 
         raw_project, role_name, requirement = parse_delegate_args(args)
         if not raw_project or not role_name or not requirement:
@@ -795,7 +796,13 @@ class Repl:
             return
 
         try:
-            project = check_project_allowed(self.app.config.delegate_policy(), raw_project)
+            policy = self.app.config.delegate_policy()
+            project = check_project_allowed(
+                policy, raw_project,
+                # 只列**已授权**的项目名：列未授权的会让人去试、然后撞闸门，
+                # 而撞闸门的感觉是「这功能坏了」。
+                known_names=authorized_names(policy.projects),
+            )
         except FreeAgentError as exc:
             self._say(f"[拒绝] {exc}")
             return

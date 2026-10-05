@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = ["OpenCodeProject", "list_projects", "resolve",
-           "DEFAULT_PROJECT_WORKTREE"]
+           "authorized_names", "DEFAULT_PROJECT_WORKTREE"]
 
 
 class _Missing:
@@ -177,6 +177,29 @@ def list_projects(*, runner=None) -> list[OpenCodeProject]:
     if getattr(proc, "returncode", 1) != 0:
         return []
     return _parse(getattr(proc, "stdout", "") or "")
+
+
+def authorized_names(allowed_paths, *, projects=None) -> list[str]:
+    """白名单里那些项目的**显示名**。
+
+    ## 为什么只列「已授权」的
+
+    提示里若列出未授权的项目，用户会去试、然后撞闸门——而撞闸门的感觉是
+    「这功能坏了」，不是「你还没授权」。所以这里**先过滤再给名字**。
+
+    查不到就返回空列表：那是「OpenCode 没装 / 查不到」，此时给不出任何
+    可靠提示，让上层照旧显示白名单里的路径（那部分不依赖 OpenCode）。
+
+    :param allowed_paths: 白名单里的路径（``DelegationPolicy.projects``）
+    :param projects: 复用已查到的清单，避免同一个错误信息里查两次。
+    """
+    if projects is None:
+        projects = list_projects()
+    if not projects:
+        return []
+    wanted = {p.replace("\\", "/").rstrip("/").casefold() for p in allowed_paths}
+    return [p.display for p in projects
+            if p.worktree.replace("\\", "/").rstrip("/").casefold() in wanted]
 
 
 def resolve(name: str, projects: list[OpenCodeProject]) -> OpenCodeProject | None:
