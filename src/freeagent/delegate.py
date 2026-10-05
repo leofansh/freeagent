@@ -687,6 +687,21 @@ def _default_server_factory(project: Path, command: str) -> "OpenCodeServer":
     return OpenCodeServer(project=project, executable=command)
 
 
+#: 单条委派允许的**工具调用次数**上限（设计文档 12.7.2）。
+#:
+#: 为什么需要它：审批本身**不能**防循环。一次失败的重试、一个跑偏的任务、
+#: 或者一个执意反复重试的 agent，都会反复来问授权 —— 而每一次都可能拿到
+#: 「允许」。于是**人是被同意淹没了，不是被拦住了**。
+#:
+#: 为什么这里必须是**代码**而不是 prompt：请 agent「别无限重试」是把安全
+#: 押在一个可以忽略它的东西上���而这个上限由我们自己数、由我们自己停。
+#:
+#: 默认值 40：一条真实的多文件改动会用到几十次工具调用，而一个正常任务
+#: 不该超过这个数。超了**不是失败**，是「这件事该拆开」——所以报错里
+#: 会直接这么说。
+DEFAULT_MAX_TOOL_CALLS = 40
+
+
 def run_with_tool_gate(
     task,
     project: Path,
@@ -697,6 +712,7 @@ def run_with_tool_gate(
     sender: "ToolCardSender | QuestionCardSender | None",
     approver: str,
     server_factory: "ServerFactory | None" = None,
+    max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
 ) -> DispatchOutcome:
     """派一条委派，**执行期逐次授权**（设计文档 11.8.1）。
     与 :func:`_dispatch_one` 的分工：那是**无人值守**的老路（subprocess 一次
@@ -742,6 +758,10 @@ def run_with_tool_gate(
     #: 有提问没答。记下来是为了在结尾把它报成**失败**——
     #: 一次无人答的提问下去就算完成，那是最像成功的一种失败。
     unanswered = False
+    #: 工具调用次数超限。**必须主动 abort**：否则 opencode 那边挂着一个
+    #: 没人会回答的授权请求干等 —— 那正是「卡死」的定义。
+    step_capped = False
+    tool_calls = 0
     try:
         with make_server(project, policy.command) as oc:
             session_id = oc.create_session()
@@ -754,7 +774,7 @@ def run_with_tool_gate(
                     # 混进去会让「几次授权」这个数字不再可信。
                     q = question_from_event(props)
                     if q is None:
-                        # 同样不能当成「已拒篝」悄悄跳过。
+                        # 同样不能当成「已拒绝」悄悄跳过。
                         log.warning("【执行期】收到认不出的 question.asked：%r", props)
                         continue
                     note = _ask_one_question(oc, q, store=store, sender=sender,
@@ -777,9 +797,34 @@ def run_with_tool_gate(
                     # 那会让 agent 干等，而人这边什么都不知道。
                     log.warning("【执行期】收到认不出的 permission.asked：%r", props)
                     continue
+                # ── 步数硬上限：防「无限循环」的���效部件 ──────────────────
+                #
+                # **检查放在问人之前**，理由很实际：否则会发出一张卡，人正在
+                # 点它，而我们会立刻中止会话 —— 那张卡点了没有任何后果，
+                # 比不发更让人困惑。
+                #
+                # 审批本身**不能**防循环：每一次都可能拿到「允许」，于是人
+                # 是被同意淹没了，不是被拦住了。所以这个数必须由我们自己数。
+                if max_tool_calls > 0 and tool_calls >= max_tool_calls:
+                    handled.append(
+                        f"工具调用达到上限（{max_tool_calls} 次）—— 已中止"
+                    )
+                    step_capped = True
+                    log.warning(
+                        "【执行期】工具调用超过上限 %d 次，主动中止会话：task=%s",
+                        max_tool_calls, getattr(task, "id", "?"),
+                    )
+                    try:
+                        oc.abort(session_id)
+                    except Exception as exc:  # noqa: BLE001
+                        # 中止失败**不改变结论**：会话已被 `with` 关掉，
+                        # 而我们要报的就是「超限停下」，不是「中止失败」。
+                        log.warning("中止会话失败（仍将按超限报出）：%s", exc)
+                    break
                 decision = _ask_one_tool(oc, req, store=store, sender=sender,
                                          approver=approver, context=context)
                 handled.append(f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}")
+                tool_calls += 1
                 if decision == "allow":
                     granted += 1
                 oc.reply_permission(req.request_id, decision)
@@ -798,6 +843,22 @@ def run_with_tool_gate(
             ok=False,
             summary="执行期有提问没箅到答案 —— 已停下会话"
                     "（已答的部分不会被重放）",
+            session_id=session_id or None, tool_calls=tuple(handled),
+        )
+    if step_capped:
+        # 报成**失败**，且必须说清「这不是 bug，是这件事太大」。
+        #
+        # 刻意不装成「完成」：那会让一次被上限拦下的委派在记录里看起来和正常
+        # 完成一样 —— 而实际上代码可能只改了一半。
+        return DispatchOutcome(
+            ok=False,
+            summary=(
+                f"工具调用达到上限（{max_tool_calls} 次）—— 已主动中止会话。\n"
+                f"  这不是失败，是**这件事该拆开**：已完成的改动还在，"
+                f"剩下的没做。\n"
+                f"  下一步：把需求拆成几条更小的委派，"
+                f"或者调高上限（DEFAULT_MAX_TOOL_CALLS）。"
+            ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
     note = (f"执行期问了 {len(handled)} 次，允许 {granted} 次"
