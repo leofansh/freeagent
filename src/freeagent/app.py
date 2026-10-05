@@ -9,6 +9,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .config import Config, load_config
 from .services.artifacts import ArtifactService
@@ -46,6 +47,7 @@ class App:
     today: TodayService
     restore: RestoreService
     reminders: ReminderEngine
+
     chat: ChatService
     #: 角色脉络知识。检索结果**自带来源说明**（关键词命中 / 近期回落 / 被截断）——
     #: 见 :class:`~freeagent.services.knowledge.RetrievalResult`。
@@ -59,6 +61,20 @@ class App:
     #: 视觉能力。**没配 Key 时是 None** —— 那就是「没有这个能力」，
     #: 不是「有个能力返回失败」。界面据此直接说清原因，不假装试过了。
     vision: VisionProvider | None = None
+    #: Web 表面的 :class:`~freeagent.cli.app.Repl`，**懒建**（见
+    #: :func:`freeagent.web.endpoints_read._web_repl`）。
+    #:
+    #: 为什么放在这里：``App`` 是 ``slots=True``，挂不了任意属性；而命令层
+    #: 必须在请求之间**保持同一个 Repl** —— 否则角色追问的半截输入会被切断，
+    #: 而 ``/mode-plan`` 攒计划、``/mode-build`` 确认本来就是多轮的。
+    #:
+    #: 声明成 ``Any`` 而不是 ``Repl``：``cli`` 层较重，而 ``app`` 不该为
+    #: 某一层通道的会话对象付导入代价。实际类型由使用方保证。
+    #:
+    #: **位置在默认字段区** —— dataclass 要求带默认值的字段排在无默认值的
+    #: 之后。我第一版把它放在 ``chat`` 前面，于是整个包 import 就炸
+    #: （``TypeError: non-default argument 'chat' follows default argument``）。
+    web_repl: Any = None
     #: 串行化所有服务访问。SQLite 连接不能被两个线程同时使用
     #: （``check_same_thread=False`` 只解除了线程归属检查，不提供并发安全）。
     #: CLI 单线程用不到它；Web UI 的每个请求都必须持有它。
