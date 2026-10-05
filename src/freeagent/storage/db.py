@@ -333,6 +333,22 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 -- 存在的理由是**不能只活在内存**：`ChannelService._repls` 是 LRU，
 -- `popitem(last=False)` 会连 Repl 一起丢，_plan 与 _mode 一并消失。
 -- 症状不是报错，而是用户以为还在规划、其实内容已经没了（实测过）。
+-- 「停掉这整条委派」的请求（设计文档 12.7.2 的可中断要求）。
+--
+-- 为什么单独一张表、而不是给 pending_approvals 加一列：
+-- **语义不同**。那张表的 `decision` 是「这一次动作批不批」，
+-- 而这里是「这条委派别再往下走了」。用户点「拒绝」只否掉一个动作，
+-- agent 还能换个方向继续；点「停止」则是中止整个会话。
+-- 混在一列里就再也分不清「他不想干这一步」和「他不想干这件事」了。
+--
+-- 作用域是**凭据**（即那一次挂起的授权），因为这是用户唯一能准确指向的
+-- 东西 —— 他手上只有那张卡。
+CREATE TABLE IF NOT EXISTS stop_requests (
+    credential  TEXT PRIMARY KEY,
+    requested_by TEXT,
+    requested_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS plan_sessions (
     chat_id    TEXT PRIMARY KEY,
     mode       TEXT NOT NULL,

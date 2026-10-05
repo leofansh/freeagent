@@ -992,7 +992,11 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         credential = value.get("id")
         choice = value.get("action")
 
-        if not credential or choice not in ("allow_once", "deny"):
+        # ``stop_delegation`` 必须在白名单里，否则点了会被这条静默丢弃 ——
+        # 而症状是「点了没反应」，那正好是「停止」最不能有的表现。
+        if not credential or choice not in (
+            "allow_once", "deny", "stop_delegation",
+        ):
             log.info("【卡片动作】载荷不认（credential=%r choice=%r）—— 丢弃",
                      credential, choice)
             return _no_card_change("载荷不认，未处理")
@@ -1022,6 +1026,35 @@ def _card_action(data: Any = None) -> dict[str, Any]:
                               "**已过期，未生效。** 过期后点它不会批准任何操作。",
                               granted=False),
                 "warning", "这张卡已过期",
+            )
+
+        # ── 「停止这条委派」：两件事都要做，缺一不可 ──────────────────────
+        #
+        # 1) 先把**当前这一次**回掉（按拒绝）—— 否则执行器会一直等它到
+        #    TTL（委派档 1800s = 半小时），而 opencode 那边也挂着一个
+        #    没人回答的请求。那不是「停止」，那是「都卡住」。
+        # 2) 再记下「停整条」—— 只做 1 的话 agent 只会换个方向继续，
+        #    而用户点的是「停止这条委派」。
+        #
+        # 判定**在 resolve 之前**：停止比允许更强，不该让任何人停掉别人的
+        # 委派。注意别把它写成「因为 resolve 之后就晚了」—— 实测
+        # ``can_answer`` 只判发起人、不看是否已决定，所以晚一点也能过。
+        # 真正的理由是**权限**：这一判定属于「谁有权」，必须在动手前做。
+        if choice == "stop_delegation":
+            if not store.can_answer(credential, who):
+                log.info("【卡片动作】停止：点击者 %s 不是发起人（凭据=%s）—— 丢弃",
+                         who, credential)
+                return _card_action_response(
+                    _decided_card("无法停止", "**只有发起人能停止这条委派。**", granted=False),
+                    "warning", "你不是这条委派的发起人",
+                )
+            store.resolve(credential, "deny", decided_by=who)
+            store.request_stop(credential, by=who)
+            log.info("【卡片动作】用户叫停（凭据=%s 点击者=%s）", credential, who)
+            return _card_action_response(
+                _decided_card("已停止", "**已叫停这条委派。**\n"
+                              "agent 不会再动手；已经完成的那几步改动仍然有效。"),
+                "success", "已停止这条委派",
             )
 
         wrote = store.resolve(

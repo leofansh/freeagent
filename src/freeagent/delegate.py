@@ -778,6 +778,10 @@ def run_with_tool_gate(
     #: 没人会回答的授权请求干等 —— 那正是「卡死」的定义。
     step_capped = False
     tool_calls = 0
+    #: 用户主动叫停。**与 step_capped / time_capped 分开报**，因为给用户的
+    #: 建议完全不同：那两条是「系统保护你，这件事太大/卡住了」，这一条是
+    #: 「你自己叫停的」—— 不该被说成失败，更不该被说成完成。
+    user_stopped = False
     #: 总时长超限。与 :data:`DEFAULT_MAX_TOOL_CALLS` **互补**：那个限次数，
     #: 这个限时长。一个一直有动静的 agent 次数上不去，但时间能拖很久。
     time_capped = False
@@ -866,13 +870,35 @@ def run_with_tool_gate(
                     )
                     _abort_quietly(oc)
                     break
-                decision = _ask_one_tool(oc, req, store=store, sender=sender,
-                                         approver=approver, context=context)
+                decision, credential = _ask_one_tool(
+                    oc, req, store=store, sender=sender,
+                    approver=approver, context=context,
+                )
                 handled.append(f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}")
                 tool_calls += 1
                 if decision == "allow":
                     granted += 1
+                # **先把答案回给 opencode，再考虑中止** —— 顺序反了会让
+                # 那个挂起的请求没人回，opencode 会一直等着。
                 oc.reply_permission(req.request_id, decision)
+                # ── 用户叫停了整条委派 ────────────────────────────────────
+                #
+                # 判定放在**回完答案之后**：这一次的授权已经有结论了（拒绝），
+                # 而「停止」是关于**整条委派**的另一个决定，混在一起会让
+                # 「已拒绝」被记成「已停止」。
+                #
+                # 必须 ``abort``：光拒绝这一步，agent 只会换个方向继续，
+                # 而用户点的是「停止这条委派」。挂着不 abort 的话，那
+                # 就是「点了没反应」。
+                if credential and store.is_stop_requested(credential):
+                    handled.append("你叫停了这条委派")
+                    user_stopped = True
+                    log.info(
+                        "【执行期】用户叫停（task=%s），中止会话",
+                        getattr(task, "id", "?"),
+                    )
+                    _abort_quietly(oc)
+                    break
     except (ServerError, OSError) as exc:
         return DispatchOutcome(
             ok=False,
@@ -888,6 +914,20 @@ def run_with_tool_gate(
             ok=False,
             summary="执行期有提问没箅到答案 —— 已停下会话"
                     "（已答的部分不会被重放）",
+            session_id=session_id or None, tool_calls=tuple(handled),
+        )
+    if user_stopped:
+        # **不算失败，也不算完成。** 用户自己叫停的，措辞必须如实：
+        # 说成「失败」会让他以为代码坏了而去排查；说成「完成」会让他
+        # 以为改动做完了而去验收 —— 后者更糟。
+        return DispatchOutcome(
+            ok=False,
+            summary=(
+                "你叫停了这条委派 —— 会话已中止，agent 不会继续动手。\n"
+                "  已经完成的那几步改动**仍然有效**，剩下的没做。\n"
+                f"  想接着做的话重新发一条委派就行；"
+                f"已做的部分可以先看一眼（{session_id or '会话已关'}）。"
+            ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
     if step_capped:
@@ -1066,8 +1106,16 @@ def _ask_one_tool(
     sender: "ToolCardSender",
     approver: str,
     context: "ApprovalContext",
-) -> str:
-    """问一次，回结论。**只回结论，不解释** —— 解释是卡片的事。
+) -> tuple[str, str]:
+    """问一次，回 ``(结论, 凭据)``。**只回结论，不解释** —— 解释是卡片的事。
+
+    **凭据为什么要带出来**：停止与拒绝在 :meth:`ApprovalStore.wait` 那里
+    **都表现为 ``deny``** —— 那次动作确实没被批准，这一点两者是一样的。
+    但「你拒绝了这一步」和「你叫停了整条委派」**给用户的话完全不同**，
+    而只有凭据能让调用方去查 :meth:`ApprovalStore.is_stop_requested`。
+
+    没有凭据的话，调用方只能把两者混成同一句「已拒绝」—— 而用户点的是
+    「停止」，却看到「拒绝」，会以为还能继续等下去。
 
     ⚠️ **TTL 只在这里算一次**，卡片文案与等待时长**都用它**。
     两处各算一次的话，改了一处就会出现「卡上写 30 分钟、实际只等 10 分钟」——
@@ -1092,12 +1140,20 @@ def _ask_one_tool(
         )
     except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成拒绝
         log.warning("【执行期】发卡失败（%s）—— 按拒绝处理", exc)
-        return "deny"
+        # 凭据给空串：没走到 wait，也就没有「被叫停」可言。
+        return "deny", ""
     store.record_card(pending.credential, message_id)
     # 结论一律回库读（同 11.9.4 的纪律），不采信任何返回值。
     # ``timeout_seconds`` 必须**显式**给 policy 的 TTL：默认那个是
     # DEFAULT_TTL_SECONDS，与本场景的 TTL 不是一回事（实测 1800 vs 600）。
-    return store.wait(pending.credential, timeout_seconds=policy.ttl_seconds)
+    decision = store.wait(
+        pending.credential,
+        timeout_seconds=policy.ttl_seconds,
+        # 让人能**中途叫停**：用户点「停止这条委派」之后，这里最多一个
+        # poll_seconds 就返回，而不是干等到 TTL（委派档 1800s = 半小时）。
+        should_stop=lambda: store.is_stop_requested(pending.credential),
+    )
+    return decision, pending.credential
 
 
 def _dispatch_one(

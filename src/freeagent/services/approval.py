@@ -35,7 +35,7 @@ import re
 import shlex
 import uuid
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 __all__ = [
     "Decision",
@@ -899,12 +899,22 @@ class ApprovalStore:
         *,
         poll_seconds: float = 0.5,
         timeout_seconds: int = DEFAULT_TTL_SECONDS,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Decision:
         """轮询等答复。**超时返回 deny。**
 
         刻意用轮询而不是条件变量/管道：等待方和桥接**是两个进程**，
         内存里的同步原语根本跨不过去。而轮询的代价（每 0.5 秒一次
         本地 SQLite 读）可以忽略，且它天然跨进程、跨重启。
+
+        ``should_stop`` 让等待**可被外部打断**（设计文档 12.7.2 的可中断
+        要求）。这个参数便宜是因为**轮询本来就在这里**——不需要事件、信号或
+        第二个连接，多问一句「要不要停下来」即可。
+
+        停下来的语义是**按拒绝处理**：那次动作没被批准，所以绝不能让它
+        看起来像通过了。区别在于「谁停的」，那个由调用方查
+        :meth:`is_stop_requested` 判断 —— 它要报的是「你停止了这条委派」，
+        不是「你拒绝了这一步」。
         """
         import time
 
@@ -913,11 +923,49 @@ class ApprovalStore:
             got = self.decide(credential)
             if got is not None:
                 return got
+            if should_stop is not None and should_stop():
+                # **按拒绝处理**，且不写库：这次动作确实没被批准。
+                # 「停止」这件事本身由调用方另行记账。
+                return "deny"
             if time.monotonic() >= deadline:
                 # 最后再问一次库：可能恰好在超时边界上答复到了。
                 got = self.decide(credential)
                 return got if got is not None else "deny"
             time.sleep(poll_seconds)
+
+    # -- 停止整条委派（设计文档 12.7.2）----------------------------------- #
+    def request_stop(self, credential: str, *, by: str = "") -> None:
+        """记下「**停掉这整条委派**」的请求。
+
+        与 :meth:`resolve` 分工：那个回答「这一次动作批不批」，这个说
+        「别再往下走了」。调用方**两者都要做** —— 光记停止而不回掉当前
+        挂起，执行器会一直等它到 TTL；光回掉而不记停止，agent 只会
+        换个方向继续。
+
+        **幂等**：同一个凭据重复点停止不会出错（``INSERT OR REPLACE``）。
+        用户连点两下是常事，而「已停止」重复说一遍比抛异常好。
+        """
+        stamp = self._clock().isoformat(timespec="seconds")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO stop_requests "
+            "(credential, requested_by, requested_at) VALUES (?, ?, ?)",
+            (credential, by, stamp),
+        )
+        self._conn.commit()
+
+    def is_stop_requested(self, credential: str) -> bool:
+        """这个凭据上有没有人要求停掉整条委派。
+
+        **只认未过期凭据的停止请求**：一张过期卡片被转发、或旧凭据被重放，
+        都不该停掉一条**新**委派。所以过期的直接当没停过。
+        """
+        row = self._conn.execute(
+            "SELECT s.credential FROM stop_requests s "
+            "JOIN pending_approvals p ON p.credential = s.credential "
+            "WHERE s.credential = ?",
+            (credential,),
+        ).fetchone()
+        return row is not None
 
     # -- 委派闸门（设计文档 11.9.7，规则 1）-------------------------------- #
     def request_delegation(

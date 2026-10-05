@@ -450,8 +450,11 @@ class TestTtlIsOneNumber:
         seen: dict[str, int] = {}
         real_wait = ApprovalStore.wait
 
+        # ``should_stop`` 必须列出：它是为了「用户能中途叫停」加的，
+        # 而这个 spy 只关心 TTL 的值。写成 **kwargs 的话签名与真实实现
+        # 脱钩 —— 生产代码改错了它也不会红。
         def spy_wait(self, credential, *, poll_seconds=0.5,
-                     timeout_seconds=0):
+                     timeout_seconds=0, should_stop=None):
             seen["wait_timeout"] = timeout_seconds
             return "allow"
 

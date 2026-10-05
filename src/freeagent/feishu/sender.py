@@ -463,15 +463,26 @@ def _tool_card(subject: str, detail: str, credential: str) -> dict[str, Any]:
             {"tag": "note", "elements": [{"tag": "plain_text", "content":
                   "只批准**这一个**动作 —— 下一个动作还会再问。"
                   "不点就算拒绝，沉默不等于同意。"}]},
+            # 三个按钮，**顺序与语义都要说清**（设计文档 12.7.2）：
+            #   允许 / 拒绝 —— 只针对**这一个动作**，agent 还能换个方向继续
+            #   停止这条委派 —— 中止**整条**，会话作废
+            #
+            # 「拒绝」与「停止」是两件事，混为一谈会让用户以为自己已经
+            # 停掉了，而 agent 还在继续改代码 —— 那比没有这个按钮糟得多。
+            # 所以第三个按钮**必须有**。
             {"tag": "action", "actions": [
                 {"tag": "button",
                  "text": {"tag": "plain_text", "content": "允许这一次"},
                  "type": "primary",
                  "value": {"action": "allow_once", "id": credential}},
                 {"tag": "button",
-                 "text": {"tag": "plain_text", "content": "拒绝"},
-                 "type": "danger",
+                 "text": {"tag": "plain_text", "content": "拒绝这一步"},
+                 "type": "default",
                  "value": {"action": "deny", "id": credential}},
+                {"tag": "button",
+                 "text": {"tag": "plain_text", "content": "停止这条委派"},
+                 "type": "danger",
+                 "value": {"action": "stop_delegation", "id": credential}},
             ]},
         ],
     }
