@@ -717,9 +717,21 @@ def run_with_tool_gate(
     会一直等下去，所以这里必须自己给期限 —— 沉默即拒绝，不是「等下去」。
     """
     if sender is None:
+        # **必须给出路**，不能只说「不派发」（设计文档 12.7.2 的 R3：
+        # 拒绝要看得见，且要告诉人下一步能做什么）。
+        # 闸门默认开启之后，这条路径从「少数人没加旗标」变成了**没配飞书的
+        # 人必经**—— 只报「不派发」会让他们以为程序坏了。
         return DispatchOutcome(
             ok=False,
-            summary="没有飞书通道 —— 执行期授权需要人逐次批准，故不派发",
+            summary=(
+                "没有飞书通道 —— 执行期授权需要人逐次批准，故不派发。\n"
+                "  三条出路，任选其一：\n"
+                "  1) 配好飞书通道（tools\\run_feishu.bat，会自检凭据）"
+                "—— 推荐，闸门才能真正起作用\n"
+                "  2) 确实只想无人值守跑：显式加 --no-tool-gate"
+                "（此时第三道闸门不存在，agent 写文件、跑命令都无人过问）\n"
+                "  3) 先看会派什么而不真跑：--dry-run"
+            ),
         )
 
     make_server = server_factory or _default_server_factory
@@ -1215,7 +1227,14 @@ def _notify_chat(task, outcome: DispatchOutcome) -> None:
         log.warning("回推飞书失败（任务本身已完成）", exc_info=True)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """造命令行解析器。
+
+    刻意提成模块级函数：``--tool-gate`` 的**默认值**是安全姿态的选择
+    （开 = Strict，关 = Dangerous），而 ``main()`` 会去探 opencode 版本、
+    真的派发 —— 直接测它就得先装 opencode、造飞书凭据，测的就不是默认值
+    而是环境。默认值必须能被单独钉住。
+    """
     parser = argparse.ArgumentParser(
         prog="python -m freeagent.delegate",
         description="委派执行器：把「已开始」的委派事务交给 opencode 完成。",
@@ -1234,13 +1253,35 @@ def main(argv: list[str] | None = None) -> int:
         help="覆盖 opencode 用的模型。留空用它的默认。"
              "实测 *-free 那批不需要账户余额。",
     )
-    parser.add_argument(
-        "--tool-gate", action="store_true",
-        help="执行期逐次授权：agent 每要动手一次就发一张飞书卡等人批"
-             "（设计文档 11.8.1）。不加则走**无人值守**的老路 —— "
-             "那时第三道闸门不存在。",
+    # 第三道闸门（执行期逐次授权）**默认开启**（设计文档 11.8.1）。
+    #
+    # 为什么翻过来：闸门的默认值决定的是**失效方向**。默认关 = 忘了加旗标
+    # 就静默进入无人值守，而「跑起来了」比「跑不起来」危险得多
+    # —— 参见 postmortem/0001：opencode 默认 allow，不传 --auto 也全放行。
+    # 对照 QM 的三档姿态（Strict / Auto / Dangerous），**从前的默认值
+    # 等价于 Dangerous**；现在是 Strict。
+    #
+    # `--tool-gate` **故意保留**：它在 README、tools\*.cmd、既有运维习惯里
+    # 都写着，删掉会把这些命令行直接变成报错（而不是变安全）。
+    # 它现在只是「把默认再说一遍」。
+    gate_group = parser.add_mutually_exclusive_group()
+    gate_group.add_argument(
+        "--tool-gate", dest="tool_gate", action="store_true",
+        help="（默认已开启）执行期逐次授权：agent 每要动手一次就发一张飞书卡"
+             "等人批。这条只是把默认再说一遍，留着是为了兼容既有命令行。",
     )
-    args = parser.parse_args(argv)
+    gate_group.add_argument(
+        "--no-tool-gate", dest="tool_gate", action="store_false",
+        help="**关掉**执行期逐次授权，回到无人值守的老路 —— "
+             "那时第三道闸门不存在，agent 写文件、跑命令都无人过问。"
+             "仅在明知风险、且没有飞书通道时用。",
+    )
+    parser.set_defaults(tool_gate=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     # ── 版本闸门（规范性，见设计文档 11.8.1 的版本陷阱表）──────────────
     # 为什么在派发**之前**就挡：V1→V2 的 permission 字段名全变，旧配置被

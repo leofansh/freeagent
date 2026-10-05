@@ -564,6 +564,96 @@ def send_view_choice_card(
 
 #: 菜单按钮的回传动作名。
 #:
+
+#: Plan 模式的**确认卡**（设计文档 12.7.2）。点它才会**真的执行**。
+#:
+#: 刻意与 :data:`VIEW_CHOICE_ACTION` 分开：那个是**只读视图**，点了跑个查询；
+#: 这个点了**建事务 / 发起委派**。两者混用的话，「点一下会不会动手」就说不清了
+#: —— 而这正是 12.7.2 要定的核心问题。
+PLAN_CONFIRM_ACTION = "plan_confirm"
+
+
+def plan_confirm_card(
+    subject: str, plan_lines: Sequence[str], *, chat_id: str
+) -> dict[str, Any]:
+    """Plan → Build 的确认卡。**无状态**（与选项卡同一思路）。
+
+    按钮的 ``value`` 只带 ``choice``（``ok`` / ``cancel``）与 ``chat``，
+    **不带计划内容** —— 计划在 :class:`Repl` 的 ``_plan`` 里。刻意如此：
+    把内容塞进按钮 payload 就等于让卡片成为第二份真源，而它会被转发、
+    被缓存、会在会话淘汰后与真正的那份不一致。
+
+    「方案」也印在卡面上，因为 12.7.2 要求**用户能核对**再批准；而点击时
+    重新读 :attr:`Repl._plan`，**不**信卡面 —— 卡面只是给人看的。
+    """
+    if not plan_lines:
+        raise ValueError("确认卡至少要一条计划内容")
+    body = "\n".join(f"{i}. {line}" for i, line in enumerate(plan_lines, 1))
+    def _btn(label: str, choice: str, primary: bool) -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": "primary" if primary else "default",
+            "value": {"action": PLAN_CONFIRM_ACTION, "choice": choice,
+                      "chat": chat_id},
+        }
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": subject},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": "确认后才会动手："}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+            {"tag": "action", "actions": [
+                _btn("确认执行", "ok", True),
+                _btn("再想想", "cancel", False),
+            ]},
+        ],
+    }
+
+
+def send_plan_confirm_card(
+    sender: Any,
+    *,
+    open_id: str,
+    subject: str,
+    plan_lines: Sequence[str],
+    chat_id: str,
+) -> str:
+    """发确认卡，返回 message_id。
+
+    与 :func:`send_view_choice_card` **同一套发卡实现**（同版本 JSON 1.0、
+    同错误处理），不新造第二个接口 —— 踩过的坑：照着批准卡写成模块级函数、
+    ``from .sender import send_approval_card``，而那个名字**是 sender 上的
+    方法**，于是 ``ImportError`` 发生在真正的发卡之前。
+    """
+    if not open_id:
+        raise ValueError("发确认卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = plan_confirm_card(subject, plan_lines, chat_id=chat_id)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发确认卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
 #: 与 :data:`VIEW_CHOICE_ACTION` **同族**：都是「点了就执行，不落库、
 #: 不等回复」的即时动作。菜单不需要 pending 记录，因为菜单项本身
 #: 没有「过期即拒」的安全含义 —— 点错了顶多跑一次只读视图或重发一张卡。

@@ -113,8 +113,11 @@ python -m freeagent.delegate --dry-run
 # 确认无误后真跑（可加 --model opencode/big-pickle 指定模型）
 python -m freeagent.delegate
 
-# 推荐：加 --tool-gate —— agent 每要动手一次就发一张飞书卡，等你批
-python -m freeagent.delegate --tool-gate
+# 默认就是这样：agent 每要动手一次就发一张飞书卡，等你批
+python -m freeagent.delegate
+
+# ⚠️ 确实要无人值守才加它（此时第三道闸门不存在）
+python -m freeagent.delegate --no-tool-gate
 ```
 
 用之前先在 `config.json` 里填项目白名单（**留空 = 关闭委派**）：
@@ -124,14 +127,24 @@ python -m freeagent.delegate --tool-gate
                 "model": "opencode/big-pickle" } }
 ```
 
-**第三道闸门是「执行期逐次授权」** —— 加 `--tool-gate` 才会生效：
+**第三道闸门是「执行期逐次授权」** —— **默认就开着**：
 
 ```
 agent 动手 → opencode 挂起 → 飞书卡片（含 **diff**）→ 你点 → 继续
 ```
 
-- **不加 `--tool-gate` 就没有这道闸门** —— 默认那条是 `subprocess`
-  一次跑到底、无人值守。它保留是因为已在没有飞书通道的环境验证过。
+- ✅ **默认开启**（`--no-tool-gate` 才关）。**默认值决定的是失效方向**：
+  默认关等于「忘了加旗标就静默进入无人值守」，而
+  [复盘 0001](docs/postmortem/0001-auto-flag-is-not-a-gate.md) 实测 opencode
+  默认 `allow` —— 不传 `--auto` 也全部放行、写出目录外都执行。
+  那种情况下「跑起来了」比「跑不起来」危险得多。
+- **`--tool-gate` 仍可用**，只是把默认再说一遍（README 与 `tools\*.cmd` 的
+  既有命令行都写着它，删掉会把那些命令变成报错而不是变安全）。
+- **没配飞书通道时会拒绝派发**（失败关闭），并列出三条出路：
+  配通道 / 显式 `--no-tool-gate` / 先 `--dry-run` 预演。
+  **绝不静默退化成无人值守** —— 那正是闸门形同虚设的样子。
+- `--no-tool-gate` 那条路是 `subprocess` 一次跑到底、无人值守。
+  它保留是因为已在没有飞书通道的环境验证过。
 - 卡片上写明动作、影响路径、**它到底想改成什么**，以及「只批准这一个动作，
   下一个还会再问」。**没有 diff 的话你点的就是「信任」而不是「确认」。**
 - **只有发起人能批** —— ✅ **已达成**（V1.17）。发起人由 `channel_ctx.sender_open_id` 落进 `tasks.delegate_requested_by`（schema 12，旧库自动迁移），

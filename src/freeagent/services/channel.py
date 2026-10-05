@@ -288,6 +288,19 @@ class ChannelService:
         repl = self._repls.get(chat_id)
         if repl is None:
             repl = Repl(self.app, out=buffer)
+            # **新建就意味着旧的刚被 LRU 淘汰掉**（``popitem(last=False)``）。
+            # 那份被丢掉的 Repl 里可能带着一个进行中的 Plan，所以这里必须
+            # 从盘上读回来 —— 否则症状是**静默丢失**：用户以为还在规划，
+            # 实际 ``_plan`` 已空、模式已退回 build，且没有任何提示。
+            # 实测过，不是假想。
+            #
+            # 恢复失败（没存过 / 已过期）不是错误：那就是「本来就没在规划」，
+            # 属于正常状态。restore_plan 自己吞异常正是为此。
+            repl.channel_ctx = _ChannelCtx(chat_id=chat_id, sender_open_id="")
+            try:
+                repl.restore_plan()
+            except Exception:  # noqa: BLE001 - 恢复不了就当没在规划
+                pass
             self._repls[chat_id] = repl
             while len(self._repls) > self.max_chats:
                 self._repls.popitem(last=False)   # 丢最久没用的那个会话

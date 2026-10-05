@@ -325,6 +325,20 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     open_message_id TEXT,
     requested_by    TEXT
 );
+
+-- Plan 模式（12.7.2）的会话状态。**刻意独立成表，不进 tasks**：
+-- Plan 期是「还没决定要不要成为事务」的对话状态，混进 tasks 会让
+-- `/today` 把没批准的草稿也算成承诺 —— 那正是零副作用要杜绝的。
+--
+-- 存在的理由是**不能只活在内存**：`ChannelService._repls` 是 LRU，
+-- `popitem(last=False)` 会连 Repl 一起丢，_plan 与 _mode 一并消失。
+-- 症状不是报错，而是用户以为还在规划、其实内容已经没了（实测过）。
+CREATE TABLE IF NOT EXISTS plan_sessions (
+    chat_id    TEXT PRIMARY KEY,
+    mode       TEXT NOT NULL,
+    lines      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

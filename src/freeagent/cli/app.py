@@ -263,10 +263,16 @@ class Repl:
         #: **零副作用**。
         #:
         #: 刻意与 ``_pending`` 并列放在同一个对象上：它们是同一类东西——
-        #: 「这个会话现在处于什么状态」。但**本字段只活在内存里**，而
-        #: ``ChannelService._repls`` 是 **LRU** 的（``channel.py:292``），
-        #: 所以 Plan 会被**静默丢弃**。规范里已记下这条（要求落盘），
-        #: **本切片尚未实现落盘** —— 别把「会话被淘汰后计划还在」当成已有保证。
+        #: 「这个会话现在处于什么状态」。**本字段有落盘副本**：进出 Plan 时
+        #: 经 :class:`~freeagent.services.plan_state.PlanStore` 写到
+        #: ``plan_sessions`` 表，所以 ``ChannelService._repls`` 这个 **LRU**
+        #: （``channel.py:292``）淘汰掉本对象之后，:meth:`restore_plan` 能把
+        #: 它读回来。
+        #:
+        #: 之前这里是纯内存的，实测症状是**静默丢失**：A 进入 plan 说了两句
+        #: → B 插进来挤掉 A → A 再说一句拿到的是空 ``_plan``、模式退回
+        #: ``build``，且没有任何提示。报错他会重来，静默丢失他只会以为
+        #: 系统记错了。
         self._mode: str = MODE_BUILD
         #: Plan 模式下累积的计划行。**只进不出，直到退出 Plan**。
         self._plan: list[str] = []
@@ -381,10 +387,57 @@ class Repl:
         「我去查」，执行时才被拒。
         """
         self._plan.append(text)
+        self._persist_plan()
         self._say(
             f"（Plan {len(self._plan)}）记下了：{text}\n"
             f"规划中不建事务、不改文件。要动手时说 /mode-build。"
         )
+        return True
+
+    # -- Plan 状态的落盘 --------------------------------------------------- #
+    def _plan_store(self):
+        """Plan 状态存储。**每次现取**，不要缓存到 ``__init__``。
+
+        缓存会在「换库」之后留下一个指向旧连接的 store，而写进旧库的
+        Plan 读回来永远是空的 —— 症状是「落盘了但重启后还是丢」。
+        """
+        from ..services.plan_state import PlanStore
+
+        return PlanStore(self.app.conn)
+
+    def _persist_plan(self) -> None:
+        """把当前 Plan 状态写盘。**静默失败**：存不上不该打断对话。
+
+        刻意吞掉异常：写盘是**锦上添花**，而这一刀的全部承诺是「零副作用」——
+        为存状态而报错，会让用户以为自己的话被弄丢了。存不上退化成
+        「这次会话内仍然有效」，那本来就是本功能的上限。
+        """
+        chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
+        if not chat_id:
+            return  # 终端会话：没有 chat_id，无处可存
+        try:
+            self._plan_store().save(chat_id, self._mode, tuple(self._plan))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def restore_plan(self) -> bool:
+        """从磁盘恢复本会话的 Plan。**有得恢复返回 True。**
+
+        由 :class:`~freeagent.services.channel.ChannelService` 在**新建**
+        Repl 时调用 —— 那正是 LRU 淘汰掉旧实例之后、新会话进来的时候。
+        没有这一步，淘汰即静默丢失（实测过，见 ``_mode`` 的注释）。
+        """
+        chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
+        if not chat_id:
+            return False
+        try:
+            saved = self._plan_store().load(chat_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if saved is None:
+            return False
+        self._mode = saved.mode
+        self._plan = list(saved.lines)
         return True
 
     # ⚠️ 刻意**不叫** ``_cmd_plan``：本文件第 1169 行已有那个名字（拆步骤，
@@ -395,16 +448,25 @@ class Repl:
     def _cmd_mode_plan(self, args: list[str]) -> bool:
         self._mode = MODE_PLAN
         self._plan = []
+        self._persist_plan()
         self._say("（Plan）只沟通、不落库。说完说 /mode-build 再动手。")
         return True
 
     def _cmd_mode_build(self, args: list[str]) -> bool:
+        chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
         if not self._plan:
             self._say("（已经在 build 模式，没有待执行的计划。）")
             return True
         plan = self._plan
         self._mode = MODE_BUILD
         self._plan = []
+        if chat_id:
+            # 退出规划即清掉持久状态：这份 Plan 已经交出去了（列给用户看了），
+            # 留着会让下次进入本会话时凭空冒出一份「待执行计划」。
+            try:
+                self._plan_store().drop(chat_id)
+            except Exception:  # noqa: BLE001
+                pass
         self._say(
             f"（build）收到 {len(plan)} 条。确认卡尚未实现 —— "
             "所以**还没有执行任何东西**。"
