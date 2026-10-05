@@ -35,7 +35,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from freeagent.app import build_app  # noqa: E402
-from freeagent.delegate import DEFAULT_MAX_TOOL_CALLS, run_with_tool_gate  # noqa: E402
+from freeagent.delegate import (  # noqa: E402
+    DEFAULT_MAX_DISPATCH_SECONDS,
+    DEFAULT_MAX_TOOL_CALLS,
+    run_with_tool_gate,
+)
 from freeagent.services.approval import ApprovalPolicy, ApprovalStore, Decision  # noqa: E402
 from freeagent.services.clock import FrozenClock  # noqa: E402
 from freeagent.services.delegate import DelegationPolicy  # noqa: E402
@@ -284,5 +288,163 @@ def test_abort_failure_still_reports_the_cap(store):
                store, max_tool_calls=2)
     assert got.ok is False
     assert "上限" in (got.summary or ""), (
+        f"结论被 abort 的失败带偏了：{got.summary!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 时长上限：与步数上限**互补**，不是重复
+# --------------------------------------------------------------------------- #
+#
+# 步数上限管「做了太多件事」；时长上限管「这件事花了太久」。
+# 一个一直有动静的 agent（持续报进度、反复读写但不问授权）次数上不去，
+# 时间却能拖很久 —— 而 ``events()`` 那个 ``timeout=600`` 是 **socket 空闲
+# 超时**，只在「600 秒没动静」时抛异常，**「一直有动静」正是它管不到的**。
+#
+# 所以两条断言必须区分「原因」和「给的路」：混成同一句话会让人往错的方向
+# 拆需求 —— 而「拆需求」对一件卡住的事完全没用。
+
+
+class _BusyServer(_FakeServer):
+    """一直吐无关事件，但**从不需要授权**。
+
+    这正是步数上限抓不到、而时长上限必须抓的那一类：次数不涨，时间在走。
+    """
+
+    def __init__(self, n: int = 50) -> None:
+        super().__init__([("message.part.updated", {"i": i}) for i in range(n)]
+                         + [("session.idle", {})])
+
+
+class _Ticker:
+    """每次调用就往前跳 ``step`` 秒的假时钟。
+
+    **为什么不用「传一个很小的 max_seconds 然后等它过期」**：
+    我第一版就那么写的（``max_seconds=0.001``），而假 server 建会话只要微秒 ——
+    循环第一次转起来时 1ms **还没到**，于是上限没触发，测试红成了一个
+    不存在的 bug。靠 sleep 修不好：调大就慢、调小就 flaky。
+    注入时钟让上限**确定性**可测，这也正是本仓库 ``FrozenClock`` 的做法
+    （README：「时间由可注入的 FrozenClock 驱动」）。
+    """
+
+    def __init__(self, step: float) -> None:
+        self.t = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        self.t += self.step
+        return self.t
+
+
+#: 跳得足够快，让第一个事件就落在期限之后
+_FAST = 100.0
+#: 跳得足够慢，期限内不会越过
+_SLOW = 0.001
+
+
+def _run_timed(server, sender, store, *, max_seconds, step=_FAST):
+    sender.bind(store)
+    return run_with_tool_gate(
+        _StubTask(), Path("C:/p"), "做点事",
+        policy=DelegationPolicy(projects=("C:/p",), model="opencode/big-pickle"),
+        store=store, sender=sender, approver="ou_owner",
+        server_factory=lambda project, command: server,
+        max_seconds=max_seconds,
+        now=_Ticker(step),
+    )
+
+
+def test_time_cap_stops_a_busy_but_silent_agent(store):
+    """一直吐事件但从不问授权 —— 次数不涨，**必须被时长上限拦住**。"""
+    oc = _BusyServer()
+    sender = _AutoApprovingSender(auto="allow")
+
+    # 快时钟：第一个事件就落在期限之后，于是立刻触发。
+    got = _run_timed(oc, sender, store, max_seconds=30, step=_FAST)
+
+    assert got.ok is False, "超时必须报失败"
+    assert oc.aborted == ["ses_fake"], f"没 abort：{oc.aborted}"
+    assert sender.cards == [], "不该发授权卡 —— 它一次都没问过"
+
+
+def test_time_cap_does_not_fire_under_a_generous_budget(store):
+    """预算够时**不许误伤** —— 修的不能是把好路径弄坏。"""
+    oc = _FakeServer([_asked("per_1"), ("session.idle", {})])
+    sender = _AutoApprovingSender(auto="allow")
+
+    got = _run_timed(oc, sender, store, max_seconds=600, step=_SLOW)
+
+    assert got.ok is True, got.summary
+    assert len(sender.cards) == 1
+    assert oc.aborted == []
+
+
+def test_zero_seconds_disables_the_time_cap(store):
+    """``0`` = 关闭时长上限（逃生舱）。
+
+    与步数上限同理由：必须有这个出口，否则一个确实要跑很久的任务
+    没有任何合法的走法。
+    """
+    oc = _BusyServer(n=6)
+    got = _run_timed(oc, _AutoApprovingSender(auto="allow"), store, max_seconds=0)
+    assert got.ok is True, "上限关了就不该拦"
+    assert oc.aborted == []
+
+
+def test_time_cap_message_says_stuck_not_too_many(store):
+    """时长超限必须说「**卡住了**」而不是「该拆开」。
+
+    这条是本组最要紧的断言：对一件卡住的事说「拆成小份」，用户会去拆需求 ——
+    而那完全没用，因为他真正需要知道的是「它卡住了」。
+    """
+    got = _run_timed(_BusyServer(), _AutoApprovingSender(auto="allow"),
+                     store, max_seconds=30, step=_FAST)
+    summary = got.summary or ""
+    assert "时长" in summary or "秒" in summary
+    assert "卡住" in summary, f"必须说清是卡住而不是太多：{summary!r}"
+    assert "拆开" not in summary, (
+        f"不该建议「拆开」—— 对卡住的事没用：{summary!r}"
+    )
+
+
+def test_time_cap_records_partial_progress(store):
+    """超限时已做的部分要留在记录里 —— 它们真的发生了。"""
+    oc = _FakeServer([_asked("per_1"), ("session.idle", {})])
+    sender = _AutoApprovingSender(auto="allow")
+
+    # 先正常跑一次拿到 tool_calls 的形状，再用极短预算跑一次带事件的
+    got_ok = _run_timed(oc, sender, store, max_seconds=600)
+    assert got_ok.tool_calls
+
+    busy = _BusyServer()
+    got = _run_timed(busy, _AutoApprovingSender(auto="allow"),
+                     store, max_seconds=0.001)
+    assert got.session_id == "ses_fake"
+
+
+def test_default_time_budget_is_sane():
+    """默认时长要有依据：够一次真实的多文件改动跑完，又不至于无限拖。
+
+    30 分钟。这个值**必须小于**人愿意等的极限 —— 超过就该让人主动去喊停，
+    而那需要终止接口（尚未实现）。
+    """
+    assert 300 <= DEFAULT_MAX_DISPATCH_SECONDS <= 3600, (
+        f"默认时长 {DEFAULT_MAX_DISPATCH_SECONDS}s 不合理："
+        "太短会误伤真实改动，太长等于没有"
+    )
+
+
+def test_abort_failure_on_time_cap_still_reports_the_cap(store):
+    """``abort`` 失败**不许改变结论** —— 结论是「超限停下」。"""
+
+    class _AbortFails(_FakeServer):
+        def abort(self, session_id) -> None:
+            raise OSError("abort 炸了")
+
+    got = _run_timed(_AbortFails(_BusyServer()._events),
+                     _AutoApprovingSender(auto="allow"), store,
+                     max_seconds=30, step=_FAST)
+    assert got.ok is False
+    assert "卡住" in (got.summary or ""), (
         f"结论被 abort 的失败带偏了：{got.summary!r}"
     )

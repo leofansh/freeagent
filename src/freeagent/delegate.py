@@ -701,6 +701,20 @@ def _default_server_factory(project: Path, command: str) -> "OpenCodeServer":
 #: 会直接这么说。
 DEFAULT_MAX_TOOL_CALLS = 40
 
+#: 单条委派的**总时长**上限（秒），默认 30 分钟。
+#:
+#: 为什么步数上限还不够：它限的是**次数**，而一个持续吐事件的 agent
+#: （一直报进度、反复读写但不问授权，或干脆在无关的工具上打转）总时长
+#: **无上界**。``events()`` 那个 ``timeout=600`` 是 **socket 空闲超时** ——
+#: 它只在「600 秒没动静」时抛异常，而「一直有动静」正是它管不到的那种。
+#:
+#: 两者是互补的，不是重复：
+#: - 步数上限管「做了太多件事」
+#: - 时长上限管「这件事花了太久」
+#:
+#: 两者都在**代码**里数，不靠请 agent 自觉。
+DEFAULT_MAX_DISPATCH_SECONDS = 30 * 60
+
 
 def run_with_tool_gate(
     task,
@@ -713,6 +727,8 @@ def run_with_tool_gate(
     approver: str,
     server_factory: "ServerFactory | None" = None,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+    max_seconds: float = DEFAULT_MAX_DISPATCH_SECONDS,
+    now: Callable[[], float] = time.monotonic,
 ) -> DispatchOutcome:
     """派一条委派，**执行期逐次授权**（设计文档 11.8.1）。
     与 :func:`_dispatch_one` 的分工：那是**无人值守**的老路（subprocess 一次
@@ -762,11 +778,45 @@ def run_with_tool_gate(
     #: 没人会回答的授权请求干等 —— 那正是「卡死」的定义。
     step_capped = False
     tool_calls = 0
+    #: 总时长超限。与 :data:`DEFAULT_MAX_TOOL_CALLS` **互补**：那个限次数，
+    #: 这个限时长。一个一直有动静的 agent 次数上不去，但时间能拖很久。
+    time_capped = False
+    #: 默认 ``monotonic`` 而不是墙钟：墙钟会被 NTP 校时或用户改时间影响，
+    #: 那样「已经跑了 30 分钟」可能突然变成负数，于是上限失效。
+    #:
+    #: **刻意做成可注入**：靠「传一个很小的 max_seconds 然后等它过期」来测
+    #: 是靠运气的 —— 我第一版就写了个 ``0.001``，而假 server 建会话只要微秒，
+    #: 循环第一次转起来时期限**还没到**，于是测试红成了一个不存在的 bug。
+    #: 注入时钟让这个上限**确定性**可测，不用 sleep、不 flaky。
+    deadline = (now() + max_seconds) if max_seconds > 0 else None
+
+    def _abort_quietly(oc) -> None:
+        """中止会话。**中止失败不许改变结论**。
+
+        会话随后会被 ``with`` 关掉，而我们要报的是「超限停下」，
+        不是「中止失败」—— 反过来会把一次**成功的保护**说成故障。
+        """
+        try:
+            oc.abort(session_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("中止会话失败（仍将按上限报出）：%s", exc)
+
     try:
         with make_server(project, policy.command) as oc:
             session_id = oc.create_session()
             oc.prompt_async(session_id, brief, model=policy.model)
             for kind, props in oc.events():
+                if deadline is not None and now() > deadline:
+                    handled.append(
+                        f"超过单条委派的时长上限（{max_seconds:g}s）—— 已中止"
+                    )
+                    time_capped = True
+                    log.warning(
+                        "【执行期】超过时长上限 %ss，主动中止会话：task=%s",
+                        max_seconds, getattr(task, "id", "?"),
+                    )
+                    _abort_quietly(oc)
+                    break
                 if kind in ("session.idle", "session.error"):
                     break
                 if kind == "question.asked":
@@ -814,12 +864,7 @@ def run_with_tool_gate(
                         "【执行期】工具调用超过上限 %d 次，主动中止会话：task=%s",
                         max_tool_calls, getattr(task, "id", "?"),
                     )
-                    try:
-                        oc.abort(session_id)
-                    except Exception as exc:  # noqa: BLE001
-                        # 中止失败**不改变结论**：会话已被 `with` 关掉，
-                        # 而我们要报的就是「超限停下」，不是「中止失败」。
-                        log.warning("中止会话失败（仍将按超限报出）：%s", exc)
+                    _abort_quietly(oc)
                     break
                 decision = _ask_one_tool(oc, req, store=store, sender=sender,
                                          approver=approver, context=context)
@@ -858,6 +903,21 @@ def run_with_tool_gate(
                 f"剩下的没做。\n"
                 f"  下一步：把需求拆成几条更小的委派，"
                 f"或者调高上限（DEFAULT_MAX_TOOL_CALLS）。"
+            ),
+            session_id=session_id or None, tool_calls=tuple(handled),
+        )
+    if time_capped:
+        # 与 step_capped 同样报成失败，但**原因不同、给的路也不同**：
+        # 步数超限是「要做的事太多」，时长超限是「这件事卡住了」。
+        # 混成同一句话会让人往错的方向拆需求。
+        return DispatchOutcome(
+            ok=False,
+            summary=(
+                f"超过单条委派的时长上限（{max_seconds:g} 秒）—— 已主动中止会话。\n"
+                f"  这不是「要做的事太多」，是**这件事卡住了**："
+                f"它一直有动静，所以次数没超，但时间拖到了上限。\n"
+                f"  已完成的改动还在，剩下的没做。可以看一眼它卡在哪，"
+                f"或者调高上限（DEFAULT_MAX_DISPATCH_SECONDS）。"
             ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
