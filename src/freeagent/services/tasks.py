@@ -251,12 +251,32 @@ class TaskService:
     def set_kind(
         self,
         task_id: str,
-        kind: TaskKind,
+        kind: TaskKind | str,
         *,
         waiting_on: WaitingOn | None = None,
         reason: str | None = None,
     ) -> Task:
-        """改事务形状。改成等候类必须同时给出在等什么。"""
+        """改事务形状。改成等候类必须同时给出在等什么。
+
+        ``kind`` 收字符串（``TaskKind`` 是 ``str`` 基枚举，所以
+        ``TaskKind("action")`` 天然可行）。**刻意在边界转换**，因为不转换
+        会静默丢掉一条校验：
+
+        ``kind is TaskKind.WAIT`` 对普通字符串 ``"wait"`` 是 **False**，
+        于是「等候类必须给 waiting_on」那条不变量被**跳过**、``target`` 被置
+        ``None``，然后一路带到 ``storage/repos.py`` 的 ``task.kind.value``
+        才炸出 ``AttributeError: 'str' object has no attribute 'value'``。
+
+        症状离病因隔了两层，而**类型注解当时说这里是 ``TaskKind``**，于是
+        排查时被引向「枚举用错了」而不是「这函数没校验输入」。先转换，两件事
+        一起消失：拿到的一定是枚举，非法值立刻在门口报出**能看懂**的话。
+
+        顺带 ``strip().lower()``：CLI 那侧有 ``args[1].lower()``，但
+        **服务层不该依赖调用方已经归一化过** —— 下一个 Web 入口不会记得做，
+        而 ``"Action"`` 撞上 ``ValueError`` 的报错对用户毫无信息量。
+        """
+        if not isinstance(kind, TaskKind):
+            kind = TaskKind(str(kind).strip().lower())  # 非法值在这里就抛
         current = self._tasks.get(task_id)
         now = self._clock.now()
         if kind is TaskKind.WAIT:
