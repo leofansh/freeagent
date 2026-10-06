@@ -26,6 +26,21 @@ from freeagent.cli.app import Repl
 from freeagent.config import Config
 from freeagent.domain import LLMError
 from freeagent.services.chat import _VIEWS
+from freeagent.services.capability import CAPABILITY_TOPICS
+
+from freeagent.services.capability import CapabilityRouter
+
+#: 模型可以被问的**全部**表。每张都是封闭集 —— 模型自创的名字一律丢弃。
+#:
+#: 现在是三张，因为「没法穷举」这件事逼出了第三张：
+#:   1. ``_VIEWS``            事务视图（规则表先走，模型兜底）
+#:   2. ``CAPABILITY_TOPICS`` 能力话题（有哪些项目 / 能做什么 / 招呼）
+#:   3. ``FALLBACK_ACTIONS``  **动作**兜底 —— 能力话题没命中时问的
+#:
+#: 第 3 张的存在理由：往第 2 张里加格子是无限赛跑（实测「OpenMOS是什么」
+#: 「怎么改OpenMOS」「小袁能改吗」三个问法就要加三格）。而**动作是有限的**
+#: ——看项目 / 讲流程 / 记账 / 不动手 —— 所以换个问法就收敛了。
+ALLOWED_TABLES = (_VIEWS, CAPABILITY_TOPICS, CapabilityRouter.FALLBACK_ACTIONS)
 from freeagent.services.clock import FrozenClock
 from freeagent.services.llm.provider import (
     ClassificationResult,
@@ -121,7 +136,20 @@ class TestClosedSet:
         llm.select_view = spy           # type: ignore[method-assign]
         app.chat.respond("今天该做什么？")
         assert seen, "没有调用 select_view"
-        assert tuple(seen[0]) == _VIEWS, f"模型看到的清单与 _VIEWS 不一致：{seen[0]}"
+        # 模型现在会被问**两张封闭表**：事务视图 ``_VIEWS``，以及能力话题
+        # ``CAPABILITY_TOPICS``（能力问答是**另一次独立**的路由，量的是
+        # 另一件事，见 ``CapabilityRouter.__init__`` 的注释）。
+        #
+        # 所以这里守的不再是「只被问一次」，而是「**每一张都是封闭的**」——
+        # 共有三张（见 ``ALLOWED_TABLES``）：事务视图、能力话题，
+        # 以及**动作**兜底。第三张是「没法穷举」逼出来的：往能力话题里
+        # 加格子是无限赛跑，而动作空间小得多（看项目/讲流程/记账/不动手）。
+        # 模型自创的名字一律被丢弃。那才是这条断言真正要守的东西。
+        assert seen, "没有调用 select_view"
+        for asked in seen:
+            assert asked in ALLOWED_TABLES, (
+                f"模型被问了一张不在允许清单里的表：{asked}"
+            )
 
     def test_hallucinated_view_name_is_rejected(self, tmp_path):
         """模型编一个视图名出来时，**绝不能**照着它渲染。
@@ -268,7 +296,17 @@ class TestViewRoutingIsOffByDefault:
         app = _app(tmp_path, llm, view_routing=False)
         app.chat.respond("今天该做什么？")
         app.chat.respond("我在等什么")
-        assert llm.calls == [], f"开关关着却仍然调了模型：{llm.calls}"
+        # ``view_routing`` 关着 = **事务视图**路由不问模型。
+        #
+        # 它不管能力路由 —— 那是独立开关、独立测量。原先这里断言
+        # ``llm.calls == []``，而能力通道上线后它必然失败：它问的是
+        # ``CAPABILITY_TOPICS``、不是 ``_VIEWS``。断言于是从「别花钱」
+        # 变成「这条路上一次模型都别碰」，超出了它的本意 ——
+        # 而且会逼着后来人把能力通道整个关掉来讨它欢。
+        #
+        # 现在各自断言各自那件事。
+        asked_tables = {tuple(c[1]) for c in llm.calls}
+        assert _VIEWS not in asked_tables, f"开关关着却问了事务视图：{llm.calls}"
 
     def test_on_means_the_model_is_consulted(self, tmp_path):
         """反方向：开关打开时必须真的问，否则接线是死的。"""
@@ -334,7 +372,8 @@ class TestBuildAppWithNoConfig:
         )
         app.roles.create("工作项目A", note="销售")
         app.chat.respond("今天该做什么？")
-        assert llm.calls == [], "没给 config 时不该默认打开模型选路"
+        asked_tables = {tuple(c[1]) for c in llm.calls}
+        assert _VIEWS not in asked_tables, "没给 config 时不该默认打开事务视图选路"
 
 
 # =============================================================================

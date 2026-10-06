@@ -30,8 +30,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
 
-from ..domain import ArtifactStatus, ScoredTask, Task, TaskKind
+from ..domain import ArtifactStatus, ScoredTask, Task, TaskKind, TaskState
+from typing import TYPE_CHECKING
+
 from ..services.clock import Clock
+
+if TYPE_CHECKING:  # 环：capability 要 ChatReply，这里只出现在标注里
+    from .capability import CapabilityRouter, CapabilityView
 from ..services.llm.provider import (
     InputIntent,
     RoleHint,
@@ -116,6 +121,24 @@ CAN_DO: tuple[str, ...] = (
 )
 
 _TODAY_WORDS = ("今天", "现在", "先做", "先干", "优先", "安排", "做什么", "干什么")
+
+#: 问「**有哪些**脉络 / 角色」的词。
+#:
+#: 这一组**不是**为了「某条脉络名下的事」——那个由 ``_match_role``
+#: （真名匹配）负责，不需要词表。这里管的是**列举**：句子里一个具体
+#: 脉络名都没有，只在问「一共有哪几条」。
+#:
+#: 踩过的坑：原先 ``role`` 这条路上是 ``if role is None: return None``，
+#: 而「没点名」被当成了「没有这条信息」—— 于是问脉络拿到今天视图。
+#: **漏了还不报错**，只是悄悄退回兜底，用户看到自信的错误答案。
+#:
+#: 刻意只用「脉络 / 角色」这两个词，不用「有哪些」这种壳子：「有哪些」
+#: 太泛，会把「有哪些提醒」也拽进来（那是 reminders）。
+_ROLE_LIST_WORDS = (
+    "脉络", "角色",
+    "有哪些角色", "哪些角色", "什么角色",
+    "角色列表", "脉络列表",
+)
 _WAITING_WORDS = ("等谁", "在等", "等什么", "卡住", "等候")
 _REMINDER_WORDS = ("提醒", "会不会忘", "别忘")
 _DONE_WORDS = ("完成", "做完", "搞定", "结束", "交付了")
@@ -148,6 +171,18 @@ _HELP_STRUCTURE_RE = re.compile(
 #: 「全部未结束的事」7 个字就该当查询；「下周二要交的销售周报初稿」14 个字
 #: 是在记事。查询是**短语**，指令是**句子** —— 用长度把它们粗略分开，
 #: 比再加一堆词表可靠（词表会被下一种说法击穿，而长度不会）。
+#: 「未结束」的**闭集**。
+#:
+#: 刻意写成闭集而不是取反（``not in (DONE, DROPPED)``）：新增一个状态时
+#: 闭集不会被自动算错，而取反会 —— 新状态会悄悄被当成「未结束」。
+#:
+#: 踩过的坑：这里原先写 ``not t.state.is_terminal``，而 ``TaskState``
+#: **没有** ``is_terminal`` 这个属性（真跑才炸：属性名是照记忆写的，
+#: 不是查的）。凡是自己编的属性名，先查。
+_OPEN_STATES: frozenset[TaskState] = frozenset(
+    {TaskState.INBOX, TaskState.ACTIVE, TaskState.BLOCKED}
+)
+
 _VIEW_QUERY_MAX_LEN = 12
 
 #: **封闭**视图集：``(名字, 中文说明)``。
@@ -166,7 +201,7 @@ _VIEWS: tuple[tuple[str, str], ...] = (
     ("progress", "某一条现在到哪一步了"),
     ("all", "全部还没结束的事，不限日期"),
     ("closed", "某个**时间段**内已经做完的事（本周/上周/最近N天）"),
-    ("role", "某个脉络（角色）名下的事"),
+    ("role", "某个脉络（角色）名下的事；**也包括**「我有哪些脉络/角色」这类**列举全部**的问题 —— 后者不需要点名任何一条"),
 )
 
 _RANGE_TOKEN_RE = re.compile(r"最近\s*(\d+)\s*(天|周|个月)")
@@ -224,6 +259,8 @@ class ChatService:
         llm,
         *,
         view_routing: bool = False,
+        capabilities: CapabilityView | None = None,
+        capability_router: CapabilityRouter | None = None,
     ) -> None:
         self._view_routing = view_routing
         self._tasks = tasks
@@ -234,6 +271,18 @@ class ChatService:
         self._clock = clock
         self._llm = llm
 
+        #: 助手**自己**的能力（有哪些项目 / 接了什么执行器）。
+        #:
+        #: 由组装层注入，而不是自己 import ``config`` —— 见
+        #: :class:`~freeagent.services.capability.CapabilityView` 的说明。
+        #: 默认 ``None`` 时能力通道一律闭嘴，所以**每个既有测试都照旧
+        #: 通过**：没注入就不该有这类回答。
+        self._capabilities = capabilities
+
+        #: 能力问题的路由器（LLM 裁决）。没注入时 :mod:`capability`
+        #: 一律闭嘴 —— 既有的每个测试因此照旧通过。
+        self._capability_router = capability_router
+
     # -- 入口 ---------------------------------------------------------------- #
     def respond(self, text: str, *, context_ids: Sequence[str] = ()) -> ChatReply:
         """回一句话。
@@ -242,6 +291,21 @@ class ChatService:
         由调用方回传，服务本身不存状态 ——
         这样多轮能接上，同时服务端仍然无状态、可测、重启不丢。
         """
+        # 能力类问题（「有哪些项目」「你能做什么」「在吗」）**在这里**接，
+        # 而不是在 :meth:`Repl._natural`。
+        #
+        # 踩过的坑（真机复现）：原先接在 ``Repl._natural`` 里，而
+        # ``/api/chat`` 走的是 ``app.chat.respond(...)`` —— **压根不经过
+        # Repl**。于是飞书那条路修好了、Web 这条原地不动，而 Web 才是
+        # 主要入口。
+        #
+        # 教训：**问「谁调用了我」而不是「我以为谁调用我」。** 三个入口
+        # （终端 / 飞书 / Web）里，只有一个走 Repl。
+        router = self._capability_router
+        if router is not None:
+            cap = router.try_route(text, self._capabilities)
+            if cap is not None:
+                return cap
         stripped = text.strip()
         if not stripped:
             return ChatReply(ChatReplyKind.HELP, "说点什么吧。", suggestions=CAN_DO)
@@ -434,6 +498,11 @@ class ChatService:
         role = self._match_role(text)
         if role is not None:
             return self._tag(self._answer_role(role), "role")
+        # 「有哪些脉络」：先点名后列举。顺序反过来会坏 ——
+        # 「有哪些角色」里没有真名，_match_role 本来就返回 None，
+        # 所以先查名单不影响点名的那条路。
+        if any(w in text for w in _ROLE_LIST_WORDS):
+            return self._tag(self._answer_roles(text), "role")
         if any(w in text for w in _WAITING_WORDS):
             return self._tag(self._answer_waiting(), "waiting")
         if any(w in text for w in _REMINDER_WORDS):
@@ -506,16 +575,41 @@ class ChatService:
         if name == "role":
             role = self._match_role(text)
             if role is None:
-                return None            # 没点名任何脉络
+                # 没点名，**不等于没有这个信息** —— 脉络列表明明查得到。
+                #
+                # 原先这里 ``return None``，于是「我有哪些角色脉络?」一路
+                # 落到硬编码的 today 兜底：用户问脉络，拿到今天清单。实测
+                # （真实投诉截图）。把「没点名」当成「没有这条信息」——
+                # 这跟今天我在别处犯的错是同一个。
+                return self._answer_roles(text)
             return self._tag(self._answer_role(role), "role")
         return None
+
+    @property
+    def capability_router(self) -> CapabilityRouter | None:
+        """能力问题的路由器；没注入就是 ``None``（那条路闭嘴）。"""
+        return self._capability_router
+
+    @property
+    def capabilities(self) -> CapabilityView | None:
+        """助手自己有哪些能力（供 :mod:`capability` 通道读取）。"""
+        return self._capabilities
 
     #: 兵底时插在答复最前面的自报家门。
     #:
     #: 刻意说「**按今天理解了你这句**」而不是「没听懂」：这句已经给了
     #: 可能有用的东西，否认它反而是撒谎。关键是让用户知道**这是我的
     #: 猜测**，好让他自己判断该信几分。
-    _INFERRED_NOTICE: str = "（没听懂你问的是哪一类，先按「今天」答 —— 不对就问在等什么/有什么提醒/全部）\n"
+    #: 兜底时插在答复最前面的自报家门。
+    #:
+    #: 列出的候选**必须是真的能问到的**。原来的三选一
+    #: （在等什么 / 提醒 / 全部）漏掉了脉络、项目、能力这些
+    #: 同样存在的路 —— 于是它把用户往一条不存在的路上引。
+    _INFERRED_NOTICE: str = (
+        "（没听懂你问的是哪一类，先按「今天」答 —— "
+        "不对就问：在等什么 / 有什么提醒 / 全部 / "
+        "我有哪些脉络 / 有哪些项目 / 你能做什么）\n"
+    )
 
     @staticmethod
     def _tag(reply: ChatReply, route: str, *, inferred: bool = False) -> ChatReply:
@@ -688,6 +782,34 @@ class ChatService:
                         for i, it in enumerate(items, 1)),
             items=items,
             suggestions=("今天该做什么", "有什么提醒"),
+        )
+
+    def _answer_roles(self, text: str) -> ChatReply:
+        """"我有哪些脉络 / 有哪些角色" —— 列出全部，不用点名。
+
+        与 :meth:`_answer_role` 的分工：那个答**某一条**名下的事，这个答
+        **有哪些条**。原先只有后者，且它要求先点名 —— 于是列表类问题
+        无路可走。
+        """
+        roles = self._roles.list_roles()
+        if not roles:
+            return ChatReply(
+                ChatReplyKind.ANSWER,
+                "你还没有任何脉络 —— 说一件事我就给你建第一条。",
+            )
+        lines = [f"你有 {len(roles)} 条脉络："]
+        # 只数**未结束**的事：脉络的价值就在这儿，而「0 件」也是有用
+        # 信息（说明这条脉络该收了）。
+        #
+        # 用 ``_OPEN_STATES`` 闭集 —— 见它的定义处。
+        open_tasks = [t for t in self._repo.list_all() if t.state in _OPEN_STATES]
+        for r in roles:
+            n = sum(1 for t in open_tasks if r.id in t.role_ids)
+            lines.append(f"  {r.name} —— {n} 件未结束")
+        return ChatReply(
+            ChatReplyKind.ANSWER,
+            "\n".join(lines),
+            suggestions=("今天该做什么",),
         )
 
     def _answer_role(self, role) -> ChatReply:

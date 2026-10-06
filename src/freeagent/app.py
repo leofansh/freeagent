@@ -13,6 +13,7 @@ from typing import Any
 
 from .config import Config, load_config
 from .services.artifacts import ArtifactService
+from .services.capability import CapabilityRouter, CapabilityView
 from .services.chat import ChatService
 from .services.clock import Clock, SystemClock
 from .services.knowledge import KnowledgeService
@@ -122,6 +123,51 @@ def build_vision_provider(config: Config | None) -> VisionProvider | None:
     )
 
 
+def _capability_view(config: Config | None) -> CapabilityView:
+    """从配置装配「助手自己有哪些能力」。
+
+    刻意在这里做、而不是让 :class:`ChatService` 自己读盘：那样
+    ChatService 就得知道 ``Config`` 的形状，边界也就糊了。
+
+    ## 项目名优先用 OpenCode 注册过的显示名
+
+    用户嘴里的项目是「FreeAgent」，磁盘上是 ``D:/PycharmProjects/freeagent``。
+    回答「有哪些项目」时给他一串路径是没用的 —— 他要的是**能说出口的名字**，
+    好让他下一句直接说「让 opencode 改 FreeAgent」。
+
+    取不到显示名时**退回路径本身**，不静默变空：空列表会让
+    「有哪些项目」回答成「没有授权任何项目」，那是在**撒谎**。
+    """
+    if config is None:
+        return CapabilityView()
+
+    projects = tuple(config.delegate_projects)
+    names: tuple[str, ...] = ()
+    executors = ("opencode",) if projects else ()
+
+    # 显示名来自 OpenCode 的注册表；查不到不是错，走回退路径即可。
+    try:
+        from .services.opencode_projects import list_projects
+
+        known = list_projects()
+        by_norm = {_norm_path(p.worktree): p.display for p in known if p.display}
+        names = tuple(
+            by_norm.get(_norm_path(p), "") or p for p in projects
+        )
+    except Exception:
+        names = ()
+
+    return CapabilityView(
+        projects=projects,
+        project_names=names,
+        executors=executors,
+    )
+
+
+def _norm_path(path: str) -> str:
+    return str(path).replace("\\", "/").rstrip("/").casefold()
+
+
 def build_app(
     db_path: Path | None = None,
     *,
@@ -196,6 +242,13 @@ def build_app(
         view_routing=(
             the_config.llm_view_routing if the_config is not None else False
         ),
+        # 能力问答**由 LLM 路由**：把 ``the_llm`` 一并给路由器，规则
+        # 不参与判断（见 services/capability.py 的模块文档）。
+        capabilities=_capability_view(the_config),
+        # 显式开：能力路由与 ``view_routing`` 是两次独立测量（见
+        # CapabilityRouter.__init__ 的注释）。默认 False 会让能力通道
+        # 永远闭嘴，而它恰恰是今天这批投诉的解药。
+        capability_router=CapabilityRouter(the_llm, enabled=True),
     )
     vision = (
         vision if vision is not None else build_vision_provider(the_config)
