@@ -23,6 +23,7 @@ from typing import Callable
 
 from ...domain import LLMError
 from .provider import (
+    DelegationIntent,
     KIND_ACTION,
     KIND_REMINDER,
     KIND_WAIT,
@@ -215,6 +216,49 @@ class DeepSeekProvider(LLMProvider):
             return self._degrade(exc).classify(text, role_hints)
 
         return _validate_classification(payload, known)
+
+    # -- 1c. parse_delegation ------------------------------------------------ #
+    def parse_delegation(
+        self, text: str, known_projects: Sequence[str]
+    ) -> DelegationIntent:
+        """抽「改哪个项目 + 改什么」。**只抽，不猜。**
+
+        ## 为什么不给它「默认项目」
+
+        猜错项目的代价是**在错误的仓库里动手**。所以抽不出项目就是空串，
+        交给上层追问 —— 一次交互 vs 改错目录，不成比例。
+
+        ## brief 要保留动词
+
+        「把 greet 函数改成返回你好」抽出来必须还是这句话（可执行），
+        而不是「greet 函数返回你好」（丢了动作，变成名词短语）。
+        所以提示里明确写了：``brief`` 是**可以直接转述给执行器的祈使句**。
+        """
+        if not known_projects:
+            return DelegationIntent()
+        catalogue = "\n".join(f"- {p}" for p in known_projects)
+        system = (
+            "你在给一个个人事务助手抽「要改代码的那句话」。"
+            "只输出 JSON，不要解释。\n"
+            '输出格式：{"is_delegation":true或false,"project":"<项目名或空串>",'
+            '"brief":"<要做的事，一句话>或空串"}\n'
+            f"可选项目（**只能原样取这些名字，不得自创**）：\n{catalogue}\n"
+            "规则：\n"
+            "1. 这句话**没有**要求改动代码时，is_delegation=false，"
+            "另两项填空串。这包括：只是记事、只是提问、只是打招呼。\n"
+            "2. 项目名抽不出就填空串，**不要挑一个最像的**。\n"
+            "3. brief 必须是**能直接转述给执行者的祈使句**，"
+            "保留动词与对象（「把 greet 改成返回你好」），"
+            "不要压成名词短语（「greet 返回你好」—— 那丢了动作）。\n"
+            "4. 只说了要改哪个项目、没说改什么时，brief 填空串，上层会追问。\n"
+            "5. brief 里**不要**写项目名（已在 project 字段里），"
+            "也不要写「用 opencode」「帮我」这类客套。"
+        )
+        try:
+            payload = self._chat_json(system, f"用户说：{text}", max_tokens=160)
+        except LLMError as exc:
+            return self._degrade(exc).parse_delegation(text, known_projects)
+        return _validate_delegation(payload, tuple(known_projects))
 
     # -- 1b. select_view ---------------------------------------------------- #
     @property
@@ -539,3 +583,27 @@ def _repair_skeleton(text: str, task: TaskRef, instruction: str) -> str:
             + "\n\n## 待确认\n- [TODO] 以上内容里哪些是我没说清楚、你是猜的？"
         )
     return body
+
+
+def _validate_delegation(payload: object, known: tuple[str, ...]) -> DelegationIntent:
+    """把模型吐的东西**收窄**回闭集。坏形状一律当「不是委派」。
+
+    与 :func:`_validate_classification` 同一套理由：模型会编造项目名，
+    编造的名字必须被丢弃 —— 而丢弃之后就没有可信的项目，于是整条按
+    「不是委派」处理（上层会走记事或追问，而不是拿一个假项目去动手）。
+    """
+    if not isinstance(payload, Mapping):
+        return DelegationIntent()
+    if payload.get("is_delegation") is not True:
+        return DelegationIntent()
+
+    project = payload.get("project")
+    project = project.strip() if isinstance(project, str) else ""
+    # **闭集**：自创名字丢弃
+    if project and project not in known:
+        project = ""
+
+    brief = payload.get("brief")
+    brief = brief.strip() if isinstance(brief, str) else ""
+
+    return DelegationIntent(is_delegation=True, project=project, brief=brief)

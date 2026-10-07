@@ -18,7 +18,7 @@ import io
 from ..app import App
 from ..domain import FreeAgentError
 from ..services.sorting import score_and_sort
-from .commands import command_payload, is_planning
+from .commands import command_payload, is_planning, wants_repl
 from . import serialize, serialize_api
 from .actions import with_actions
 
@@ -187,19 +187,12 @@ def chat(app: App, body: dict) -> dict:
     if not isinstance(raw_context, list):
         raise FreeAgentError("last_items 必须是数组")
     context = [str(x) for x in raw_context[:MAX_CONTEXT_IDS] if isinstance(x, str)]
-    # 路由到 **Repl** 的两种情形（与飞书/终端同一个派发，
-    # 见设计文档 12.7.2「通道的统一边界」）：
-    #
-    # 1) 文本以 ``/`` 开头 —— 命令本来就�� Repl 的职责，塞进 ChatService
-    #    就是第二份命令表，而那份必然与 Repl 漂移。
-    # 2) **这个会话正在规划中** —— 这条是我第一版漏掉的，写测试才发现：
-    #    Plan 模式靠**自由文本**累积，而自由文本若照旧发给 ChatService，
-    #    计划就永远是空的，于是 ``/mode-build`` 报「没有待执行的计划」。
-    #    只分流命令在**原理上**就不够。
-    #
-    # 代价要说清：走 Repl 意味着这条回复是**纯文字**，没有 ``items`` ——
-    # 那是 Web 结构化渲染的依据。所以只有命令与规划期才走这条路。
-    if text.startswith("/") or is_planning(app):
+    # 什么该走 Repl、什么该走只读问答，三种情形都写在
+    # :func:`.commands.wants_repl` 的 docstring 里（含代价说明）。
+    if wants_repl(app, text, is_planning=is_planning(app)):
+        return command_payload(app, text)
+    #    判据是那个**闭合动作集**（LLM 判）：关键词穷举不完这些说法。
+    if wants_repl(app, text, is_planning=is_planning(app)):
         return command_payload(app, text)
     return serialize_api.chat_payload(app.chat.respond(text, context_ids=context))
 

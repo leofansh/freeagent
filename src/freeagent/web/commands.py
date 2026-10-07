@@ -61,6 +61,34 @@ def _web_repl(app: App):
     return repl
 
 
+def wants_repl(app, text: str, *, is_planning: bool) -> bool:
+    """这句话该不该走 :class:`~freeagent.cli.app.Repl` 而不是只读问答？
+
+    三种情形（第三种是 2026-10-06 补的）：
+
+    1. 文本以 ``/`` 开头 —— 命令本来就是 Repl 的职责，塞进 ChatService
+       就是第二份命令表，而那份必然与 Repl 漂移。
+    2. 会话正在规划中 —— Plan 靠**自由文本**累积，走 ChatService 计划永远是空的。
+    3. **要求改代码** —— 要**写库**（建委派事务），而 ChatService 是只读的。
+
+    ## 代价要说清
+
+    走 Repl 意味着这条回复是**纯文字**，没有 ``items`` —— 那是 Web 结构化
+    渲染的依据。所以只有这三种情形才走这条路。
+
+    第 3 种的判据是那个**闭合动作集**（LLM 判）：关键词穷举不完「让 opencode
+    改 X」「X 项目修一下」这类说法。漏判的代价是这句被**悄悄记成普通事务**
+    —— 看着成功、实际执行器根本不会碰。
+    """
+    if text.startswith("/") or is_planning:
+        return True
+    router = app.chat.capability_router
+    return bool(
+        router
+        and router.wants_code_change(text, app.chat.capabilities)
+    )
+
+
 def command_payload(app: App, text: str) -> dict:
     """文本以 ``/`` 开头时走**命令层**，与飞书/终端**同一个**派发。
 

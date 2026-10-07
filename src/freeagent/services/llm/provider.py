@@ -22,6 +22,7 @@ __all__ = [
     "TaskRef",
     "SignalRef",
     "ClassificationResult",
+    "DelegationIntent",
     "LLMProvider",
     "KIND_ACTION",
     "KIND_WAIT",
@@ -287,7 +288,38 @@ CANNOT_MUTATE_HINT = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class DelegationIntent:
+    """一句自然语言里「要改哪个项目、改什么」的**结构化**抽取结果。
+
+    ## 为什么让模型抽，而不是规则剥
+
+    第一版是「从句子里剥掉动词与项目名，剩下的就是要做的事」。它必然出错：
+    「帮我改一下 README」剥出来是空的；「把 greet 函数改成返回你好」剥出来
+    是「greet 函数返回你好」而不是「把 greet 函数改成返回你好」——
+    **动词本身就是要��的一部分**。
+
+    规则只在写表的人和用户说同一句话时成立。所以这件事交给模型，产出
+    **结构**而不是字符串。
+
+    ## 字段都可能为空 —— 那不是失败
+
+    用户常常只说一半（「我要改 XiaoYuan」没说改什么）。空字段由上层**追问**
+    补齐，而不是硬猜：猜出来的简报会被发出去让执行器改代码。
+    """
+
+    #: 要改的项目名。**必须原样取自**给定清单；抽不出是空串。
+    project: str = ""
+    #: 要做的事。抽不出是空串。
+    brief: str = ""
+    #: 这句话**到底是不是**在要求改代码。False 时上面两项无意义。
+    is_delegation: bool = False
+
+    def __bool__(self) -> bool:
+        return self.is_delegation
+
 @runtime_checkable
+
 class LLMProvider(Protocol):
     """助手智能能力的统一接口。"""
 
@@ -315,6 +347,17 @@ class LLMProvider(Protocol):
 
         所以：``RuleBasedProvider`` 为 ``False``，``DeepSeekProvider`` 为
         ``True``；上层据此决定是采信还是继续用关键词表。
+        """
+        ...
+
+    def parse_delegation(
+        self, text: str, known_projects: Sequence[str]
+    ) -> DelegationIntent:
+        """抽「要改哪个项目、改什么」。**抽不出就说抽不出。**
+
+        ``known_projects`` 是授权清单里的项目名，``project`` **必须原样取自**
+        它 —— 自创名字一律丢弃。闭集是这条接口的安全边界，与
+        :meth:`select_view` 同一条道理。
         """
         ...
 

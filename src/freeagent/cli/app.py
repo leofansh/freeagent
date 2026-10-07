@@ -262,6 +262,13 @@ class Repl:
         self.app = app
         self.out = out
         self._pending: _Pending | None = None
+
+        #: **委派要件**（项目名, 要做的事），半截状态。
+        #:
+        #: 与 ``_pending`` 并列，因为它们是同一类东西：「这个会话现在处于
+        #: 什么状态」。分开存是因为**回答的问题不同**：``_pending`` 是「这条
+        #: 该归哪条脉络」，本字段是「这件事到底是不是你要的」。
+        self._pending_delegate: tuple[str | None, str] | None = None
         #: 当前交互模式（设计文档 12.7.2）。``build`` = 正常，``plan`` = 只沟通、
         #: **零副作用**。
         #:
@@ -602,6 +609,17 @@ class Repl:
             self._last_items = [item.task_id for item in view.items]
             return True
 
+        # 委派意图**先于**记事判断 —— 「帮我改 OpenMOS 的登录」既有动作
+        # 动词又像一句话，若先走记事分支就会被建成普通事务，**看着成功、
+        # 实际什么都不会发生**（执行器只认 project_path 非空的行）。
+        if self._pending_delegate is not None:
+            if text.strip() in ("确认", "对", "是", "确认执行"):
+                return self._confirm_delegation()
+            return self._resume_delegation(text)
+
+        if self._maybe_delegation(text):
+            return True
+
         intent = read_intent(text)
         if intent is InputIntent.QUESTION:
             # 问句要**回答**，不是拒绝。
@@ -731,6 +749,158 @@ class Repl:
             if task.id == partial or task.id.startswith(partial):
                 return task.id
         raise FreeAgentError(f"找不到事务 {partial}")
+
+    # -- 委派：对话 → 确定要件 → 审批后执行 ------------------------------- #
+    def _maybe_delegation(self, text: str) -> bool:
+        """这句话是在要求改代码吗？是就接进委派三段。
+
+        ## 为什么不在能力通道里做
+
+        能力通道（:mod:`services.capability`）**只读**。而建委派要写库，
+        所以这一步只能在 Repl 里 —— 这也是 ``/api/chat`` 需要把这类句子
+        转过来的原因（见 ``web/endpoints_read.py``）。
+
+        ## 判断用 LLM，不用关键词
+
+        「让 opencode 改 X」「帮我改 X 项目」「X 那个 bug 修一下」——
+        关键词表必漏。所以这里问模型一次**动作**（``describe``/``howto``/
+        ``authorize``/``none``，见 :class:`CapabilityRouter`），复用同一套
+        闭合动作集，不另造词表。
+        """
+        router = self.app.chat.capability_router
+        caps = self.app.chat.capabilities
+        if router is None or caps is None or not caps.enabled:
+            return False
+        project, brief = self._delegation_needs(text)
+        if project is None and not brief:
+            # 模型说「这不是委派」或抽不出任何东西 —— 走它自己那条路
+            # （记事 / 提问 / 能力问答）。
+            return False
+        if project is not None and brief:
+            # 两样都有 —— 也**先复述**，不直接建。
+            self._pending_delegate = (project, brief)
+            self._say("我理解你要的是：")
+            self._say(f"  项目：{project}")
+            self._say(f"  做的事：{brief}")
+            self._say("对的话回「确认」，要改说法就直接说新的。")
+            return True
+        return self._ask_delegation_parts(brief)
+
+
+    def _delegation_needs(self, text: str) -> tuple[str | None, str]:
+        """这句话里能抽出 ``(项目, 需求)`` 吗？抽不出就 ``(None, ...)``。
+
+        **交给模型抽结构**（``LLMProvider.parse_delegation``），不用规则剥。
+
+        ## 为什么不用规则剥（第一版就是这么写的，错了）
+
+        第一版是「剥掉项目名与一串动词，剩下的就是要做的事」。实测两处出错：
+
+        - 「帮我改一下 README」剥出**空串** —— 需求整个丢了
+        - 「把 greet 函数改成返回你好」剥成「greet 函数返回你好」——
+          **动作被当成噪声删掉了**，而动词正是要执行的那部分
+
+        规则只在写表的人和用户说同一句话时成立。结构化抽取交给模型，
+        它保留了动词（实测 brief 原样是「把 greet 函数改成返回你好」）。
+
+        ## 项目名必须原样取自授权清单
+
+        ``parse_delegation`` 内部按闭集校验，自创名字被丢弃。而抽取不出
+        项目时**不挑一个最像的** —— 挑错的代价是**在错误的仓库里动手**。
+        """
+        caps = self.app.chat.capabilities
+        if caps is None or not caps.enabled:
+            return None, ""
+        try:
+            got = self.app.llm.parse_delegation(text, caps.labels())
+        except Exception:
+            return None, ""
+        if not got or not got.is_delegation:
+            return None, ""
+        project = got.project or None
+        return project, (got.brief or "")
+
+    def _ask_delegation_parts(self, brief: str) -> bool:
+        """缺要件 —— 问清楚，**不建**。"""
+        caps = self.app.chat.capabilities
+        assert caps is not None
+        if brief:
+            self._pending_delegate = (None, brief)
+            self._say(f"要改什么？「{brief}」是要做的事，还是项目名？")
+            self._say("一句话说完就行，例如「FreeAgent 的 README 加一行说明」。")
+            return True
+        self._pending_delegate = (None, "")
+        self._say(
+            "要用 opencode 改哪个项目？现在授权的是："
+            + "、".join(caps.labels())
+        )
+        self._say("说一句「改 <项目名> <要做的事>」就行。")
+        return True
+
+    def _resume_delegation(self, line: str) -> bool:
+        """用户补上了缺的那半句 —— 复述一遍，**要他确认**。
+
+        ## 确认卡在这里，不在后面
+
+        闸门（授权卡）管的是「执行器每动一次要不要批」。而**这一步**管的是
+        「这件事到底是不是你要的」。两道是不同的东西：前者在链路上，后者
+        在链路上**之前**。少了它，一张张授权卡批下去，批的是一份猜出来的
+        简报。
+        """
+        prior_project, prior_brief = self._pending_delegate
+        self._pending_delegate = None
+
+        project, brief = self._delegation_needs(line)
+        project = project or prior_project
+        brief = brief or prior_brief
+
+        if project is None:
+            caps = self.app.chat.capabilities
+            self._say("项目还是不知道叫哪个。现在授权的是："
+                      + "、".join(caps.labels() if caps else ()))
+            return True
+        if not brief:
+            self._pending_delegate = (project, "")
+            self._say(f"「{project}」——要改什么？一句话说清就行。")
+            return True
+
+        # **复述，不是新建。** 用户确认后才落库。
+        self._pending_delegate = (project, brief)
+        self._say("我理解你要的是：")
+        self._say(f"  项目：{project}")
+        self._say(f"  做的事：{brief}")
+        self._say("对的话回「确认」，要改说法就直接说新的。")
+        return True
+
+    def _confirm_delegation(self) -> bool:
+        """确认落库 —— 走 :meth:`_create_delegation`，与命令同一条路。"""
+        project, brief = self._pending_delegate or (None, "")
+        self._pending_delegate = None
+        if not project or not brief:
+            self._say("要确认的东西不完整，重新说一句「改 <项目> <要做的事>」。")
+            return True
+
+        role_name = self._default_role_name()
+        task, err, role, by_default = self._create_delegation(
+            project, role_name, brief
+        )
+        if err:
+            self._say(f"[拒绝] {err}")
+            return True
+
+        self._say(f"已建委派事务 {task.id[:8]}")
+        self._say(f"  项目：{task.project_path}")
+        self._say(f"  脉络：{role.name}" + ("（默认第一条）" if by_default else ""))
+        self._say("")
+        self._say("它现在是「待办」，执行器不会碰它 —— 这是第三道闸门。")
+        self._say(f"确认要派：/start {task.id[:8]}")
+        if not by_default:
+            self._say("（之后每一步它还会发卡问你批不批 —— 那是第四道闸门。）")
+        return True
+
+    def _default_role_name(self) -> str:
+        roles = self.app.roles.list_roles()
+        return roles[0].name if roles else ""
 
     # -- 自然语言建事务 ----------------------------------------------------- #
     def _create(self, text: str, kind: str, role_names: list[str]) -> None:
@@ -1064,43 +1234,64 @@ class Repl:
             return
         self._create(desc, "action", [role_name])
 
-    def _cmd_delegate(self, args: list[str]) -> None:
-        """建一条**委派**事务：交给 opencode 在指定项目里完成。
+    def _create_delegation(
+        self, raw_project: str, role_name: str, requirement: str
+    ):
+        """委派事务的**唯一**创建入口。命令与自然语言都走它。
 
-        刻意放在终端而不是界面上。委派链路的终点是本地代码执行，
-        所以「谁能创建委派」必须是显式动作，而不是表单里的一个字段。
+        ## 为什么不写两份
+
+        白名单闸门、脉络归属、``delegate_chat_id`` / ``delegate_requested_by``
+        的来源——每一条都是**安全或闭环**的一部分。抄第二份就等于给其中
+        一条漏掉的路径开了个口子。所以 :meth:`_cmd_delegate` 与自然语言那条
+        都在这里汇合。
+
+        返回 **4 元组** ``(task, err, role, by_default)``：成功时后两项有值，
+        失败时前两项有值。**四个位置在两条路上都要填** —— 少填一个，
+        走那条路的调用方就会在解包时炸，而那恰恰是最该被测的错误路径
+        （实测：「白名单外的项目被拒」那条测试就是这么红的）。
+
+        **不抛异常** —— 调用点是「说一句话」，抛异常会变成一句没人懂的栈。
         """
         from ..services.delegate import check_project_allowed
         from ..services.opencode_projects import authorized_names
 
-        raw_project, role_name, requirement = parse_delegate_args(args)
-        if not raw_project or not role_name or not requirement:
-            self._usage("/delegate")
-            self._say(
-                "格式：/delegate <项目绝对路径> | <角色> | <需求>\n"
-                "例：  /delegate D:/proj/myapp | 工作项目A | 加个邮箱登录\n"
-                "（`|` 只是分隔符，敲不敲都行；也可用空格分隔）"
-            )
-            return
-
+        caps = self.app.chat.capabilities
+        policy = self.app.config.delegate_policy()
         try:
-            policy = self.app.config.delegate_policy()
             project = check_project_allowed(
                 policy, raw_project,
                 # 只列**已授权**的项目名：列未授权的会让人去试、然后撞闸门，
                 # 而撞闸门的感觉是「这功能坏了」。
                 known_names=authorized_names(policy.projects),
+                # 项目**名**也认 —— 译出来的路径照常过白名单，准入权不变
+                # （见 services/delegate.py 里 aliases 的说明）。
+                aliases=tuple(zip(
+                    caps.labels() if caps else (),
+                    caps.projects if caps else (),
+                )),
             )
         except FreeAgentError as exc:
-            self._say(f"[拒绝] {exc}")
-            return
+            return None, str(exc), None, False
+
         role = self._match_role(role_name)
         if role is None:
-            self._say(
-                f"没有叫「{role_name}」的脉络。委派要归属到已有脉络，"
-                "先 /role-add 建一个。"
-            )
-            return
+            # 自然语言那句「没说归属哪条脉络」不该逼用户去 /role-add ——
+            # 有第一条就用它，并在回话里说清用了哪条。
+            existing = self.app.roles.list_roles()
+            if role_name and len(existing) > 1:
+                return None, (
+                    f"「{role_name}」不是现有脉络。你有：" +
+                    "、".join(r.name for r in existing)
+                ), None, False
+            if not existing:
+                return None, (
+                    "还没有任何脉络，委派需要归属到一条 —— 先 /role-add 建一个。"
+                ), None, False
+            role = existing[0]
+            chosen_by_default = True
+        else:
+            chosen_by_default = False
 
         task = self.app.tasks.create(
             requirement,
@@ -1121,9 +1312,40 @@ class Repl:
                 if self.channel_ctx else None
             ),
         )
+        return task, None, role, chosen_by_default
+
+    def _cmd_delegate(self, args: list[str]) -> None:
+        """建一条**委派**事务：交给 opencode 在指定项目里完成。
+
+        刻意放在终端而不是界面上。委派链路的终点是本地代码执行，
+        所以「谁能创建委派」必须是显式动作，而不是表单里的一个字段。
+        """
+        from ..services.delegate import check_project_allowed
+        from ..services.opencode_projects import authorized_names
+
+        raw_project, role_name, requirement = parse_delegate_args(args)
+        if not raw_project or not role_name or not requirement:
+            self._usage("/delegate")
+            self._say(
+                "格式：/delegate <项目名或绝对路径> | <角色> | <需求>\n"
+                "例：  /delegate myapp | 工作项目A | 加个邮箱登录\n"
+                "（`|` 只是分隔符，敲不敲都行；也可用空格分隔）\n"
+                "项目名指你在设置里授权过的那些（" +
+                "、".join(self.app.chat.capabilities.labels()
+                          if self.app.chat.capabilities else ()) + "）"
+            )
+            return
+
+        task, err, role, by_default = self._create_delegation(
+            raw_project, role_name, requirement
+        )
+        if err:
+            self._say(f"[拒绝] {err}")
+            return
+
         self._say(f"已建委派事务 {task.id[:8]}")
-        self._say(f"  项目：{project}")
-        self._say(f"  脉络：{role.name}")
+        self._say(f"  项目：{task.project_path}")
+        self._say(f"  脉络：{role.name}" + ("（你没指定，用的第一条）" if by_default else ""))
         self._say("")
         self._say("它现在是「待办」，执行器不会碰它。")
         self._say(f"确认要派的话：/start {task.id[:8]}")

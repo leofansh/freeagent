@@ -11,6 +11,7 @@ import re
 from typing import Sequence
 
 from .provider import (
+    DelegationIntent,
     KIND_ACTION,
     KIND_REMINDER,
     KIND_WAIT,
@@ -175,6 +176,20 @@ class RuleBasedProvider:
         返回 ``None`` 让上层走它自己那条路，所以离线/降级时行为完全不变。
         """
         return None
+
+    def parse_delegation(
+        self, text: str, known_projects: Sequence[str]
+    ) -> DelegationIntent:
+        """规则实现**不抽**，如实说「不是委派」。
+
+        与 :meth:`select_view` 同一条理由：那份「剥动词猜需求」的实现
+        实测必然出错（「帮我改一下 README」剥出空的，「把 greet 改成
+        返回你好」剥丢了动作）。而**猜错项目的代价是在错误的仓库里动手**。
+
+        返回 ``is_delegation=False`` 时上层照旧走它自己那条路
+        （记事 / 追问），所以离线或降级时行为与从前逐字一致。
+        """
+        return DelegationIntent()
 
     def _infer_kind(self, text: str) -> str:
         lowered = text.lower()
