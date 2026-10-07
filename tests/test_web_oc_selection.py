@@ -228,3 +228,131 @@ def test_no_endpoint_accepts_credentials(wired):
     assert "/config/providers" not in source.replace(
         "``/config/providers``", ""), "别去读那个会泄露明文 key 的端点"
     assert "api_key" not in source and "API_KEY" not in source
+
+
+# ── 前端：派发接线 ──────────────────────────────────────────────────── #
+
+def test_dispatch_view_is_actually_reachable():
+    """``ocDispatchView`` 必须**被调用** —— 定义了不等于接线了。
+
+    第一版写完这个函数就去做别的了，它一次都没被调用，于是页面上只有
+    选择、没有「开始」。这类漏最安静：JS 语法合法、端点齐全、全绿。
+    """
+    js = __import__("pathlib").Path(
+        "src/freeagent/web/js_oc_selection.py").read_text(encoding="utf-8")
+    body = js.split('JS_OC_SELECTION = r"""')[1]
+    assert "function ocDispatchView(" in body
+    assert "ocDispatchView(data, root)" in body, "定义了却从没被调用"
+
+
+def _js_onscreen_text() -> str:
+    """JS 里**真正上屏**的部分：剥掉注释。
+
+    刻意剥注释再断言，而不是对整个文件下绝对判据 —— 注释里用 ``**`` 强调
+    是**合理的**（那是给人读的中文说明），而只有字符串里的会显示成星号。
+    第一版就是「整个文件不许有 ``**``」，结果注释里的中文说明把自己的测试
+    判红了 —— 判据错了，红的也是错的。
+
+    剥 ``//`` 时跳过前面是 ``:`` 的那种（``https://…``），否则将来谁在
+    提示里写个链接就会误报。
+    """
+    import re
+
+    js = __import__("pathlib").Path(
+        "src/freeagent/web/js_oc_selection.py").read_text(encoding="utf-8")
+    body = js.split('JS_OC_SELECTION = r"""')[1]
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    body = re.sub(r"(?<!:)//[^\n]*", "", body)
+    return body
+
+
+def test_hint_text_has_no_markdown_emphasis():
+    """``hint`` 元素**不解析 markdown**，只认 HTML。
+
+    所以 ``**这样**`` 会原样显示成星号 —— 而星号在界面上看起来像乱码。
+    这条断言的原因是我**已经犯过两次**：第一次在说明文字里，第二次在
+    派发卡的提示里，都是写的时候顺手用了 markdown 习惯。
+
+    真需要强调就用 ``<strong>`` —— 那个确实生效（同一个页面上「配置与试验」
+    就是靠它加粗的）。
+    """
+    onscreen = _js_onscreen_text()
+    assert "**" not in onscreen, (
+        "上屏文本里出现了 ** —— hint 不解析 markdown，会显示成字面星号。"
+        "要强调请用 <strong>。"
+    )
+
+
+def test_emphasis_actually_uses_strong():
+    """反向确认：确实有地方用 ``<strong>``，否则上面那条可能是「因为没人强调」。"""
+    assert "<strong>" in _js_onscreen_text()
+
+
+def test_python_user_facing_strings_have_no_markdown():
+    """Python 侧上屏文案也不许有 ``**`` —— **同一个 bug 的第三个来源**。
+
+    界面不解析 markdown（只认 HTML），所以任何**会显示给用户**的字符串里
+    写 ``**这样**``，用户看到的就是字面星号。
+
+    这条判据用 AST 区分「docstring」与「真字符串」：docstring 与注释是给
+    开发者读的、在那儿用 ``**`` 强调是**合理的**；而字面量是要上屏的。
+
+    加上这条的原因：这个 bug 我犯了三次 —— 前两次在 JS 字符串里
+    （``test_hint_text_has_no_markdown_emphasis`` 已钉住），第三次在
+    Python 端点返回的 ``next`` 话术里，靠肉眼看截图才发现。
+    """
+    import ast
+
+    path = __import__("pathlib").Path(
+        "src/freeagent/web/endpoints_oc_selection.py")
+    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+
+    # 收集所有 docstring 的节点 id：它们是「说明」而不是「上屏文案」。
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant):
+            continue
+        if not isinstance(node.value, str) or id(node) in docstrings:
+            continue
+        if "**" in node.value:
+            offenders.append(node.value[:60])
+
+    assert not offenders, (
+        "这些字符串会上屏但里面有 **（界面不解析 markdown）：\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_brief_must_be_single_line(wired):
+    """含换行的需求必须**在这里**被挡。
+
+    实测：opencode 看到换行就判定「复杂任务」，升级到它自己的强模型并
+    **无视** ``--model``，于是必然失败。那是 opencode 的行为，所以我们挡 ——
+    而且要挡在**建事务之前**，否则用户会拿到一条注定失败的委派。
+    """
+    with pytest.raises(FreeAgentError) as exc:
+        ep.oc_dispatch(_App(), {"brief": "第一行\n第二行",
+                                "project": "D:/p/freeagent"})
+    assert "一行" in str(exc.value)
+
+
+def test_empty_brief_is_rejected(wired):
+    with pytest.raises(FreeAgentError):
+        ep.oc_dispatch(_App(), {"brief": "  ", "project": "D:/p/freeagent"})
+
+
+def test_dispatch_without_project_says_so(wired):
+    """没选项目要说清，**不要**默默挑一个 —— 挑错的代价是在错误的仓库动手。"""
+    with pytest.raises(FreeAgentError) as exc:
+        ep.oc_dispatch(_App(), {"brief": "改点东西"})
+    assert "还没选项目" in str(exc.value)

@@ -147,6 +147,56 @@ function ocCurationView(curated, repaint) {
   return box;
 }
 
+function ocDispatchView(data, root, repaint) {
+  const box = el("div", "card");
+  box.innerHTML = '<div class="row1"><span class="title">要做什么</span>' +
+    '<span class="meta">建一条委派事务</span></div>';
+
+  const ta = el("textarea", "");
+  ta.id = "ocbrief";
+  ta.rows = 2;
+  ta.placeholder = "一句话说清，例如：把 README 的用法那节补上";
+  ta.style.width = "100%";
+  box.appendChild(ta);
+
+  const btn = el("button", "btn primary", "开始");
+  btn.id = "ocgo";
+  const note = el("div", "hint", "");
+  btn.addEventListener("click", () => {
+    const brief = ta.value.trim();
+    if (!brief) { toast("先说一句要做的事"); return; }
+    if (/[\r\n]/.test(brief)) {
+      // 服务端也会挡，但这里先说 —— 免得用户莫名其妙看到失败。
+      toast("需求要写成一行（换行会让 opencode 判成复杂任务然后失败）");
+      return;
+    }
+    btn.disabled = true;
+    api("/api/oc/dispatch", {
+      method: "POST",
+      body: JSON.stringify({ brief: brief, project: data.selection.project }),
+    }).then((r) => {
+      note.innerHTML = '<strong>已建好事务</strong>：' + esc(r.title) +
+        "（脉络：" + esc(r.role) + (r.role_by_default ? "，自动选的" : "") + "）" +
+        "<br>" + esc(r.next);
+      ta.value = "";
+      btn.disabled = false;
+      toast("已建好事务");
+    }, (e) => {
+      note.innerHTML = '<span class="log-err">' + esc(e.message) + "</span>";
+      btn.disabled = false;
+    });
+  });
+  box.appendChild(btn);
+  box.appendChild(note);
+
+  box.appendChild(el("div", "hint",
+    "<strong>建了事务 ≠ 已经在跑。</strong> 执行器是独立进程，只跑「已确认且已 /start」" +
+    "的事务 —— 所以建好之后还要两步（上面会写出来）。<br>" +
+    "opencode 每要动手一次，仍然会在<strong>飞书</strong>给你一张授权卡。" +
+    "代码不该在你没点过的情况下动。"));
+  return box;
+}
+
 function renderOcSelection(data, root) {
   // **清空再画**。刻意不在这里清 —— 调用方 :func:`loadOcSelection` 会清，
   // 而清单的 repaint 回调也走它，所以只有一个地方负责清。
@@ -206,6 +256,9 @@ function renderOcSelection(data, root) {
 
   paint(data.selection);
   root.appendChild(card);
+
+  // 派发卡紧跟选择卡 —— 顺序就是操作顺序：先定「用哪个」，再说「做什么」。
+  root.appendChild(ocDispatchView(data, root));
 
   root.appendChild(ocCurationView(data.curated, () => loadOcSelection(root)));
 

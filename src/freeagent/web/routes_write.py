@@ -105,6 +105,14 @@ def dispatch_post(
             app, read_body()
         )
 
+    if parts == ["api", "oc", "dispatch"]:
+        # **建委派事务** —— 终点是本地代码执行，所以它必须走
+        # Repl._create_delegation（白名单闸门在那儿），而不是网页自己拼一条
+        # ``/delegate`` 文本命令。只走 POST。
+        return HTTPStatus.CREATED, endpoints_oc_selection.oc_dispatch(
+            app, read_body()
+        )
+
     if len(parts) == 4 and parts[:2] == ["api", "task"]:
         action = parts[3]
         # 白名单在这里查，不在端点里：动作名是 URL 的一部分，

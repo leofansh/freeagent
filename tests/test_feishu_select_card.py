@@ -156,6 +156,31 @@ def test_pagination_shown_only_when_needed(opts):
     assert all(el["tag"] != "note" for el in single["elements"])
 
 
+def test_pagination_boundary_is_page_size():
+    """清单 ≤ 每页数时**一次看完** —— 分页按钮与页码提示都不出现。
+
+    ## 这条为什么存在
+
+    「飞书模型卡要不要去掉分页」曾被我列成待办，依据是读了代码觉得
+    「清单大了用不着分页了」。但读代码不算证据：万一它是**无条件**渲染
+    的呢？而条件渲染这件事很容易在改动时被破坏（有人把 ``total_pages > 1``
+    去掉，或者换了个默认 page_size）。
+
+    实测确认了它本来就是条件渲染（1/5/12 个 → 无翻页，13 个 → 有），
+    所以**没有代码要改** —— 但边界值值得钉住，因为它正是「勾到第 13 个
+    模型那一刻」的体验变化点。
+    """
+    for n, want_nav in ((1, False), (12, False), (13, True), (85, True)):
+        many = [sel.Option(value=f"opencode/m{i}", label=f"M{i}")
+                for i in range(n)]
+        card = select_card("model", many, chat_id="oc_1",
+                           page_size=sel.MODEL_PAGE_SIZE)
+        has_nav = any(el["tag"] == "action"
+                      and el["actions"][0]["value"].get("nav")
+                      for el in card["elements"])
+        assert has_nav is want_nav, f"{n} 个模型时翻页={has_nav}，期望 {want_nav}"
+
+
 def test_out_of_range_page_is_clamped(opts):
     """页码来自飞书载荷，可伪造 —— 越界不能变成 IndexError。"""
     card = select_card("model", _many(30), chat_id="oc_1", page=999, page_size=12)
