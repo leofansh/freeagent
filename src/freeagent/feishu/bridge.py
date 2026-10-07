@@ -27,6 +27,8 @@ import re
 import socket
 import sys
 import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +52,8 @@ from .sender import (  # noqa: E402
     _decided_card,
     VIEW_CHOICE_ACTION,
     MENU_ACTION,
-  PLAN_CONFIRM_ACTION,
+    PLAN_CONFIRM_ACTION,
+    SELECT_ACTION,
     send_menu_card,
 )
 from .status import (
@@ -1015,6 +1018,12 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         if value.get("action") == PLAN_CONFIRM_ACTION:
             return _run_plan_confirm(value, who=who)
 
+        # **OpenCode 四段选择**：放在凭据流程之前（它无状态、不查库），
+        # 但排在 ``PLAN_CONFIRM_ACTION`` **之后** —— 两者 payload 形状
+        # 几乎一样（都是 action/choice/chat），先判更具体的那个。
+        if value.get("action") == SELECT_ACTION:
+            return _run_oc_select(value, who=who)
+
         credential = value.get("id")
         choice = value.get("action")
 
@@ -1196,13 +1205,14 @@ def _role_names() -> list[str]:
 def _menu_entries() -> list[tuple[str, str]]:
     """入口菜单项。
 
-    **刻意只4 项。** 选项越多越没人选（选择过载），而这四项覆盖了
+    **刻意只 5 项。**选项越多越没人选**（选择过载），而这五项覆盖了
     「我现在到底想干什么」的全部常见答案。每加一项都要问一句
     「真的会有人点它吗」。
     """
     return [
-        ("委派给 opencode", "delegate"),
-        ("我有哪些角色", "roles"),
+("委派给 opencode", "delegate"),
+            ("选项目/模型", "oc_select"),
+            ("我有哪些角色", "roles"),
         ("今天该做什么", "today"),
         ("我能做什么", "help"),
     ]
@@ -1249,6 +1259,22 @@ def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
         if not name:
             return _no_card_change("选项不完整，未处理")
         return _run_view_choice({"view": f"/role {name}", "chat": chat_id}, who=who)
+
+    if choice == "oc_select":
+        # 发第一段卡。**成功就一个字都不再说** —— 新卡就在下面，
+        # 再补一句「点一下就行」既教用户操作、又指向他已经在看的那张卡。
+        try:
+            _oc_send_stage("project", who=who, chat_id=chat_id, page=0)
+        except _NoOptions as exc:
+            return _card_action_response(
+                _decided_card("没有可选项", f"**{exc}**", granted=False),
+                "error", "没有可选项",
+            )
+        return _card_action_response(
+            _decided_card("已打开", "**选项目在下面**，选完会自动往下走。",
+                          granted=True),
+            "success", "已打开",
+        )
 
     # **从这一行往下，查的是 :func:`_menu_dispatch` 那张表**——
     # 与打字路径同一个来源（设计文档 12.1.3）。第一版这里写的是自己的
@@ -1428,6 +1454,10 @@ def _menu_dispatch(choice: str) -> dict[str, Any]:
         return {"roles": True}
     if choice == "delegate":
         return {"text": _menu_delegate_text()}
+    # 四段选择：``oc`` 键是新形态，``_run_menu`` 里单独处理并**立刻返回** ——
+    # 它要发的是「一串卡」，不是「一段文本」，所以不能落进下面那两个分支。
+    if choice == "oc_select":
+        return {"oc": True}
     return {}
 
 
@@ -1445,6 +1475,314 @@ def _menu_delegate_text() -> str:
         f"`/delegate <项目绝对路径> | {role} | <要做的事，一句话>`\n\n"
         "两处要换：项目路径得在 `config.json` 的 `delegate.projects` 白名单里；"
         "需求写成**单行**（换行会被 opencode 判成复杂任务而失败）。"
+    )
+
+
+# ── OpenCode 四段选择（项目 / 工作模式 / 模型 / 推理档）───────────────── #
+#
+# 飞书**没有下拉框**，所以 Desktop 那三个下拉只能拆成四段按钮卡。
+# 拆分带来三件事，全在这一段里：
+#   1. 查选项      → :mod:`services.oc_selection`（**唯一的过滤真源**）
+#   2. 发下一张卡  → :func:`sender.send_select_card`
+#   3. 记住选了什么 → :func:`services.oc_selection.save_selection`
+#
+# 刻意**不**查库、不发审批凭据 —— 与 :data:`VIEW_CHOICE_ACTION` /
+# :data:`MENU_ACTION` 同族：选择是「点一下就生效」的即时动作，没有
+# 「过期即拒」的安全含义。混进凭据流程是错配（那套机制是为**授权**设计的）。
+
+
+def _oc_options(stage: str) -> tuple[list[Any], str]:
+    """某一阶段的选项。**返回 ``(选项, 提示语)``**。
+
+    失败时返回 ``([], 原因)`` —— 理由是**用户必须看到真实原因**，
+    而不是一张空卡。实测踩过：过滤规则写错时症状是「选项一个都没有」，
+    而那句话可以被解读成「没有可选的项目」，于是往错的方向查。
+    """
+    from ..services import oc_selection as sel
+
+    if stage == "project":
+        rows = _oc_snapshot().projects
+        if rows is None:
+            return [], "查不到项目列表 —— OpenCode 没起来或读不到它的项目库。"
+        return sel.list_project_options(rows), ""
+    if stage == "agent":
+        rows = _oc_agents()
+        if rows is None:
+            return [], "查不到 OpenCode 的工作模式列表 —— OpenCode 没起来或版本不认。"
+        opts = sel.list_agent_options(rows)
+        return opts, "" if opts else "这台机器上没有可用的工作模式。"
+
+    # model 与 variant 都要 ``/provider``（实测 **6.7MB**），而两者读的是
+    # 同一份快照 —— 所以翻档位那一段不再付 7 秒。
+    if stage == "model":
+        payload = _oc_provider_payload()
+        if payload is None:
+            return [], "查不到模型列表 —— OpenCode 没起来或 /provider 不可用。"
+        opts = sel.list_model_options(
+            payload, provider_filter=sel.connected_providers(payload))
+        if not opts:
+            return [], "没有已连接凭据的 provider —— 先在 OpenCode 里登录一个。"
+        return opts, "免费模型排在前面。"
+
+    if stage == "variant":
+        current = _oc_load_selection()
+        if not current.model:
+            return [], "还没选模型 —— 先选模型再选推理档。"
+        payload = _oc_provider_payload()
+        if payload is None:
+            return [], "查不到推理档列表 —— OpenCode 的 /provider 不可用。"
+        opts = sel.variant_options(payload, current.model)
+        if len(opts) <= 1:
+            return opts, "这个模型没有可选推理档（用它的默认设置）。"
+        return opts, "「不指定」= 用模型自己的默认强度。"
+
+    return [], f"未知阶段：{stage}"
+
+
+def _oc_snapshot() -> "_OcSnapshot":
+    """一次 discovery，把**三份数据**都拿回来。缓存 30 秒。
+
+    ## 为什么必须合成一个快照
+
+    最初是三个各自带缓存的函数（``_oc_provider_payload`` /
+    ``_oc_agents`` / ``list_projects``），各起各的 opencode 进程。
+    实测冷启动四段要走一遍，于是**总计 20.6 秒**（6.6 + 6.9 + 7.1）
+    —— 用户点「选项目/模型」要等 20 秒才看到第四张卡。
+
+    根因不是缓存粒度，而是**缓存的切分维度错了**：三份数据来自**同一个**
+    进程、同一次启动，却分三次去要。合成一个快照后冷启动只起**一次**进程。
+
+    ## 30 秒的依据
+
+    够走完一整轮翻页（点四次「下一页」），又能在用户中途用 OpenCode
+    Desktop 登录了新 provider 之后**不用重启**就看到。不缓存则用户会
+    以为「我登录了但飞书里还是没有」。
+
+    ## 失败时哪些字段是 ``None``
+
+    刻意**逐项**记成败，而不是整体抛：一个 provider 登录失败不该让
+    「有哪些项目」也一起消失。``None`` 与 ``[]`` 有别 ——
+    ``None`` 是「查不到」（该说环境有问题），``[]`` 是「真的没有」。
+    混成一个空列表，两种症状长得一模一样。
+    """
+    global _OC_SNAPSHOT
+    now = time.monotonic()
+    if _OC_SNAPSHOT is not None and now - _OC_SNAPSHOT.at < _OC_SNAPSHOT_TTL:
+        return _OC_SNAPSHOT
+
+    snap = _OcSnapshot(at=now)
+    try:
+        with _oc_discovery() as oc:
+            try:
+                snap.projects = oc.list_projects()
+            except Exception:
+                log.exception("【选择】查项目失败")
+            try:
+                snap.agents = oc.list_agents()
+            except Exception:
+                log.exception("【选择】查工作模式失败")
+            try:
+                snap.providers = oc.list_models()
+            except Exception:
+                log.exception("【选择】查 provider 失败")
+    except Exception:
+        # 连服务都起不来：三份都没拿到。
+        log.exception("【选择】起 discovery 服务失败")
+    _OC_SNAPSHOT = snap
+    return snap
+
+
+@dataclass(slots=True)
+class _OcSnapshot:
+    """一次 discovery 的三份结果。字段为 ``None`` = 那次查询失败。"""
+
+    at: float
+    projects: list[dict[str, Any]] | None = None
+    agents: list[dict[str, Any]] | None = None
+    providers: dict[str, Any] | None = None
+
+
+_OC_SNAPSHOT: _OcSnapshot | None = None
+
+#: 快照有效期。理由见 :func:`_oc_snapshot`。
+_OC_SNAPSHOT_TTL = 30.0
+
+
+def _oc_provider_payload() -> dict[str, Any] | None:
+    """``GET /provider`` 的结果。**查不到返回 ``None``**（不是空字典）。"""
+    return _oc_snapshot().providers
+
+
+def _oc_agents() -> list[dict[str, Any]] | None:
+    """``GET /agent`` 的结果。**查不到返回 ``None``**（不是空列表）。
+
+    区分「查不到」与「一个都没有」很重要：前者是环境问题（OpenCode 没起来），
+    该说清原因；后者是真实状态，界面该显示「没有可用的工作模式」。
+    """
+    return _oc_snapshot().agents
+
+
+def _oc_discovery() -> Any:
+    """一个**只读发现**客户端。
+
+    刻意用 :meth:`OpenCodeServer.discovery` 而不是自己写 HTTP：认证、错误
+    处理、形状校验都在那个类里，这里复制的每一行都会漂移。
+
+    关键是它 **不隔离**（``isolate=False``）：项目注册表与 provider 的登录
+    状态都在你真实的配置目录里，而隔离实例把 ``HOME``/``XDG_*`` 全指向
+    一次性目录，于是它看到的是一个**空世界** —— ``/project`` 空、
+    ``connected`` 空。症状是「明明有 3 个项目、一个模型都没有」，而那会被
+    误读成「白名单没配 / 没登录」，于是往错的方向查。
+
+    只用于 GET。绝不用它发 prompt：那会让委派读到你的真实配置，而
+    :mod:`services.delegate` 的全部安全声明都建立在隔离之上。
+    """
+    from ..services.opencode_server import OpenCodeServer
+
+    return OpenCodeServer.discovery()
+
+
+def _oc_load_selection() -> Any:
+    from ..services.oc_selection import load_selection
+    return load_selection()
+
+
+def _oc_store(selection: Any) -> None:
+    from ..services.oc_selection import save_selection
+    try:
+        save_selection(selection)
+    except OSError:
+        log.warning("【选择】写选择失败", exc_info=True)
+
+
+class _NoOptions(Exception):
+    """这一段没有可选项。**带一句给用户看的原因**。"""
+
+
+def _oc_send_stage(stage: str, *, who: str, chat_id: str, page: int) -> str:
+    """发某一阶段的选择卡。**返回 message_id**（给上层回写旧卡）。"""
+    from ..services import oc_selection as sel
+    from .sender import send_select_card
+
+    options, note = _oc_options(stage)
+    if not options:
+        # 没有选项**不发明一张卡** —— 空卡让人以为「点了没反应」。
+        # 直接发文字说清原因。
+        raise _NoOptions(note or "这一段没有可选项。")
+    current = _oc_load_selection()
+    msg_id = send_select_card(
+        _card_sender, open_id=who, stage=stage, options=options,
+        chat_id=chat_id, page=page, page_size=sel.MODEL_PAGE_SIZE,
+        selected={
+            "project": current.project, "agent": current.agent,
+            "model": current.model, "variant": current.variant,
+        },
+        note=note,
+    )
+    return msg_id
+
+
+def _run_oc_select(value: dict[str, Any], *, who: str) -> dict[str, Any]:
+    """点了选择项 / 翻页 → 更新选择，发下一张卡。
+
+    与 :func:`_run_menu` 同构（发内容 + 收旧卡），但状态是**有**的：
+    选过的段落在 :class:`Selection` 里，于是「翻回去改前面那段」能工作
+    （改 project 会 :meth:`Selection.clear_from` 清掉下游）。
+
+    ## 为什么翻页不落状态
+
+    载荷里带了 ``page``，所以点「下一页」时桥接**不需要**知道「谁翻到第几页」。
+    落状态的做法在桥接重启、多端同时点、同会话两人操作时会错位，
+    而错位的表现是「点了 A 结果选了 B」。
+    """
+    from ..services import oc_selection as sel
+    from .sender import SELECT_STAGES
+
+    stage = str(value.get("stage") or "").strip()
+    chat_id = str(value.get("chat") or "").strip()
+    picked = value.get("value")
+    picked = "" if picked is None else str(picked)
+    try:
+        page = int(value.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    nav = bool(value.get("nav"))
+
+    if stage not in SELECT_STAGES:
+        return _no_card_change("不认识的选择步骤，未处理")
+    if _card_sender is None or _card_channel is None:
+        return _no_card_change("没连上通道，未处理")
+    # 白名单：**同一把尺子**，理由见 :func:`_run_menu` 里那段注释。
+    # 选择卡在群里也是全员可见的，不判就会向白名单外确认这里有个 bot。
+    if not _card_channel.is_allowed(who):
+        log.info("【选择】点击者不在白名单，不回话也不执行（who=%r）", who)
+        return _no_card_change("没权限，未处理")
+
+    selection = _oc_load_selection()
+
+    if nav:
+        # 翻页：**不改任何选择**，只重发那一页。
+        try:
+            _oc_send_stage(stage, who=who, chat_id=chat_id, page=page)
+        except _NoOptions as exc:
+            return _card_action_response(
+                _decided_card("没有可选项", f"**{exc}**", granted=False),
+                "error", "没有可选项",
+            )
+        return _card_action_response(
+            _decided_card("翻页", f"**第 {page + 1} 页在下面。**", granted=True),
+            "success", "翻页",
+        )
+
+    if not picked and stage != "variant":
+        # 值为空 = 用户想「这一段不选」。variant 段的空值是**合法选项**
+        # （「不指定，用模型基线」），所以那里不拦。
+        setattr(selection, stage, "")
+        selection.clear_from(stage)
+
+    elif picked:
+        # **必须校验值真的在选项里**。
+        # 载荷来自飞书，而飞书载荷**用户可以伪造**（转发卡片、手改 JSON）。
+        # 不校验就等于「任何人都能让机器人往任意目录委派」。
+        options, _ = _oc_options(stage)
+        allowed = {str(getattr(o, "value", "")) for o in options}
+        if picked not in allowed:
+            log.info("【选择】回传值不在选项内，丢弃（stage=%s value=%r）",
+                     stage, picked[:40])
+            return _no_card_change("这个选项已不可用，未处理")
+        setattr(selection, stage, picked)
+        selection.clear_from(stage)
+
+    _oc_store(selection)
+
+    # 下一步：variant 之后**没有下一段** —— 直接给摘要，让用户确认。
+    idx = SELECT_STAGES.index(stage)
+    if idx + 1 >= len(SELECT_STAGES):
+        summary = "\n".join(f"· {line}" for line in selection.describe())
+        try:
+            _card_sender.send_text(
+                chat_id,
+                "选好了：\n" + summary +
+                "\n\n要做的事直接发给我就行（例：把 README 的用法那节补上）。",
+            )
+        except Exception:
+            log.warning("【选择】摘要发不出去（chat=%s）", chat_id, exc_info=True)
+        return _card_action_response(
+            _decided_card("已选好", "**四段都选完了。**", granted=True),
+            "success", "已选好",
+        )
+
+    next_stage = SELECT_STAGES[idx + 1]
+    try:
+        _oc_send_stage(next_stage, who=who, chat_id=chat_id, page=0)
+    except _NoOptions as exc:
+        return _card_action_response(
+            _decided_card("没有可选项", f"**{exc}**", granted=False),
+            "error", "没有可选项",
+        )
+    return _card_action_response(
+        _decided_card("已记下", "**选好了，下面选下一项。**", granted=True),
+        "success", "已记下",
     )
 
 

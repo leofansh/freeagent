@@ -256,6 +256,16 @@ def _argv(policy: DelegationPolicy, brief: str, title: str) -> list[str]:
     argv = [policy.command, "run", brief, "--format", "json", "--title", title]
     if policy.model:
         argv += ["--model", policy.model]
+    if policy.agent:
+        argv += ["--agent", policy.agent]
+    # ``--variant`` **实测存在**（``opencode run --help``，1.18.34）：
+    # ``--variant`` "model variant (provider-specific reasoning effort,
+    # e.g., high, max, minimal)"。
+    #
+    # 刻意**不加** ``--thinking``：它是「显示思考过程」的 UI 开关，不是
+    # 推理强度开关。把它当推理用会得到「看起来在思考、实际强度没变」。
+    if policy.variant:
+        argv += ["--variant", policy.variant]
     return argv
 
 
@@ -808,7 +818,8 @@ def run_with_tool_gate(
     try:
         with make_server(project, policy.command) as oc:
             session_id = oc.create_session()
-            oc.prompt_async(session_id, brief, model=policy.model)
+            oc.prompt_async(session_id, brief, model=policy.model,
+                            agent=policy.agent, variant=policy.variant)
             for kind, props in oc.events():
                 if deadline is not None and now() > deadline:
                     handled.append(
@@ -1430,6 +1441,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖 opencode 用的模型。留空用它的默认。"
              "实测 *-free 那批不需要账户余额。",
     )
+    # ``--agent`` / ``--variant`` 与 ``--model`` 同族：三者都是「用哪个」。
+    # 合成一个 ``--use`` 看着更整齐，但 OpenCode 的载荷本来就是三个独立字段
+    # （OpenAPI ``UserMessage``），拆一次就多一处会漂移的地方。
+    parser.add_argument(
+        "--agent", default=None, metavar="工作模式",
+        help="覆盖 opencode 的工作模式（agent 名，如 "
+             "'Sisyphus - ultraworker'）。留空用它的默认。",
+    )
+    parser.add_argument(
+        "--variant", default=None, metavar="档位",
+        help="推理档位，如 high。留空=不施加 variant，用模型基线。"
+             "只有部分模型有档（实测 4300/8475），且 opencode **不校验**"
+             "错档也会返回 204，所以只给模型真有的档。",
+    )
     # 第三道闸门（执行期逐次授权）**默认开启**（设计文档 11.8.1）。
     #
     # 为什么翻过来：闸门的默认值决定的是**失效方向**。默认关 = 忘了加旗标
@@ -1547,9 +1572,19 @@ def main(argv: list[str] | None = None) -> int:
 
     def once() -> DispatchReport:
         policy = None
-        if args.model is not None:
+        if args.model is not None or args.agent is not None \
+                or args.variant is not None:
             base = _delegate_policy(build_app(args.db))
-            policy = replace(base, model=args.model)
+            # 只覆盖**真的给了**的那些 —— ``--agent A`` 不该顺手把配置里的
+            # model 抹成默认。逐个判而不是 ``if any(...)`` 之后一起 replace。
+            overrides = {}
+            if args.model is not None:
+                overrides["model"] = args.model
+            if args.agent is not None:
+                overrides["agent"] = args.agent
+            if args.variant is not None:
+                overrides["variant"] = args.variant
+            policy = replace(base, **overrides)
         # ``--dry-run`` 不碰闸门：预演的意义是「看看会派什么」，
         # 而闸门要发卡、要人点 —— 在这里发卡会让预演变成一次真请求。
         gate = None if args.dry_run else build_real_gate()

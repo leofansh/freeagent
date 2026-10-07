@@ -83,7 +83,10 @@ class _FakeServer:
     def create_session(self) -> str:
         return "ses_fake"
 
-    def prompt_async(self, session_id, brief, *, model="", directory=None) -> None:
+    def prompt_async(self, session_id, brief, *, model="", agent="",
+                       variant="", directory=None) -> None:
+        # agent / variant：飞书四段选择接进来的（2026-10-07），
+        # 签名跟 :meth:`OpenCodeServer.prompt_async` 走。
         pass
 
     def events(self, **kw):

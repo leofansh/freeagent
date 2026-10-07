@@ -14,6 +14,7 @@ from freeagent.services.opencode_projects import (
     _basename,
     _parse,
     list_projects,
+    reset_cache,
     resolve,
 )
 
@@ -157,3 +158,97 @@ def test_happy_path_via_runner():
     got = list_projects(runner=_runner(ROWS))
     assert len(got) == 3
     assert {p.display for p in got} == {"FreeAgent", "OpenMOS", "XiaoYuan"}
+
+
+# --------------------------------------------------------------------------- #
+# 结果缓存
+#
+# 为什么这组测试重要：``GET /project`` 实测**每次 5.7 秒**（要起一个
+# opencode 进程）。而这条路径在**每条飞书消息**上都会被走到 —— 不缓存的话
+# 发一句话要等 6 秒才有回音。第一版没缓存，全量测试也因此超时 30 分钟。
+# --------------------------------------------------------------------------- #
+
+class _FakeDiscovery:
+    """假 discovery 客户端。数着被开了几次。"""
+
+    calls = 0
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __enter__(self):
+        type(self).calls += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def list_projects(self):
+        return self.rows
+
+
+@pytest.fixture
+def counted(monkeypatch):
+    """装上假 discovery，并在每个测试前后清缓存。"""
+    reset_cache()
+    _FakeDiscovery.calls = 0
+    monkeypatch.setattr(
+        "freeagent.services.opencode_server.OpenCodeServer.discovery",
+        classmethod(lambda cls, **kw: _FakeDiscovery(RAW_ROWS)),
+    )
+    yield
+    reset_cache()
+
+
+RAW_ROWS = [
+    {"worktree": "D:/PycharmProjects/freeagent", "name": "FreeAgent"},
+    {"worktree": "D:/PycharmProjects/openmos", "name": "OpenMOS"},
+]
+
+
+def test_second_call_is_served_from_cache(counted):
+    assert len(list_projects()) == 2
+    assert len(list_projects()) == 2
+    assert _FakeDiscovery.calls == 1, "第二次不该再起 opencode"
+
+
+def test_reset_cache_forces_a_requery(counted):
+    list_projects()
+    reset_cache()
+    list_projects()
+    assert _FakeDiscovery.calls == 2, "reset_cache 之后必须真查"
+
+
+def test_runner_path_never_caches(counted):
+    """测试路径每次都要真跑 —— 缓存会让「同参数两次调用」看起来像幂等。"""
+    list_projects(runner=_runner(ROWS))
+    list_projects(runner=_runner(ROWS))
+    assert _FakeDiscovery.calls == 0
+
+
+def test_failure_is_not_cached(counted):
+    """一次偶发失败不该被记住 30 秒。
+
+    症状是「刚才还好的，现在一直说没有项目」而查不出原因 ——
+    因为真实原因（那次起不来）已经被缓存覆盖掉了。
+    """
+    def boom(**kw):
+        raise RuntimeError("opencode 没起来")
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(
+        "freeagent.services.opencode_server.OpenCodeServer.discovery",
+        classmethod(lambda cls, **kw: boom()),
+    )
+    try:
+        assert list_projects() == []
+        assert list_projects() == []
+        assert _FakeDiscovery.calls == 0
+    finally:
+        monkey.undo()
+
+
+def test_cached_result_is_a_copy(counted):
+    """返回的是**副本**：调用方改了它不该污染缓存。"""
+    first = list_projects()
+    first.clear()
+    assert len(list_projects()) == 2

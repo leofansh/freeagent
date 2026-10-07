@@ -57,6 +57,21 @@ class DelegationPolicy:
     #: 402 失败。所以默认留空，用 opencode 的默认（它会挑能用的），
     #: 而要指定就用 ``*-free`` 那批 —— 实测它们不需要余额。
     model: str = ""
+    #: 用哪个**工作模式**（opencode 的 agent）。**空 = 用 opencode 自己的默认**。
+    #:
+    #: 与 :attr:`model` 分开存而不是合成一个字符串，因为它们在 OpenCode 的
+    #: 载荷里是**两个字段**：``{"agent": "Sisyphus - ultraworker",
+    #: "model": {"providerID": ..., "modelID": ...}}``（取自 OpenAPI 的
+    #: ``UserMessage``）。合成一个字段就得在发送时再拆，而拆的那一步
+    #: 迟早会与 OpenCode 的字段名漂移。
+    agent: str = ""
+    #: 推理档位。**空 = 不施加 variant，用模型基线**。
+    #:
+    #: 刻意不给「high」默认值：实测 4300/8475 个模型带 variants，且**没有一个
+    #: 带 ``default`` 档** —— 所以「不指定」不是「落到某个默认」，而是「不施加」。
+    #: 而错配的代价是 OpenCode **不校验**（实测错误 variant 也返回 204），
+    #: 于是「推理档选了 High 却没生效」这件事极难排查。
+    variant: str = ""
     #: 单次执行超时（秒）。opencode 改一个功能可能要很久，但不该无限等。
     timeout: float = 1800.0
 
@@ -66,7 +81,11 @@ class DelegationPolicy:
 
 
 def check_project_allowed(
-    policy: DelegationPolicy, raw: str, *, known_names: Sequence[str] = ()
+    policy: DelegationPolicy,
+    raw: str,
+    *,
+    known_names: Sequence[str] = (),
+    aliases: Sequence[tuple[str, str]] = (),
 ) -> Path:
     """校验项目路径在白名单里，返回**规范化**后的绝对路径。
 
@@ -77,11 +96,23 @@ def check_project_allowed(
     3. **必须落在某个白名单目录内** —— 用 ``resolve`` + ``relative_to`` 判断，
        不用字符串前缀（``/data/proj`` 会匹配 ``/data/project-x``）
 
-    ## ``known_names`` 是**提示**，不是准入
+    ## 名字**能**用了，但准入权仍在白名单
 
-    它只出现在错误文案里，用来告诉用户「可以填这些名字」。它**不参与**任何
-    判定：准入只看 ``policy.projects``。这一点必须写死—— 一旦让提示里的
-    名字影响到放行，白名单就成了摆设。
+    原先这里只有 ``known_names``（只给错误文案用），而文案却写着「可以用
+    项目名代替路径」—— **提示在撒谎**：实测 ``/delegate FreeAgent | …``
+    直接被拒（"项目路径必须是绝对路径"）。
+
+    所以加了 ``aliases``：``(名字, 路径)`` 序列，用它把名字**翻译成**路径，
+    翻译完**照常走下面那三层校验**。
+
+    ## 为什么这不新增准入面
+
+    关键在于：``aliases`` 只提供**候选路径**，不提供**放行**。译出来的路径
+    仍然要与 ``policy.projects`` 比对 —— 一个指向白名单外的别名照样被拒
+    （实测过 ``("Evil", r"C:\\Windows")``，第 3 层拦下）。
+
+    也就是说 ``aliases`` 的作用只是**省掉用户手打绝对路径**，
+    而白名单仍是唯一权威。谁在调用它、由谁构造，都不改变这一点。
 
     刻意做成**入参**而不是在这里调 ``opencode db``：这个函数是闸门，
     闸门里不该有一个会起子进程的调用（慢、且失败方式会变得不可预测）。
@@ -98,6 +129,13 @@ def check_project_allowed(
             "要委派到哪个项目？给一个绝对路径。"
             + _names_hint(known_names)
         )
+
+    # 先把**名字**翻成路径。翻完照常往下走 —— 白名单仍是唯一权威。
+    if not Path(text).is_absolute():
+        for name, path in aliases:
+            if name.casefold() == text.casefold():
+                text = str(path)
+                break
 
     candidate = Path(text)
     if not candidate.is_absolute():

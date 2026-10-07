@@ -300,9 +300,21 @@ class Config:
         ``services.delegate`` 才是那个策略类型的定义处。
         """
         from .services.delegate import DelegationPolicy
+        from .services.oc_selection import load_selection
 
+        # 飞书四段选择（项目/工作模式/模型/推理档）的结果。
+        #
+        # 刻意**只取模型与档位，不取项目** —— 项目仍走 ``projects`` 白名单
+        # 那一道闸门。把选择的项目直接当准入依据等于开第二个口子：
+        # 那个值来自飞书载荷（可伪造），而白名单是配置里写死的。
+        # 项目已经在 :func:`services.delegate.check_project_allowed` 里被
+        # 白名单校验过一遍，这里再放一次没有意义，只有风险。
+        selection = load_selection(self.home)
         return DelegationPolicy(
-            projects=self.delegate_projects, model=self.delegate_model
+            projects=self.delegate_projects,
+            model=self.delegate_model or selection.model,
+            agent=selection.agent,
+            variant=selection.variant,
         )
 
 

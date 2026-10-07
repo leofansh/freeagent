@@ -35,3 +35,9 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
 filterwarnings = ["error"]
+# ``live``：要真起 opencode 的测试。默认**跑**（本机有就该验），
+# 而 ``--fast`` 之外无跳过开关 —— 刻意不给「一键跳过真机验证」的旗标：
+# 那会让「variant 放错层级」这种静默 bug 悄悄溜过去（实测就溜过一次）。
+markers = [
+  "live: 需要真起 opencode 的测试（起进程约 6 秒/次）",
+]

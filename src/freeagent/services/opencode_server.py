@@ -371,12 +371,14 @@ class OpenCodeServer:
         port: int | None = None,
         startup_timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
+        isolate: bool = True,
     ) -> None:
         self._project = pathlib.Path(project)
         self._exe = executable
         self._port = port or free_port()
         self._startup_timeout = startup_timeout
         self._extra_env = dict(extra_env or {})
+        self._isolate = isolate
         self._proc: Any = None
         self._home: pathlib.Path | None = None
         self._password = uuid.uuid4().hex
@@ -388,6 +390,8 @@ class OpenCodeServer:
 
     # -- 生命周期 -------------------------------------------------------- #
     def start(self) -> "OpenCodeServer":
+        if not self._isolate:
+            return self._start_unisolated()
         self._home = pathlib.Path(tempfile.mkdtemp(prefix="freeagent-oc-"))
         cfg_dir = self._home / "opencode"
         cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -407,19 +411,75 @@ class OpenCodeServer:
             },
         )
 
-        # 进程组参数**两个平台不同**（Windows 要 creationflags、POSIX 要
-        # start_new_session）。刻意用显式分支而不是
-        # ``**({"creationflags": f} if win else {"start_new_session": True})``：
-        # 后者两个分支的**值类型不同**，类型检查器会把整个 dict 推成
-        # ``int | bool``，于是 Popen 的每个参数都报「int 不能赋给 bool」——
-        # 12 条假错误淹掉真错误。踩过，故留此注记。
+        # 进程组参数与 ``--hostname`` 的理由见 :meth:`_popen`（两个入口共用它，
+        # 免得「回环 + 独立进程组」这两条安全属性在一个入口里漏掉）。
+        self._proc = self._popen(env)
+
+        if not self._wait_ready():
+            self.close()
+            raise ServerError(
+                f"opencode 服务没在 {self._startup_timeout:g}s 内就绪"
+                f"（端口 {self._port}）"
+            )
+        return self
+
+    def _start_unisolated(self) -> "OpenCodeServer":
+        """起一个**看得见真实配置**的服务。只给「发现」用（见 :meth:`discovery`）。
+
+        ## 为什么需要这一条
+
+        :func:`freeagent.services.opencode_projects.list_projects` 与四段选择
+        都要问 OpenCode「有哪些项目 / 哪些模型 / 哪些 Agent」，而那些答案
+        **只存在于你真实的配置里**：
+
+        - 项目注册表在 ``%USERPROFILE%\\.local\\share\\opencode\\opencode.db``
+        - provider 的登录状态在真实配置目录的 auth 文件里
+
+        隔离实例把 ``HOME`` / ``XDG_*`` 全指向一次性目录，于是它**看到的是
+        一个空世界**：``/project`` 返回空数组、``connected`` 为空。症状是
+        「明明有 3 个项目，界面说一个都没有」—— 而那被误读成
+        「白名单没配」，于是往错的方向查（实测踩过：
+        ``tests/test_opencode_projects_live.py`` 就是这么红的）。
+
+        ## 边界：只读，且不写任何配置
+
+        这一条**只用于 GET**。绝不能拿它发 prompt —— 那样委派就会读到你的
+        真实配置（插件、模型、权限），而 :mod:`services.delegate` 的全部
+        安全声明都建立在「委派跑在隔离实例上」之上。
+
+        不写 ``opencode.json``、不 ``PATCH /config``：唯一新增的是随机密码，
+        它只存在于这个对象里，随对象一起消失。
+        """
+        env = dict(os.environ)
+        env.update({
+            "OPENCODE_SERVER_USERNAME": "opencode",
+            "OPENCODE_SERVER_PASSWORD": self._password,
+            **self._extra_env,
+        })
+        self._proc = self._popen(env)
+        if not self._wait_ready():
+            self.close()
+            raise ServerError(
+                f"opencode 发现服务没在 {self._startup_timeout:g}s 内就绪"
+                f"（端口 {self._port}）"
+            )
+        return self
+
+    def _popen(self, env: dict[str, str]) -> Any:
+        """起进程。进程组参数**两个平台不同**（Windows 要 creationflags、
+        POSIX 要 ``start_new_session``）。刻意用显式分支而不是
+        ``**({"creationflags": f} if win else {"start_new_session": True})``：
+        后者两个分支的**值类型不同**，类型检查器会把整个 dict 推成
+        ``int | bool``，于是 Popen 的每个参数都报「int 不能赋给 bool」——
+        12 条假错误淹掉真错误。踩过，故留此注记。
+        """
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
         try:
-            self._proc = subprocess.Popen(
+            return subprocess.Popen(
                 # ``--hostname`` **显式给回环**，不靠默认值。随机密码已经在了，
                 # 但「只在回环监听」是更靠前的一层 —— 它决定同机别的进程
                 # 能不能看见这个端口。参照 qm 的 ``--hostname=127.0.0.1``。
@@ -433,14 +493,6 @@ class OpenCodeServer:
         except OSError as exc:
             self._cleanup_home()
             raise ServerError(f"起不了 opencode 服务：{exc}") from exc
-
-        if not self._wait_ready():
-            self.close()
-            raise ServerError(
-                f"opencode 服务没在 {self._startup_timeout:g}s 内就绪"
-                f"（端口 {self._port}）"
-            )
-        return self
 
     def _wait_ready(self) -> bool:
         deadline = time.monotonic() + self._startup_timeout
@@ -487,6 +539,20 @@ class OpenCodeServer:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self._port}"
+
+    @classmethod
+    def discovery(cls, *, executable: str = "opencode",
+                  cwd: pathlib.Path | None = None) -> "OpenCodeServer":
+        """一个**只读发现**客户端：看得见你的真实配置。
+
+        用来问「有哪些项目 / 哪些模型 / 哪些 Agent」—— 那些答案只在真实
+        配置里。**不要**用它发 prompt（见 :meth:`_start_unisolated` 的边界）。
+
+        :param cwd: 服务的工作目录。默认临时目录 —— 发现用的服务不碰任何
+            项目目录，也就不会在项目里留下文件。
+        """
+        return cls(project=cwd or pathlib.Path(tempfile.gettempdir()),
+                   executable=executable, isolate=False)
 
     def call(
         self, path: str, method: str = "GET", body: Any = None, *, timeout: float = 30.0
@@ -541,18 +607,140 @@ class OpenCodeServer:
             raise ServerError(f"建会话没拿到 sessionID：{body!r}")
         return sid
 
+    def list_projects(self) -> list[dict[str, Any]]:
+        r"""``GET /project`` —— 项目列表。
+
+        ## 为什么不用 ``/config/projects``
+
+        没有那个端点。``/project`` 是官方的（OpenAPI 里 ``/project`` 直接返回
+        ``Project[]``）。
+
+        **注意 worktree 的斜杠方向**：实测 HTTP 返回 ``D:\PycharmProjects\openmos``
+        （反斜杠），而旧的 ``opencode db`` 查询返回 ``D:/PycharmProjects/openmos``。
+        两种都出现过，所以 :mod:`opencode_projects` 的解析必须两种都能处理。
+        """
+        raw = self._must("/project")
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        raise ServerError(f"/project 返回了预期外的形状：{type(raw).__name__}")
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        """``GET /agent`` —— 可选 Agent（工作模式）。
+
+        实测 17 个，含 ``Sisyphus - ultraworker``（primary）、
+        ``Prometheus - Plan Builder``（primary，自带 variant=xhigh）、
+        ``explore`` / ``oracle`` 等 subagent。
+
+        每个元素的 ``model`` 是 ``{providerID, modelID}``，``variant`` 可选 ——
+        也就是说 **Agent 自带的默认 variant 会盖过会话级的选择**，这与
+        ``UserMessage.model.variant`` 的关系需要在真机上验一次（见
+        :meth:`prompt_async` 的注释）。
+        """
+        raw = self._must("/agent")
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        raise ServerError(f"/agent 返回了预期外的形状：{type(raw).__name__}")
+
+    def list_models(self) -> dict[str, Any]:
+        """``GET /provider`` —— 可选 provider / 模型 / 推理档位。
+
+        ## 为什么用 ``/provider`` 而**不是** ``/config/providers``
+
+        实测：``/config/providers`` 里 **2 个 provider 带明文 ``key``**。
+        那个端点只配拿来做调试输出；接进界面就是把 API Key 送到浏览器里。
+
+        ``/provider`` 是干净的（``all`` / ``default`` / ``connected``）。
+
+        ## 返回形状
+
+        - ``all``          所有 provider，每个带 ``models``（dict）
+        - ``connected``    **已配凭据的** provider id（实测 ``['deepseek','opencode']``）
+        - ``default``      provider -> 默认模型
+
+        每个模型带 ``capabilities.reasoning``（能否推理）与
+        ``variants``（可用档位，如 ``{"high": {"reasoningEffort": "high"}}``）。
+        **只有 4300/8475 个模型有 variants，且没有一个带 ``default`` 档** ——
+        所以「不指定推理级别」= 不施加 variant，用模型基线。
+        """
+        raw = self._must("/provider")
+        if isinstance(raw, dict) and isinstance(raw.get("all"), list):
+            return raw
+        raise ServerError(f"/provider 返回了预期外的形状：{type(raw).__name__}")
+
     def prompt_async(
-        self, session_id: str, brief: str, *,
-        model: str = "", directory: str | None = None,
+        self,
+        session_id: str,
+        brief: str,
+        *,
+        model: str = "",
+        agent: str = "",
+        variant: str = "",
+        directory: str | None = None,
     ) -> None:
-        """发指令，**立即返回**。等的是事件流，不是这个调用。"""
+        """发指令，**立即返回**。等的是事件流，不是这个调用。
+
+        ## ``model`` / ``agent`` / ``variant`` 三个字段的权威形状
+
+        取自 OpenCode 自带的 OpenAPI（``GET /doc``，实测 1.18.34）——
+        ``UserMessage`` 的定义就是请求体：
+
+            agent: string
+            model: { providerID: string, modelID: string, variant?: string }
+            additionalProperties: false
+
+两条由此推出的硬事实：
+
+        1. **推理级别叫 ``variant``，而且是 ``UserMessage`` 的**顶层**字段**
+           （不是 ``model`` 对象的成员 —— 那是个真踩过的坑，见下面构造处）。
+           整个规范里 ``reasoningEffort`` / ``reasoning_effort`` /
+           ``thinking`` 出现 **0** 次，且 ``additionalProperties: false``
+           —— 传它们会被直接拒绝。所以「High」= ``variant: "high"``。
+        2. **``variant`` 不在 ``required`` 里** ⇒ **不指定也能工作**，
+           用模型基线。实测 4300/8475 个模型带 variants，且**没有一个带
+           ``default`` 档**，所以「省略」= 不施加 variant，不是「落到某个默认档」。
+
+        ## ``model`` 这个参数的形状是 ``provider/model``
+
+        沿用既有约定（``--model opencode/big-pickle`` 与
+        ``DelegationPolicy.model`` 都是这个形状），这里只是把它拆回
+        ``providerID`` / ``modelID``。所以
+        ``model="opencode/fledge-alpha-free", variant="high"`` 会变成
+        ``{"model": {"providerID": "opencode", "modelID": "fledge-alpha-free"},
+        "variant": "high", "parts": [...]}``。
+        """
         path = f"/session/{session_id}/prompt_async"
         if directory:
             path += f"?directory={urllib.parse.quote(directory, safe='')}"
         payload: dict[str, Any] = {"parts": [{"type": "text", "text": brief}]}
         if model:
             provider, _, name = model.partition("/")
-            payload["model"] = {"providerID": provider, "modelID": name or provider}
+            # **``variant`` 不在这里** —— 见下面「variant 在顶层」那段。
+            payload["model"] = {
+                "providerID": provider,
+                "modelID": name or provider,
+            }
+        if variant:
+            # **variant 是 ``UserMessage`` 的顶层字段**，不是 ``model`` 的成员。
+            #
+            # 踩过的坑（实测 2026-10-07，opencode 1.18.34）：第一版把它塞进
+            # ``model`` 里，依据是 OpenAPI 里 ``Session.model`` 的形状——
+            # 而那**不是** ``UserMessage.model``。后果极其隐蔽：
+            #   - 服务端**不报错**（HTTP 204，与乱传档名表现完全一样）
+            #   - ``GET /session/{id}`` 回显 ``variant: "default"``
+            #   - 而同一个模型的 ``opencode run --variant high`` 回显 ``high``
+            # 也就是说「选了 High 却没生效」，且**没有任何报错可查**。
+            #
+            # 正确形状由抓 CLI 的真实请求确认：
+            #   ``{"model": {"providerID","modelID"}, "variant": "high", "parts": [...]}``
+            #
+            # 只在真的指定时才带 —— 省略与带空串**不是一回事**（空串会被
+            # 当成 variant 名去查，然后查不到）。
+            payload["variant"] = variant
+        if agent:
+            payload["agent"] = agent
+        # **这一行曾经丢过**，而 prompt_async 因此变成静默的 no-op：
+        # 它把 payload 构造好就返回，什么都没发。断言落在假的 server 上，
+        # 于是测试全绿而真机不工作。构造完**必须**发出去。
         self._must(path, "POST", payload)
 
     def pending_permissions(self, *, directory: str | None = None) -> list[Any]:

@@ -1,0 +1,271 @@
+"""OpenCode 四段选择的过滤与状态（设计文档 12.7.1 补充）。
+
+## 为什么这些断言要锁
+
+三条过滤规则**每一条都对应一个真实踩过的坑**，而症状全都表现为
+「选项少了一个 / 多了奇怪的东西 / 选不中」，极难从界面反推：
+
+- 少了 ``global`` 项目 —— 它的 worktree 是 ``/``，不是目录
+- 多了 ``compaction`` / ``summary`` / ``title`` —— OpenCode 内部件
+- 85 个还是 8475 个 —— 取决于有没有按 ``connected`` 过滤
+
+## 为什么「模型名里有 free」不是判据
+
+实测 ``space-bunny-free`` 名字带 free，而 ``big-pickle`` / ``kimi-k3``
+同样 ``cost == 0`` 却没带。按名字判会漏掉一大半，而「哪些真不要钱」
+只有 ``cost`` 说了算。:func:`_is_free` 因此只读 ``cost``。
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from freeagent.services import oc_selection as sel
+
+
+# ── 项目 ──────────────────────────────────────────────────────────────── #
+
+def test_global_project_is_filtered():
+    """``global`` 的 worktree 是 ``/``，不是目录 —— 委派进去不可能成功。"""
+    rows = [
+        {"name": "global", "worktree": "/"},
+        {"name": "FreeAgent", "worktree": "D:\\PycharmProjects\\freeagent"},
+        {"name": "", "worktree": "D:\\PycharmProjects\\openmos"},
+    ]
+    got = sel.list_project_options(rows)
+    assert [o.label for o in got] == ["FreeAgent", "openmos"]
+
+
+def test_project_backslash_is_normalized_and_deduped():
+    """HTTP 返回反斜杠，DB 返回正斜杠 —— 两种都要归一，否则白名单匹配不上。"""
+    rows = [
+        {"name": "FreeAgent", "worktree": "D:\\PycharmProjects\\freeagent"},
+        {"name": "FreeAgent", "worktree": "D:/PycharmProjects/freeagent"},
+    ]
+    got = sel.list_project_options(rows)
+    assert len(got) == 1, "同一目录不该出两项（斜杠方向不同）"
+    assert got[0].value == "D:/PycharmProjects/freeagent"
+
+
+def test_project_unnamed_falls_back_to_dirname():
+    rows = [{"name": "", "worktree": "D:\\PycharmProjects\\xiaoyuan"}]
+    assert sel.list_project_options(rows)[0].label == "xiaoyuan"
+
+
+# ── 工作模式 ──────────────────────────────────────────────────────────── #
+
+def test_internal_agents_are_filtered():
+    """``compaction`` / ``summary`` / ``title`` 是 OpenCode 内部件。
+
+    Desktop 的下拉框里没有它们，所以飞书里也不该有 —— 两边不一致时
+    用户会问「为什么这里有 summary」。
+    """
+    rows = [
+        {"name": "Sisyphus - ultraworker", "mode": "primary",
+         "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+        {"name": "compaction", "mode": "primary", "model": None},
+        {"name": "summary", "mode": "primary", "model": None},
+        {"name": "title", "mode": "primary", "model": None},
+        {"name": "explore", "mode": "subagent",
+         "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+    ]
+    got = sel.list_agent_options(rows)
+    assert [o.value for o in got] == ["Sisyphus - ultraworker"]
+
+
+def test_agent_without_model_is_filtered_even_if_named_normally():
+    """``model is None`` 是真判据 —— 不只挡那三个已知名字。"""
+    rows = [{"name": "mystery", "mode": "primary", "model": None}]
+    assert sel.list_agent_options(rows) == []
+
+
+def test_internal_agent_rejected_even_if_it_gains_a_model():
+    """名字那道闸门是独立的：哪天 OpenCode 给 summary 配了模型，也挡住。"""
+    rows = [{"name": "summary", "mode": "primary",
+             "model": {"providerID": "opencode", "modelID": "x"}}]
+    assert sel.list_agent_options(rows) == []
+
+
+def test_agent_hint_shows_its_default_model():
+    rows = [{"name": "Prometheus - Plan Builder", "mode": "primary",
+             "model": {"providerID": "opencode", "modelID": "claude-fable-5"}}]
+    got = sel.list_agent_options(rows)[0]
+    assert got.hint == "opencode/claude-fable-5"
+    assert got.value == "Prometheus - Plan Builder", "回传必须用精确名"
+
+
+# ── 模型 ──────────────────────────────────────────────────────────────── #
+
+def _provider_payload() -> dict:
+    return {
+        "connected": ["opencode", "deepseek"],
+        "all": [
+            {"id": "opencode", "name": "OpenCode Zen", "models": {
+                "big-pickle": {"name": "Big Pickle", "variants": {},
+                               "cost": {"input": 0, "output": 0}},
+                "fledge-alpha-free": {
+                    "name": "Fledge Alpha Free",
+                    "variants": {"high": {}, "low": {}, "max": {}},
+                    "cost": {"input": 0, "output": 0}},
+                "claude-opus-5": {
+                    "name": "Claude Opus 5",
+                    "variants": {"high": {}, "low": {}, "medium": {},
+                                 "xhigh": {}, "max": {}},
+                    "cost": {"input": 5, "output": 25}},
+            }},
+            {"id": "nomodel", "name": "No creds", "models": {
+                "x": {"name": "X", "cost": {"input": 0, "output": 0}}}},
+        ],
+    }
+
+
+def test_models_are_filtered_to_connected_providers():
+    """8475 → 85 的关键就在这一行：不按 connected 过滤的全是没凭据的。"""
+    got = sel.list_model_options(
+        _provider_payload(), provider_filter=sel.connected_providers(_provider_payload()))
+    values = [o.value for o in got]
+    assert "nomodel/x" not in values
+    assert "opencode/big-pickle" in values
+
+
+def test_free_models_sorted_first():
+    got = sel.list_model_options(_provider_payload(),
+                                 provider_filter=["opencode"])
+    assert got[0].value == "opencode/big-pickle"
+    assert got[-1].value == "opencode/claude-opus-5"
+
+
+def test_free_detection_uses_cost_not_name():
+    """``big-pickle`` 名字里没有 free，但 cost 为 0 —— 必须算免费。"""
+    got = sel.list_model_options(_provider_payload(), provider_filter=["opencode"])
+    free = [o for o in got if o.value in
+            ("opencode/big-pickle", "opencode/fledge-alpha-free")]
+    assert len(free) == 2
+
+
+def test_model_hint_counts_variants():
+    got = {o.value: o.hint for o in
+           sel.list_model_options(_provider_payload(), provider_filter=["opencode"])}
+    assert got["opencode/fledge-alpha-free"] == "OpenCode Zen · 3 档"
+    assert got["opencode/big-pickle"] == "OpenCode Zen", "无档就别写档数"
+
+
+def test_connected_providers_reads_the_field():
+    assert sel.connected_providers(_provider_payload()) == ["opencode", "deepseek"]
+
+
+def test_connected_providers_survives_junk():
+    assert sel.connected_providers({"nope": 1}) == []
+    assert sel.connected_providers({}) == []
+
+
+# ── 推理档 ────────────────────────────────────────────────────────────── #
+
+def test_variant_first_option_is_always_unspecified():
+    """「不指定」= 不施加 variant，用模型基线（实测没有模型带 default 档）。"""
+    got = sel.variant_options(_provider_payload(), "opencode/fledge-alpha-free")
+    assert got[0].value == ""
+    assert "不指定" in got[0].label
+
+
+def test_variants_sorted_by_strength_not_dict_order():
+    """dict 键序不保证强弱顺序；用户预期「越高越靠后」。"""
+    payload = {"all": [{"id": "opencode", "name": "OC", "models": {"m": {
+        "name": "M", "variants": {"max": {}, "low": {}, "high": {}, "medium": {}},
+        "cost": {}}}}]}
+    got = [o.value for o in sel.variant_options(payload, "opencode/m")]
+    assert got == ["", "low", "medium", "high", "max"]
+
+
+def test_unknown_variant_is_listed_not_dropped():
+    """不认识的名字不能静默丢掉 —— 「我明明有却选不到」无从解释。"""
+    payload = {"all": [{"id": "opencode", "name": "OC", "models": {"m": {
+        "name": "M", "variants": {"high": {}, "ultra-turbo": {}},
+        "cost": {}}}}]}
+    values = [o.value for o in sel.variant_options(payload, "opencode/m")]
+    assert "ultra-turbo" in values
+    assert values.index("high") < values.index("ultra-turbo")
+
+
+def test_model_without_variants_still_offers_unspecified():
+    """只有一项也要给 —— 那正是「这个模型没有档可选」的信息。"""
+    got = sel.variant_options(_provider_payload(), "opencode/big-pickle")
+    assert [o.value for o in got] == [""]
+
+
+def test_variant_of_unknown_model_is_just_unspecified():
+    got = sel.variant_options(_provider_payload(), "nope/zzz")
+    assert [o.value for o in got] == [""]
+
+
+def test_current_variant_validity():
+    payload = _provider_payload()
+    assert sel.current_variant_is_valid(payload, "opencode/fledge-alpha-free", "high")
+    # Big Pickle 没有档 —— 之前选的高不该被当成有效
+    assert not sel.current_variant_is_valid(payload, "opencode/big-pickle", "high")
+    assert sel.current_variant_is_valid(payload, "opencode/big-pickle", "")
+
+
+# ── 状态 ──────────────────────────────────────────────────────────────── #
+
+def test_selection_clear_from_wipes_downstream():
+    """改了模型就清档 —— 否则给 Big Pickle 发一个它没有的 ``high``。
+
+    而 OpenCode **不校验**（实测错误档也返回 204），症状是
+    「推理档明明选了 High，实际没生效」，极难排查。
+    """
+    s = sel.Selection(project="D:/p", agent="Sisyphus",
+                      model="opencode/fledge-alpha-free", variant="high")
+    s.clear_from("model")
+    s.model = "opencode/big-pickle"
+    assert s.variant == "", "档位必须被清掉"
+    assert s.agent == "Sisyphus", "上游不该被动"
+
+
+def test_selection_clear_from_keeps_upstream():
+    """被改的那一段**自己**由调用方赋值，所以这里只清它**下游**。"""
+    s = sel.Selection(project="D:/p", agent="Sisyphus",
+                      model="opencode/m", variant="high")
+    s.clear_from("agent")
+    assert s.model == "", "下游要清"
+    assert s.variant == "", "更下游也要清"
+    assert s.project == "D:/p", "上游不动"
+
+
+def test_describe_shows_all_four_even_when_empty():
+    """少一行用户会以为程序没听见 —— 所以显示成「（默认）」而不是消失。"""
+    lines = sel.Selection().describe()
+    assert len(lines) == 4
+    assert "（默认）" in lines[0]
+
+
+def test_selection_roundtrip(tmp_path):
+    s = sel.Selection(project="D:/p", agent="Sisyphus",
+                      model="opencode/m", variant="high")
+    sel.save_selection(s, tmp_path)
+    got = sel.load_selection(tmp_path)
+    assert got == s
+
+
+def test_missing_selection_file_is_not_an_error(tmp_path):
+    """用户还没选过 —— 那是正常状态，不该让助手起不来。"""
+    assert sel.load_selection(tmp_path).is_empty()
+
+
+def test_corrupt_selection_file_is_not_an_error(tmp_path):
+    (tmp_path / "oc_selection.json").write_text("{ not json", encoding="utf-8")
+    assert sel.load_selection(tmp_path).is_empty()
+
+
+def test_selection_is_not_a_secret(tmp_path):
+    """选择存 ``config.json`` 同级而非 ``llm.env`` —— 后者是秘密的存放处。
+
+    agent 名 / 模型 id / 档位名**不是秘密**（``/config/providers`` 那种
+    明文 key 才是）。混进去会让「哪些文件碰不得」这条规矩失效。
+    """
+    sel.save_selection(sel.Selection(model="opencode/fledge-alpha-free"), tmp_path)
+    raw = json.loads((tmp_path / "oc_selection.json").read_text(encoding="utf-8"))
+    assert raw["model"] == "opencode/fledge-alpha-free"
+    assert not (tmp_path / "llm.env").exists()

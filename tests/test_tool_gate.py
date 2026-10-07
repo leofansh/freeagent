@@ -233,6 +233,10 @@ class _FakeServer:
         self._events = events
         self.replies = list(replies or [])
         self.prompts: list[tuple[str, str]] = []
+        #: 最近一次 ``prompt_async`` 收到的三个「用哪个」字段。
+        #: 存在是为了让测试能断言它们真的被透传了 —— 签名跟上只防崩溃，
+        #: 防不住「传了但传的是空串」。
+        self.last_options: dict[str, str] = {}
         self.closed = False
 
     def __enter__(self):
@@ -244,8 +248,14 @@ class _FakeServer:
     def create_session(self) -> str:
         return "ses_fake"
 
-    def prompt_async(self, session_id, brief, *, model="", directory=None):
+    def prompt_async(self, session_id, brief, *, model="", agent="",
+                       variant="", directory=None):
+        # ``agent`` / ``variant`` 是飞书四段选择接进来的（2026-10-07）。
+        # 签名跟着 :meth:`OpenCodeServer.prompt_async` 走，缺一个就是
+        # 「委派时 TypeError」—— 34 条测试一起红，读起来像大范围回归，
+        # 实际只是替身没跟上。
         self.prompts.append((session_id, brief))
+        self.last_options = {"model": model, "agent": agent, "variant": variant}
 
     def events(self, **kw):
         yield from self._events
@@ -292,17 +302,63 @@ class _StubTask:
 
 
 class TestToolGateLoop:
-    def _run(self, server, sender, store, approver="ou_owner"):
+    def _run(self, server, sender, store, approver="ou_owner", **policy_kw):
         from freeagent.delegate import run_with_tool_gate
         from freeagent.services.delegate import DelegationPolicy
         sender.bind(store)
         factory: ServerFactory = lambda project, command: server  # noqa: E731
+        policy = DelegationPolicy(
+            projects=("C:/p",),
+            # 默认给一个模型（模拟 config.json 里写了），让 ``**policy_kw``
+            # 能覆盖它。反过来（``policy_kw.setdefault``）就没法测「显式
+            # 传 model 覆盖配置」这条了 —— 而那正是选择生效的路径。
+            **{"model": "opencode/big-pickle", **policy_kw},
+        )
         return run_with_tool_gate(
             _StubTask(), Path("C:/p"), "做点事",
-            policy=DelegationPolicy(projects=("C:/p",), model="opencode/big-pickle"),
+            policy=policy,
             store=store, sender=sender, approver=approver,
             server_factory=factory,
         )
+
+    def test_chosen_agent_model_variant_reach_opencode(
+            self, store: ApprovalStore) -> None:
+        """飞书里选的「工作模式 / 模型 / 推理档」真的一路送到 opencode。
+
+        ## 为什么这条测试重要
+
+        这是**接缝**测试。四段选择把值存进 ``oc_selection.json``，
+        ``DelegationPolicy`` 读它，``run_with_tool_gate`` 把它传给
+        ``prompt_async`` —— 三处都对、接缝漏一处，症状都是
+        「我明明选了 High，实际没生效」，而且**没有任何报错**
+        （opencode 对不存在的 variant 也返回 204）。
+
+        而签名跟上只防「崩溃」，防不住「传的是空串」——
+        那正是最可能的漏法，所以这里断言**值**而不只是「不报错」。
+        """
+        server = _FakeServer([("session.idle", {})])
+        self._run(server, _FakeSender(), store,
+                  agent="Sisyphus - ultraworker",
+                  model="opencode/fledge-alpha-free",
+                  variant="high")
+        assert server.last_options == {
+            "model": "opencode/fledge-alpha-free",
+            "agent": "Sisyphus - ultraworker",
+            "variant": "high",
+        }
+
+    def test_unselected_options_are_empty_strings(
+            self, store: ApprovalStore) -> None:
+        """没选就传空串 —— **不是**传 None，也不是省略。
+
+        空串在 :meth:`prompt_async` 里被当作「没给」而不带进载荷；
+        传 None 会变成 ``variant: null``，而 OpenCode 那边「不存在的档」
+        与「不指定」行为不同，且它**不报错** —— 于是无从察觉。
+        """
+        server = _FakeServer([("session.idle", {})])
+        self._run(server, _FakeSender(), store)
+        assert server.last_options["agent"] == ""
+        assert server.last_options["variant"] == ""
 
     def test_full_loop_allow(self, store: ApprovalStore) -> None:
         server = _FakeServer([_asked("per_1"), ("session.idle", {})])

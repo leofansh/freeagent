@@ -769,6 +769,175 @@ def send_menu_card(
     return str(((body.get("data") or {}).get("message_id")) or "")
 
 
+#: 选择类动作。与 :data:`MENU_ACTION` 同族（无状态、点了就执行），
+#: 但**回传的东西不是命令** —— 是「选了哪个选项」，由 bridge 决定下一步发哪张卡。
+#:
+#: 刻意**不开新 action**，也复用不了 menu：menu 的 choice 是**命令**（打给
+#: ChannelService），而这里的 choice 是**数据**（option.value）。混用的话，
+#: 「哪个 choice 是能直接当命令执行的」这件事就不再有单一判据。
+SELECT_ACTION = "oc_select"
+
+#: 四段选择的阶段名。顺序即流程顺序，**不是随便定的**：
+#: 模型依赖 connected provider（要发查询），档位依赖模型（要读该模型的 variants）。
+#: 所以 project → agent → model → variant，中间跳不过去。
+SELECT_STAGES = ("project", "agent", "model", "variant")
+
+#: 阶段的中文名，给「现在到第几步了」用。
+_STAGE_LABELS = {
+    "project": "项目",
+    "agent": "工作模式",
+    "model": "模型",
+    "variant": "推理档位",
+}
+
+
+def select_card(
+    stage: str,
+    options: Sequence[Any],
+    *,
+    chat_id: str,
+    page: int = 0,
+    page_size: int = 0,
+    selected: dict[str, str] | None = None,
+    note: str = "",
+) -> dict[str, Any]:
+    """某一阶段的选择卡。**JSON 1.0**，与菜单卡同版本。
+
+    ## 为什么 ``value`` 里带 ``page``
+
+    翻页必须**无状态**：按钮载荷里带页码，点「下一页」时 bridge 直接
+    知道该渲染第几页，不必在进程里存「谁翻到第几页」。带状态的做法在
+    桥接重启、多端同时点、两个人在同一个会话里操作时都会错位 ——
+    而错位的表现是「点了 A 结果选了 B」，那是最坏的一种。
+
+    ## 为什么 ``selected`` 用来标「当前值」而不是禁用其它项
+
+    Desktop 是下拉框，选中项就在框里。按钮列表没有那个概念，所以
+    **把当前选中项标成 primary**（高亮）。不把其它项灰掉：飞书的
+    ``disabled`` 按钮点不动，而用户可能要改主意 —— 灰掉等于替他做了取舍。
+
+    :param options: :class:`~freeagent.services.oc_selection.Option` 序列。
+        这里只读 ``value`` / ``label`` / ``hint`` / ``disabled``，
+        刻意**不 import** 那个类 —— 卡片层不该知道数据层的类型，
+        否则两个模块一起改就一起坏。
+    """
+    if stage not in SELECT_STAGES:
+        raise ValueError(f"未知的选择阶段：{stage}")
+    if not options:
+        raise ValueError("选择卡至少要一个选项")
+    size = page_size or len(options)
+    total_pages = max(1, -(-len(options) // size))   # 向上取整
+    page = max(0, min(page, total_pages - 1))
+    window = options[page * size:(page + 1) * size]
+
+    chosen = {k: str(v) for k, v in (selected or {}).items() if v}
+    buttons: list[dict[str, Any]] = []
+    for opt in window:
+        value = str(getattr(opt, "value", "") or "")
+        label = str(getattr(opt, "label", "") or "")
+        hint = str(getattr(opt, "hint", "") or "")
+        is_current = value == chosen.get(stage, "\0") if value else False
+        text = f"{label} · {hint}" if hint and not is_current else label
+        buttons.append({
+            # 按钮文案上限 40 字，超了被飞书截成看不懂的东西。
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": text[:40]},
+            # 当前选中项高亮 —— 替代下拉框的「框里那个值」。
+            "type": "primary" if is_current else "default",
+            # ``disabled`` 的按钮在飞书里**不能点**，而「点了没反应」
+            # 比「明确告诉你不能点」更让人困惑，所以这里**不**置灰，
+            # 只把 note 里说明（见下方 hint 的用法）。
+            "value": {
+                "action": SELECT_ACTION,
+                "stage": stage,
+                "value": value,
+                "page": page,
+                "chat": str(chat_id),
+            },
+        })
+
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": note or "点一个就行。"}}
+    ]
+    if total_pages > 1:
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text",
+                          "content": f"第 {page + 1}/{total_pages} 页"}],
+        })
+    elements.append({"tag": "action", "actions": buttons})
+    if total_pages > 1:
+        elements.append({"tag": "action", "actions": [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text",
+                         "content": "上一页" if page > 0 else "«"},
+                "type": "default",
+                "value": {"action": SELECT_ACTION, "stage": stage,
+                          "value": "", "page": page - 1, "nav": 1,
+                          "chat": str(chat_id)},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text",
+                         "content": "下一页" if page + 1 < total_pages else "»"},
+                "type": "default",
+                "value": {"action": SELECT_ACTION, "stage": stage,
+                          "value": "", "page": page + 1, "nav": 1,
+                          "chat": str(chat_id)},
+            },
+        ]})
+
+    idx = SELECT_STAGES.index(stage) + 1
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text",
+                      "content": f"选{_STAGE_LABELS[stage]}（{idx}/{len(SELECT_STAGES)}）"},
+        },
+        "elements": elements,
+    }
+
+
+def send_select_card(
+    sender: Any,
+    *,
+    open_id: str,
+    stage: str,
+    options: Sequence[Any],
+    chat_id: str,
+    page: int = 0,
+    page_size: int = 0,
+    selected: dict[str, str] | None = None,
+    note: str = "",
+) -> str:
+    """发选择卡，返回 message_id。与 :func:`send_menu_card` 同结构。"""
+    if not open_id:
+        raise ValueError("发选择卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = select_card(stage, options, chat_id=chat_id, page=page,
+                       page_size=page_size, selected=selected, note=note)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发选择卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
+
 def _decided_card(subject: str, line: str, *, granted: bool) -> dict[str, Any]:
     """**已处理完**的卡片：绿头/红头，**且没有按钮**。
 
