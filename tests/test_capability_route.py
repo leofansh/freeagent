@@ -175,3 +175,115 @@ def test_模块里不许有动作词表() -> None:
     body = re.sub(r'"""(?:.|\n)*?"""', "", src)
     assert "_ACTION_VERBS" not in body
     assert not re.search(r"^\s*_[A-Z_]+_Q\s*=", body, re.M), "又长出关键词表了"
+
+
+# ── wants_code_change：Web 对话的主路径曾在这里 500 ───────────────────── #
+#
+# 上面那些测试全都只调 ``try_route``（走 ``select_view``）。而
+# ``wants_code_change`` 走的是 ``parse_delegation`` —— 于是它此前**一次也没
+# 被一个忠实于协议的替身覆盖过**。
+#
+# 真实后果（实测 2026-10-07）：上一版在这里读 ``self._llm.llm_enabled``，
+# 而那是 ``Config`` 的字段、``LLMProvider`` 协议里没有。AttributeError
+# 发生在 ``try`` **之外**，于是冒到 Web 层 = **HTTP 500，整条对话不可用**。
+# 而 2300 条测试全绿 —— 因为替身恰好带了那个属性，或者压根没走到这行。
+# 症状（只有真 provider 才犯）与覆盖面正好错开。
+
+
+class ProtocolFaithfulLLM:
+    """**只实现协议里真有的方法** —— 刻意不补 ``llm_enabled``。
+
+    这是这组测试的关键：替身一旦「顺手」补上协议外的属性，就又看不见那个
+    bug 了。所以这里连 ``can_select_view`` 也不给 ——
+    :class:`CapabilityRouter` 对它的访问是带默认的 ``getattr``。
+    """
+
+    def __init__(self, is_delegation: bool = True) -> None:
+        self._is_delegation = is_delegation
+        self.seen: list[tuple[str, tuple]] = []
+
+    def select_view(self, text, views):
+        return None
+
+    def parse_delegation(self, text, known_projects):
+        from freeagent.services.llm.provider import DelegationIntent
+        self.seen.append((text, tuple(known_projects)))
+        return DelegationIntent(
+            is_delegation=self._is_delegation,
+            project="FreeAgent" if self._is_delegation else None,
+            brief="改一下 README" if self._is_delegation else "",
+        )
+
+
+def test_wants_code_change_不读协议外的字段(view: CapabilityView) -> None:
+    """provider 上没有 ``llm_enabled`` —— 读了就是 AttributeError。
+
+    这条断言就是那个 500 的回归测试。**不要**为了让它过而去给
+    :class:`ProtocolFaithfulLLM` 补属性：那正是当初让 2300 条测试
+    一起失效的做法。
+    """
+    llm = ProtocolFaithfulLLM()
+    assert not hasattr(llm, "llm_enabled"), "替身不该有这个协议外属性"
+    router = CapabilityRouter(llm)
+    assert router.wants_code_change("帮我改一下 README", view) is True
+    assert llm.seen, "该真的问模型"
+
+
+def test_wants_code_change_模型说不是就不是(view: CapabilityView) -> None:
+    router = CapabilityRouter(ProtocolFaithfulLLM(is_delegation=False))
+    assert router.wants_code_change("今天该做什么", view) is False
+
+
+def test_wants_code_change_没有_llm_返回否而不是崩(view: CapabilityView) -> None:
+    assert CapabilityRouter(None).wants_code_change("帮我改一下", view) is False
+
+
+def test_wants_code_change_规则层如实说不是(view: CapabilityView) -> None:
+    """离线/降级时走规则层，而它**拒绝**用规则猜项目（见 rules.py）。
+
+    所以「智能层关了别问它」这个意图不需要额外判一次 ``llm_enabled`` ——
+    规则层自己就返回 ``is_delegation=False``。
+    """
+    from freeagent.services.llm.rules import RuleBasedProvider
+
+    router = CapabilityRouter(RuleBasedProvider())
+    assert router.wants_code_change("帮我改一下 README", view) is False
+
+
+def test_wants_code_change_视图未启用时不问模型() -> None:
+    """``enabled`` 是**派生属性**（白名单非空即真），不是构造参数。"""
+    llm = ProtocolFaithfulLLM()
+    off = CapabilityView(projects=(), executors=("opencode",))
+    assert off.enabled is False
+    assert CapabilityRouter(llm).wants_code_change("帮我改一下", off) is False
+    assert not llm.seen, "没启用就不该白问一次模型"
+
+
+def test_代码里不许从_provider_读_llm_enabled() -> None:
+    """AST 守卫：``llm_enabled`` 是 ``Config`` 的字段，不许挂在 provider 上。
+
+    这条防的是**整类**错误，而不只是那一行。判据用 AST 而不是文本 grep：
+    注释与文档字符串里会合法地解释「为什么不能读它」，那是历史叙述，
+    文本 grep 分不清，断言会变成噪音然后被人加白名单绕过。
+    """
+    import ast
+    from pathlib import Path
+
+    path = Path("src/freeagent/services/capability.py")
+    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+
+    offenders: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if node.attr != "llm_enabled":
+            continue
+        # 只看挂在 ``self._llm`` 上的 —— 别的对象（config）读它是对的
+        base = node.value
+        if (isinstance(base, ast.Attribute) and base.attr == "_llm"):
+            offenders.append(node.lineno)
+
+    assert not offenders, (
+        "又从 provider 上读 llm_enabled 了（那是 Config 的字段）—— "
+        f"行号：{offenders}"
+    )

@@ -173,6 +173,23 @@ class CapabilityRouter:
 
         返回 ``None`` 仍然意味着闭嘴 —— 动作也说不出，就真的不归我管。
         """
+        # **必须点名我认识的东西**，否则一律闭嘴。
+        #
+        # 实测踩到的：兜底上线后「我有哪些角色脉络?」被 ``describe`` 接走，
+        # 答成「授权给我改代码的项目：OpenMOS、XiaoYuan」—— 而用户问的是
+        # **他自己的脉络**。那是事务层的活（``_answer_roles`` 已经会答），
+        # 被抢走后用户拿到一份项目清单。
+        #
+        # 所以这里加一道**按名字**的闸：句子里出现授权项目名或执行器名，
+        # 才轮到能力通道答。理由不是「关键词穷举」（那正是失败的做法），
+        # 而是**同名判定**：「XiaoYuan」这个名字要么在授权清单里，要么不在，
+        # 这件事是确定的，不依赖用户怎么措辞。
+        #
+        # 「小袁能改吗」能接住，是因为「小袁」和「XiaoYuan」指向同一个项目 ——
+        # 这条由模型判断，闸门只查「有没有一个我认识的名字」。
+        if not self._mentions_known_thing(text, view):
+            return None
+
         action = self._ask_action(text)
         if action in (None, "none"):
             return None
@@ -181,6 +198,20 @@ class CapabilityRouter:
         if action == "authorize":
             return self._authorize_hint(text, view)
         return self._describe(text, view)
+
+    def _mentions_known_thing(self, text: str, view: CapabilityView) -> bool:
+        """句子里有没有我认识的项目 / 执行器 / 脉络名？
+
+        项目与执行器查授权清单。**脉络名也查** —— 因为「工作项目A 里有什么」
+        是事务层的事，落到能力通道就是又一次抢活。
+
+        「小袁」这种简称认不出来，那就不接管 —— 宁可漏答，
+        不给一份无关的清单。实测漏答的代价是「没听懂 + 兜底自报」，
+        而误捕的代价是**一个自信的错误答案**。
+        """
+        low = text.casefold()
+        known = [*view.labels(), *(view.executors or ())]
+        return any(k.casefold() in low for k in known if k)
 
     #: 兜底用的**闭合动作集**。这是「模型答不出能力话题时」的出口。
     #:
@@ -218,6 +249,47 @@ class CapabilityRouter:
         except Exception:
             return None
         return picked if picked in _TOPIC_NAMES else None
+
+    def wants_code_change(self, text: str, view: CapabilityView | None = None) -> bool:
+        """这句话是在要求**改代码**吗？
+
+        给 :mod:`freeagent.web.endpoints_read` 用：那边要判断「这句话能不能
+        只读回答」，而建委派要写库、必须转 :class:`~freeagent.cli.app.Repl`。
+
+        ## 问的是 ``parse_delegation``，不是 ``_ask_action``
+
+        原先问 ``_ask_action(...) == "authorize"``，而那个动作集里还有
+        ``howto`` —— 于是「怎么改OpenMOS?」（**问做法**）与
+        「帮我改OpenMOS」（**要动手**）分在了两处判定上，而它们其实
+        共用同一个回答（怎么改 = 三步流程）。
+
+        ``parse_delegation`` 直接问「是不是在要求改代码」，是这件事
+        本来的问法；``_ask_action`` 留给**兜底回答**用（见
+        :meth:`_fallback_route`）。
+
+        **任何异常都当否** —— 判错方向是把一句闲聊送去建委派。
+        """
+        if view is not None and not view.enabled:
+            return False
+        # **不要读 ``self._llm.llm_enabled``** —— 那是 :class:`Config` 上的
+        # 字段，``LLMProvider`` 协议里没有（provider 只有
+        # ``parse_delegation`` / ``select_view``）。上一版这么写，于是每条
+        # 消息都 AttributeError，而它发生在 ``try`` **之外**，于是直接
+        # 冒到 Web 层变成 **HTTP 500**，整条对话不可用。
+        #
+        # 全量 2300 条测试没抓到，是因为断言用的 provider 恰好带了那个属性，
+        # 或者压根没走到这行 —— 症状（只有真 provider 才犯）与覆盖面正好错开。
+        #
+        # 「智能层关掉了就别问它」这个意图由**规则层自己**满足：
+        # :meth:`RuleBasedProvider.parse_delegation` 如实返回
+        # ``is_delegation=False``（它明确拒绝用规则猜项目，见那里的理由），
+        # 所以离线或降级时这里自然返回 False —— 不需要额外判一次。
+        if self._llm is None:
+            return False
+        try:
+            return bool(self._llm.parse_delegation(text, view.labels() if view else ()))
+        except Exception:
+            return False
 
     def _ask_action(self, text: str) -> str | None:
         """兜底问法：这句话**该做什么动作**。
