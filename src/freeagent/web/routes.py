@@ -20,6 +20,7 @@ from . import (
     endpoints_feishu,
     endpoints_feishu_config,
     endpoints_feishu_control,
+    endpoints_oc_selection,
     endpoints_read,
     serialize,
     serialize_api,
@@ -46,6 +47,9 @@ def feishu_routes() -> dict[str, Callable[..., Any]]:
         # 委派白名单候选（只读）。**授权动作另走 POST** —— 查是纯观测、
         # 可以随手做；授权是安全边界，得单独一步。见设计文档 12.7.1。
         "/api/delegate/projects": endpoints_delegate_projects.delegate_projects,
+        # OpenCode 四段选项（只读）。选择与清单的**修改**在 POST 侧 ——
+        # 理由同委派白名单：查是纯观测，改是配置变更。
+        "/api/oc/options": endpoints_oc_selection.oc_options,
     }
 
 

@@ -269,3 +269,116 @@ def test_selection_is_not_a_secret(tmp_path):
     raw = json.loads((tmp_path / "oc_selection.json").read_text(encoding="utf-8"))
     assert raw["model"] == "opencode/fledge-alpha-free"
     assert not (tmp_path / "llm.env").exists()
+
+
+# ── 日常可选清单（curation）──────────────────────────────────────────── #
+#
+# 为什么这一层存在：连了凭据的 provider 下**有 85 个模型**（实测
+# 2026-10-07：deepseek 2 + opencode 83）。85 个按钮放不进飞书一张卡，
+# 也超出「识别优于回忆」能承载的量。而「日常要用的」通常不到十个。
+
+
+def test_empty_curation_falls_back_to_all_connected(tmp_path):
+    """没挑过 = **给全部**，不是给空。
+
+    「没挑过」是正常状态（刚装好的人还没配）。给空列表会让人以为
+    「没模型可用」，而实际上有 85 个 —— 于是去查凭据、查网络，
+    真实原因只是「还没挑」。
+
+    ``home`` 必须给 tmp_path：第一版传 ``None``，而那读的是**真的**
+    ``~/.freeagent/oc_models.json`` —— 于是本机上勾过哪个模型，
+    这条断言就红。测试不该依赖用户当前配置（症状是「昨天还好好的」）。
+    """
+    got = sel.daily_model_options(_provider_payload(), home=tmp_path)
+    assert len(got) == len(
+        sel.list_model_options(_provider_payload(), provider_filter=["opencode"]))
+
+
+def test_curation_narrows_the_list(tmp_path):
+    sel.save_curated_models(
+        ["opencode/fledge-alpha-free", "opencode/claude-opus-5"], tmp_path)
+    got = sel.daily_model_options(_provider_payload(), home=tmp_path)
+    assert [o.value for o in got] == [
+        "opencode/fledge-alpha-free", "opencode/claude-opus-5"]
+
+
+def test_curation_drops_models_this_version_lacks(tmp_path):
+    """清单里勾了、但这一版 OpenCode 不提供的，跳过而不报错。
+
+    那是「你卸载了它 / 它改名了」。症状是「我明明勾了它却选不到」——
+    说清比报错有用。
+    """
+    sel.save_curated_models(["opencode/已经没了", "opencode/big-pickle"], tmp_path)
+    got = sel.daily_model_options(_provider_payload(), home=tmp_path)
+    assert [o.value for o in got] == ["opencode/big-pickle"]
+
+
+def test_curated_add_and_remove(tmp_path):
+    assert sel.curate("add", "opencode/big-pickle", tmp_path) == [
+        "opencode/big-pickle"]
+    assert sel.curate("add", "opencode/big-pickle", tmp_path) == [
+        "opencode/big-pickle"], "重复添加应幂等"
+    sel.curate("add", "opencode/claude-opus-5", tmp_path)
+    assert sel.curate("remove", "opencode/big-pickle", tmp_path) == [
+        "opencode/claude-opus-5"]
+
+
+def test_curate_rejects_unknown_action_and_empty_model(tmp_path):
+    """**抛 ValueError** 而不是默默加个空串进清单。
+
+    清单是纯 JSON 文件，一个空串会让界面上出现一个点不中的空白项。
+    """
+    for bad_action in ("toggle", "", "ADD"):
+        with pytest.raises(ValueError):
+            sel.curate(bad_action, "opencode/big-pickle", tmp_path)
+    with pytest.raises(ValueError):
+        sel.curate("add", "  ", tmp_path)
+
+
+def test_remove_drops_all_duplicates(tmp_path):
+    """清单是纯 JSON，可能已被手改成有重复 —— 只删一个会留下幽灵项。
+
+    症状是「同一个模型在界面出现两次」。
+    """
+    (tmp_path / "oc_models.json").write_text(
+        json.dumps({"models": ["opencode/m", "opencode/m", "opencode/other"]}),
+        encoding="utf-8")
+    assert sel.curate("remove", "opencode/m", tmp_path) == ["opencode/other"]
+
+
+def test_curation_dedupes_and_keeps_order(tmp_path):
+    """**保序**是有意的：勾选顺序就是偏好顺序（常用的排前面）。"""
+    sel.save_curated_models(
+        ["opencode/b", "opencode/a", "opencode/b", "", "  "], tmp_path)
+    assert sel.load_curated_models(tmp_path) == ["opencode/b", "opencode/a"]
+
+
+def test_curation_corrupt_file_is_empty_not_crash(tmp_path):
+    """坏了就是「没挑过」，不是助手起不来。"""
+    (tmp_path / "oc_models.json").write_text("{ 坏", encoding="utf-8")
+    assert sel.load_curated_models(tmp_path) == []
+    assert sel.daily_models_configured(tmp_path) is False
+
+
+def test_curation_accepts_bare_list_shape(tmp_path):
+    """容许「裸数组」：手写 JSON 时最容易写成那样，而不该报错。"""
+    (tmp_path / "oc_models.json").write_text(
+        json.dumps(["opencode/m"]), encoding="utf-8")
+    assert sel.load_curated_models(tmp_path) == ["opencode/m"]
+
+
+def test_curation_is_independent_of_selection_file(tmp_path):
+    """两个文件独立：``save_config`` 整体重写 ``config.json`` 不影响清单，
+    而界面改一次 LLM 设置也不该顺手清掉「日常可选模型」。"""
+    sel.save_selection(sel.Selection(model="opencode/x"), tmp_path)
+    sel.save_curated_models(["opencode/y"], tmp_path)
+    assert sel.load_selection(tmp_path).model == "opencode/x"
+    assert sel.load_curated_models(tmp_path) == ["opencode/y"]
+
+
+def test_daily_models_configured_distinguishes_unset(tmp_path):
+    assert sel.daily_models_configured(tmp_path) is False
+    sel.save_curated_models(["opencode/m"], tmp_path)
+    assert sel.daily_models_configured(tmp_path) is True
+    sel.save_curated_models([], tmp_path)
+    assert sel.daily_models_configured(tmp_path) is False, "清空=回到未配置"

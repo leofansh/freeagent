@@ -27,6 +27,7 @@ from . import (
     endpoints_delegate_projects,
     endpoints_feishu_config,
     endpoints_feishu_control,
+    endpoints_oc_selection,
     endpoints_read,
     endpoints_write,
     llm_probe,
@@ -87,6 +88,20 @@ def dispatch_post(
         # 不额外注册 GET 侧的别名：一个能杀进程的操作不该有「顺手 GET 一下
         # 就能触发」的路径。
         return HTTPStatus.OK, endpoints_feishu_control.feishu_bridge_action(
+            app, read_body()
+        )
+
+    if parts == ["api", "oc", "selection"]:
+        # 改「四段选择」—— 决定**下一次**委派用哪个 agent/model/档位。
+        # 只走 POST：它是配置变更，且值来自浏览器载荷（可伪造），必须在
+        # 服务层对着真实选项校验，而不是「顺手 GET 一下就能改」。
+        return HTTPStatus.OK, endpoints_oc_selection.oc_selection_save(
+            app, read_body()
+        )
+
+    if parts == ["api", "oc", "curation"]:
+        # 改「日常可选模型」清单。同样只走 POST，理由同上。
+        return HTTPStatus.OK, endpoints_oc_selection.oc_curation_save(
             app, read_body()
         )
 

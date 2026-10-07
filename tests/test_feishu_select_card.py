@@ -28,6 +28,7 @@ from freeagent.feishu.sender import (
     SELECT_STAGES,
     select_card,
 )
+from freeagent.services import oc_discovery as discovery
 from freeagent.services import oc_selection as sel
 
 
@@ -348,9 +349,15 @@ def one_server(monkeypatch):
     """每次只放行**一个** discovery；第二次调用就失败。
 
     这样「四段各起一次进程」会立刻炸，而不只是慢 —— 慢在测试里看不出来。
+
+    打桩打在 :mod:`services.oc_discovery` 上，而**不是**
+    :mod:`freeagent.feishu.bridge`：快照与选项查询搬走之后（为了让 Web
+    端点不必 import 飞书桥接），那才是它们所在的地方。桩留在旧位置的话，
+    这几条会静默失去作用 —— 而「测试悄悄不再测任何东西」是最坏的结局：
+    它们绿着，却什么也没守住。
     """
     _FakeServer.opened = 0
-    monkeypatch.setattr(bridge, "_OC_SNAPSHOT", None)
+    monkeypatch.setattr(discovery, "_SNAPSHOT", None)
 
     def one_shot(**kw):
         if _FakeServer.opened >= 1:
@@ -360,7 +367,7 @@ def one_server(monkeypatch):
         "freeagent.services.opencode_server.OpenCodeServer.discovery",
         classmethod(lambda cls, **kw: one_shot(**kw)))
     yield
-    monkeypatch.setattr(bridge, "_OC_SNAPSHOT", None)
+    monkeypatch.setattr(discovery, "_SNAPSHOT", None)
 
 
 def test_four_stages_use_one_server(one_server):
@@ -371,16 +378,37 @@ def test_four_stages_use_one_server(one_server):
     合成快照后是 7.1 秒 —— 那 7 秒是 opencode 自己的冷启动，起不掉。
     """
     for stage in ("project", "agent", "model"):
-        opts, _ = bridge._oc_options(stage)
+        opts, _ = discovery.stage_options(stage)
         assert opts, f"{stage} 该有选项"
     assert _FakeServer.opened == 1
 
 
 def test_snapshot_is_reused_across_calls(one_server):
-    bridge._oc_options("project")
+    discovery.stage_options("project")
     for _ in range(5):
-        bridge._oc_options("model")
+        discovery.stage_options("model")
     assert _FakeServer.opened == 1
+
+
+def test_bridge_delegates_to_discovery(monkeypatch):
+    """桥接必须**转手**服务层，不能自己查 —— 否则两处实现会漂移。
+
+    这条防的是「有人在 bridge 里又写了一份查询」：那样 Web 端点与飞书
+    就会给出不同的选项，而症状是「Web 上选得到，飞书里选不到」。
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path("src/freeagent/feishu/bridge.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_oc_options")
+    called = {n.func.id for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "stage_options" in called, "bridge._oc_options 不该自己查 OpenCode"
+    for banned in ("list_projects", "list_agents", "list_models",
+                   "list_model_options", "variant_options"):
+        assert banned not in called, f"bridge._oc_options 又自己调了 {banned}"
 
 
 def test_each_stage_failure_is_isolated(monkeypatch):
@@ -392,17 +420,17 @@ def test_each_stage_failure_is_isolated(monkeypatch):
         def list_models(self):
             raise RuntimeError("登录过期")
 
-    monkeypatch.setattr(bridge, "_OC_SNAPSHOT", None)
+    monkeypatch.setattr(discovery, "_SNAPSHOT", None)
     monkeypatch.setattr(
         "freeagent.services.opencode_server.OpenCodeServer.discovery",
         classmethod(lambda cls, **kw: Partial()))
     try:
-        assert bridge._oc_options("project")[0], "项目不该受 provider 失败影响"
-        assert bridge._oc_options("agent")[0], "工作模式也不该"
-        opts, note = bridge._oc_options("model")
+        assert discovery.stage_options("project")[0], "项目不该受 provider 失败影响"
+        assert discovery.stage_options("agent")[0], "工作模式也不该"
+        opts, note = discovery.stage_options("model")
         assert opts == [] and "查不到" in note, "模型段要说清是查不到"
     finally:
-        monkeypatch.setattr(bridge, "_OC_SNAPSHOT", None)
+        monkeypatch.setattr(discovery, "_SNAPSHOT", None)
 
 
 def test_failure_is_distinguishable_from_empty(monkeypatch):
@@ -411,10 +439,12 @@ def test_failure_is_distinguishable_from_empty(monkeypatch):
     混成一个空列表时，「OpenCode 没起来」与「你没装任何工作模式」
     长得一模一样，界面只能说同一句话 —— 于是用户往错的方向查。
     """
-    monkeypatch.setattr(bridge, "_OC_SNAPSHOT", None)
-    monkeypatch.setattr(bridge, "_oc_discovery",
+    monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+    monkeypatch.setattr(discovery, "_discovery_client",
                         lambda: (_ for _ in ()).throw(RuntimeError("起不来")))
     try:
-        assert bridge._oc_agents() is None, "起不来必须是 None"
+        snap = discovery.snapshot()
+        assert snap.agents is None, "起不来必须是 None"
+        assert snap.projects is None and snap.providers is None
     finally:
-        monkeypatch.setattr(bridge, "_OC_SNAPSHOT", None)
+        monkeypatch.setattr(discovery, "_SNAPSHOT", None)

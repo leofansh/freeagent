@@ -60,11 +60,17 @@ __all__ = [
     "list_project_options",
     "list_agent_options",
     "list_model_options",
+    "daily_model_options",
+    "model_list_note",
     "connected_providers",
     "variant_options",
     "current_variant_is_valid",
     "load_selection",
     "save_selection",
+    "load_curated_models",
+    "save_curated_models",
+    "curate",
+    "daily_models_configured",
     "MODEL_PAGE_SIZE",
     "VARIANT_ORDER",
 ]
@@ -352,6 +358,138 @@ def current_variant_is_valid(payload: dict[str, Any], model: str, variant: str) 
     if not variant:
         return True
     return variant in _variants_of(payload, model)
+
+
+# ── 日常可选清单（curation）──────────────────────────────────────────── #
+#
+# 为什么需要这一层：连了凭据的 provider 下**有 85 个模型**（实测
+# 2026-10-07：deepseek 2 + opencode 83）。而「日常要用的」通常不到十个。
+# 85 个按钮既放不进飞书一张卡（于是我写了分页），也超出「识别优于回忆」
+# 能承载的量 —— 选项越多越没人选。
+#
+# 与 OpenCode Desktop「管理模型 → 自定义模型选择器中显示的模型」是同一个
+# 意图（给每个模型一个开关），但**清单放在 FreeAgent 侧**：
+#
+# - Desktop 那个开关写进 OpenCode 自己的配置；FreeAgent 若也去写，就变成
+#   **两个进程共同拥有同一个配置文件**，迟早互相覆盖
+# - 飞书用不着管 OpenCode 的配置，它只需要知道「日常能用哪些」
+#
+# 刻意**不**提供「连接提供商」：``/config/providers`` 只有 GET，且实测返回
+# **明文 API Key**。让凭据流经一个无鉴权的 Web 界面等于把密钥摊开。
+
+#: 清单文件名。与 :data:`_SELECTION_FILE` 同级但独立 —— 理由同样是
+#: ``save_config`` 会整体重写 ``config.json``。
+_CURATED_FILE = "oc_models.json"
+
+
+def _curated_path(home: str | Path | None = None) -> Path:
+    base = Path(home) if home is not None else Path.home() / ".freeagent"
+    return base / _CURATED_FILE
+
+
+def load_curated_models(home: str | Path | None = None) -> list[str]:
+    """日常可选的模型 id 列表。**读不出来就是空清单**（不抛）。
+
+    空清单**不是错误**，它意味着「还没挑过」—— 那时 :func:`daily_model_options`
+    退回给全部已连接模型（见那里的理由）。若这里抛异常，助手会因一个
+    可选的配置起不来。
+    """
+    try:
+        raw = json.loads(_curated_path(home).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x or "").strip()]
+    if isinstance(raw, dict) and isinstance(raw.get("models"), list):
+        return [str(x).strip() for x in raw["models"] if str(x or "").strip()]
+    return []
+
+
+def save_curated_models(models: Sequence[str], home: str | Path | None = None) -> Path:
+    """写日常可选清单，返回写入路径。**去重并保序**。
+
+    保序是有意的：用户勾选的顺序就是他的偏好顺序（常用的排前面），
+    而界面上除「当前选中项高亮」外没有别的排序依据。
+    """
+    path = _curated_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in models:
+        key = str(item or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    path.write_text(
+        json.dumps({"models": ordered}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def curate(action: str, model: str, home: str | Path | None = None) -> list[str]:
+    """增删一个模型，返回新的清单。
+
+    :param action: ``"add"`` 或 ``"remove"``。
+    :raises ValueError: 未知 action，或 ``model`` 为空 —— 调用方要把它
+        变成 400，而不是默默加了个空串进清单。
+    """
+    key = str(model or "").strip()
+    if not key:
+        raise ValueError("模型 id 不能为空")
+    current = load_curated_models(home)
+    if action == "add":
+        if key not in current:
+            current.append(key)
+    elif action == "remove":
+        # 移除**全部**同名项：清单可能已被手改成有重复（它是纯 JSON 文件），
+        # 只删一个会留下幽灵项，而界面会把同一个模型显示两次。
+        current = [m for m in current if m != key]
+    else:
+        raise ValueError(f"未知操作：{action}")
+    save_curated_models(current, home)
+    return current
+
+
+def daily_models_configured(home: str | Path | None = None) -> bool:
+    """用户是否**挑过**。用于区分「没挑=全给」与「挑了=按清单」。"""
+    return bool(load_curated_models(home))
+
+
+def daily_model_options(
+    payload: dict[str, Any], *, home: str | Path | None = None
+) -> list[Option]:
+    """日常可选的模型。**清单为空就退回全部已连接模型**。
+
+    ## 退回而不是给空
+
+    因为「没挑过」是**正常状态**（刚装好的人还没配），给一个空列表会让人
+    以为「没模型可用」，而实际上有 85 个 —— 于是去查凭据、查网络，而真实
+    原因只是「还没挑」。这与 :func:`list_project_options` 里「滤掉 global」
+    是同类理由。
+
+    ## 清单里的模型这一版**不在**了怎么办
+
+    跳过（不报错）。那是「你卸载了它 / 它改名了」，而症状是「我明明勾了它
+    却选不到」—— 说清比报错有用。
+    """
+    every = list_model_options(payload, provider_filter=connected_providers(payload))
+    curated = load_curated_models(home)
+    if not curated:
+        return every
+    allowed = set(curated)
+    return [o for o in every if o.value in allowed]
+
+
+def model_list_note(options: Sequence[Option]) -> str:
+    """模型段的提示语。
+
+    刻意**不提分页**：清单通常十来个，一屏就够。而 :data:`MODEL_PAGE_SIZE`
+    仍然生效 —— 万一清单勾到几十个，那时它才有用武之地。
+    """
+    if not options:
+        return "日常清单是空的。"
+    return f"日常清单里的 {len(options)} 个模型（可在设置里增删）。"
 
 
 # ── 状态持久化 ────────────────────────────────────────────────────────── #

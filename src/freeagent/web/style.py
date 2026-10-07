@@ -127,6 +127,18 @@ STYLE_CSS = r"""  :root {
   }
   input[type=text] { flex: 1 1 260px; min-width: 0; }
   input[type=number] { width: 82px; }
+  /* 编程页签的四个下拉要**占满整行**：模型名有长有短（「Nemotron 3.5
+     Lightning Free」29 字 vs「Big Pickle」10），窄的下拉会把长名截断成
+     「Nemotron 3.5 Lig…」，而那正好是最难认的一批。 */
+  .field > select { width: 100%; box-sizing: border-box; }
+  /* 日常可选模型的开关列表：网格而不是竖排 —— 85 个竖排要滚很久，
+     而「勾/不勾」是个一眼能扫完的动作。 */
+  .currow {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 4px 12px; margin: 6px 0 12px;
+  }
+  .curopt { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+  .curopt .tag { flex: none; }
   input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   input:disabled, select:disabled { opacity: .5; }
   form.set { margin: 0; }

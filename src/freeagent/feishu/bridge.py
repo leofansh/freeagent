@@ -1492,104 +1492,33 @@ def _menu_delegate_text() -> str:
 
 
 def _oc_options(stage: str) -> tuple[list[Any], str]:
-    """某一阶段的选项。**返回 ``(选项, 提示语)``**。
+    """某一阶段的选项 —— **转手** :func:`services.oc_discovery.stage_options`。
 
-    失败时返回 ``([], 原因)`` —— 理由是**用户必须看到真实原因**，
-    而不是一张空卡。实测踩过：过滤规则写错时症状是「选项一个都没有」，
-    而那句话可以被解读成「没有可选的项目」，于是往错的方向查。
+    这里**不再自己查 OpenCode**：Web 的编程页签也要同一份选项，而那段
+    逻辑原先住在这个飞书模块里，于是让 Web 去 import 飞书桥接 ——
+    一个 Web 端点依赖一个通道模块，方向是倒的，换掉飞书就连服务层一起删。
+
+    现在两个前端都只依赖 :mod:`services.oc_discovery`，所以「在 Web 里
+    验过的」就是「飞书在跑的」。
+
+    本函数保留是为了让下面那些调用点不必改 import —— 真正的原因是
+    **改动面小**：卡片、白名单判定、回写旧卡那些逻辑都在这一段里，
+    连带重写只会把 diff 撑大而看不出行为变化。
     """
-    from ..services import oc_selection as sel
+    from ..services.oc_discovery import stage_options
 
-    if stage == "project":
-        rows = _oc_snapshot().projects
-        if rows is None:
-            return [], "查不到项目列表 —— OpenCode 没起来或读不到它的项目库。"
-        return sel.list_project_options(rows), ""
-    if stage == "agent":
-        rows = _oc_agents()
-        if rows is None:
-            return [], "查不到 OpenCode 的工作模式列表 —— OpenCode 没起来或版本不认。"
-        opts = sel.list_agent_options(rows)
-        return opts, "" if opts else "这台机器上没有可用的工作模式。"
-
-    # model 与 variant 都要 ``/provider``（实测 **6.7MB**），而两者读的是
-    # 同一份快照 —— 所以翻档位那一段不再付 7 秒。
-    if stage == "model":
-        payload = _oc_provider_payload()
-        if payload is None:
-            return [], "查不到模型列表 —— OpenCode 没起来或 /provider 不可用。"
-        opts = sel.list_model_options(
-            payload, provider_filter=sel.connected_providers(payload))
-        if not opts:
-            return [], "没有已连接凭据的 provider —— 先在 OpenCode 里登录一个。"
-        return opts, "免费模型排在前面。"
-
-    if stage == "variant":
-        current = _oc_load_selection()
-        if not current.model:
-            return [], "还没选模型 —— 先选模型再选推理档。"
-        payload = _oc_provider_payload()
-        if payload is None:
-            return [], "查不到推理档列表 —— OpenCode 的 /provider 不可用。"
-        opts = sel.variant_options(payload, current.model)
-        if len(opts) <= 1:
-            return opts, "这个模型没有可选推理档（用它的默认设置）。"
-        return opts, "「不指定」= 用模型自己的默认强度。"
-
-    return [], f"未知阶段：{stage}"
+    return stage_options(stage)
 
 
-def _oc_snapshot() -> "_OcSnapshot":
-    """一次 discovery，把**三份数据**都拿回来。缓存 30 秒。
+def _oc_snapshot() -> Any:
+    """快照 —— 转手 :mod:`services.oc_discovery`。
 
-    ## 为什么必须合成一个快照
-
-    最初是三个各自带缓存的函数（``_oc_provider_payload`` /
-    ``_oc_agents`` / ``list_projects``），各起各的 opencode 进程。
-    实测冷启动四段要走一遍，于是**总计 20.6 秒**（6.6 + 6.9 + 7.1）
-    —— 用户点「选项目/模型」要等 20 秒才看到第四张卡。
-
-    根因不是缓存粒度，而是**缓存的切分维度错了**：三份数据来自**同一个**
-    进程、同一次启动，却分三次去要。合成一个快照后冷启动只起**一次**进程。
-
-    ## 30 秒的依据
-
-    够走完一整轮翻页（点四次「下一页」），又能在用户中途用 OpenCode
-    Desktop 登录了新 provider 之后**不用重启**就看到。不缓存则用户会
-    以为「我登录了但飞书里还是没有」。
-
-    ## 失败时哪些字段是 ``None``
-
-    刻意**逐项**记成败，而不是整体抛：一个 provider 登录失败不该让
-    「有哪些项目」也一起消失。``None`` 与 ``[]`` 有别 ——
-    ``None`` 是「查不到」（该说环境有问题），``[]`` 是「真的没有」。
-    混成一个空列表，两种症状长得一模一样。
+    只为兼容既有调用点（测试会 monkeypatch 它）。真实快照只有一个，
+    在 :mod:`services.oc_discovery` 里。
     """
-    global _OC_SNAPSHOT
-    now = time.monotonic()
-    if _OC_SNAPSHOT is not None and now - _OC_SNAPSHOT.at < _OC_SNAPSHOT_TTL:
-        return _OC_SNAPSHOT
+    from ..services.oc_discovery import snapshot
 
-    snap = _OcSnapshot(at=now)
-    try:
-        with _oc_discovery() as oc:
-            try:
-                snap.projects = oc.list_projects()
-            except Exception:
-                log.exception("【选择】查项目失败")
-            try:
-                snap.agents = oc.list_agents()
-            except Exception:
-                log.exception("【选择】查工作模式失败")
-            try:
-                snap.providers = oc.list_models()
-            except Exception:
-                log.exception("【选择】查 provider 失败")
-    except Exception:
-        # 连服务都起不来：三份都没拿到。
-        log.exception("【选择】起 discovery 服务失败")
-    _OC_SNAPSHOT = snap
-    return snap
+    return snapshot()
 
 
 @dataclass(slots=True)
@@ -1600,26 +1529,6 @@ class _OcSnapshot:
     projects: list[dict[str, Any]] | None = None
     agents: list[dict[str, Any]] | None = None
     providers: dict[str, Any] | None = None
-
-
-_OC_SNAPSHOT: _OcSnapshot | None = None
-
-#: 快照有效期。理由见 :func:`_oc_snapshot`。
-_OC_SNAPSHOT_TTL = 30.0
-
-
-def _oc_provider_payload() -> dict[str, Any] | None:
-    """``GET /provider`` 的结果。**查不到返回 ``None``**（不是空字典）。"""
-    return _oc_snapshot().providers
-
-
-def _oc_agents() -> list[dict[str, Any]] | None:
-    """``GET /agent`` 的结果。**查不到返回 ``None``**（不是空列表）。
-
-    区分「查不到」与「一个都没有」很重要：前者是环境问题（OpenCode 没起来），
-    该说清原因；后者是真实状态，界面该显示「没有可用的工作模式」。
-    """
-    return _oc_snapshot().agents
 
 
 def _oc_discovery() -> Any:

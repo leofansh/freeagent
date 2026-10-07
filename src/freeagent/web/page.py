@@ -26,6 +26,7 @@ from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
 from .js_delegate_projects import JS_DELEGATE_PROJECTS
 from .js_feishu_control import JS_FEISHU_CONTROL
+from .js_oc_selection import JS_OC_SELECTION
 from .js_settings import JS_SETTINGS
 from .js_settings_llm import JS_SETTINGS_LLM
 from .js_vision import JS_VISION
@@ -56,6 +57,9 @@ INDEX_HTML = (
             # 但它自己提供 delegateProjectsView / delegateRestartBanner，
             # 必须在 JS_BOOT 之前进页面 —— boot 里会调用它们。
             JS_DELEGATE_PROJECTS,
+            # oc_selection 只用 JS_CORE 里的 el/esc/api/toast，但 boot 会调
+            # loadOcSelection，所以必须在 JS_BOOT 之前。
+            JS_OC_SELECTION,
             JS_BOOT,
         )
     )

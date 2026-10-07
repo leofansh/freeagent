@@ -35,6 +35,12 @@ async function load(next) {
       await loadChat();
       return;
     }
+    if (view === "oc") {
+      // 编程页签：四段选择 + 日常可选模型。选项来自 /api/oc/options，
+      // 与飞书那四张卡同一个来源（services/oc_discovery）。
+      loadOcSelection(root);
+      return;
+    }
     if (view === "feishu") {
       // 两个端点顺序取：状态拿不到也要把日志显示出来，否则「页面空了」
       // 会被理解成「什么都没开」，而真相可能是「日志能看但状态接口挂了」。
