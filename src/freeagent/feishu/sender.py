@@ -665,6 +665,162 @@ def send_plan_confirm_card(
         )
     return str(((body.get("data") or {}).get("message_id")) or "")
 
+
+#: 卡片按钮回传的**命令名**（设计文档 11.9.8「卡片按钮 → 合成命令」）。
+#:
+#: ⚠️ **载荷里刻意不带 JSON**：``Repl._command`` 是 ``line.split()`` 之后
+#: 取第一段当命令名，JSON 里的空格会把一条命令切成好几段 —— 症状是
+#: 「点了没反应」，而日志里什么错都没有。所以这里只带**两个短字段**
+#: （``cmd`` 与 ``id``），由 bridge 拼成 ``"<cmd> <id>"`` 再交给
+#: ``ChannelService.handle``。
+#:
+#: ## 为什么它**无凭据**
+#:
+#: 与 :data:`MENU_ACTION` / :data:`SELECT_ACTION` 同族：点了就执行，
+#: 不落库、不等回复。但**刻意不叫 ``allow_once`` 那一套** —— 那套是给
+#: 「授权有副作用的动作」用的，带 TTL 与过期即拒。而 ``/done`` 这类
+#: 状态迁移**已经有**自己的闸门（白名单 + 幂等 + 状态迁移表），
+#: 再套一层审批凭据等于让同一次点击被记两次，且凭空多出「卡片过期了
+#: 但用户还没点」这类失败模式。
+COMMAND_ACTION = "command"
+
+
+def task_action_card(
+    title: str, task_id: str, *, chat_id: str, state: str = ""
+) -> dict[str, Any]:
+    """事务的三个状态迁移按钮：开始 / 做完 / 放一放。
+
+    **无状态**（同 :func:`menu_card` 的思路）：按钮 value 只带要执行的
+    命令与那条事务的 id 前缀，不带任何业务内容。
+
+    刻意**不**把 ``"开始做"`` 这种中文翻译放在这张卡里：命令名是
+    ``/start``，中文只印在按钮**文案**上。载荷里放中文就得在 bridge
+    侧再翻译回去，而那份翻译表与命令表一漂移就是「点了报错」。
+    """
+    def _btn(label: str, cmd: str) -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": "default",
+            "value": {"action": COMMAND_ACTION, "cmd": cmd,
+                      "id": task_id, "chat": chat_id},
+        }
+
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "lark_md",
+                                "content": f"**{title}**" + (
+                                    f"（当前：{state}）" if state else "")}},
+    ]
+    elements.append({"tag": "action", "actions": [
+        _btn("开始做", "/start"),
+        _btn("做完啦", "/done"),
+        _btn("放一放", "/pause"),
+    ]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": elements,
+    }
+
+
+def send_task_action_card(
+    sender: Any,
+    *,
+    open_id: str,
+    title: str,
+    task_id: str,
+    chat_id: str,
+    state: str = "",
+) -> str:
+    """发事务动作卡，返回 message_id。发卡实现与 :func:`send_plan_confirm_card` 同一套。"""
+    if not open_id:
+        raise ValueError("发事务动作卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = task_action_card(title, task_id, chat_id=chat_id, state=state)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发事务动作卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
+
+def pairing_card(code: str, *, ttl_seconds: int) -> dict[str, Any]:
+    """配对卡（设计文档 11.9.8）。**一个按钮都没有** —— 这是刻意的。
+
+    这张卡**不发指令**，所以没有按钮可点：对方要做的事是「把码抄到终端」，
+    而抄码这个动作**无法也不该**由飞书的点击事件代替 —— 一张能被点的卡
+    会让「点一下就算配对」成立，那等于给陌生人一个自助入口。
+
+    因此卡上**只有码和怎么用**，且**不回显任何白名单内容**。
+
+    为什么给陌生人发这张卡不削弱白名单：白名单判定一个字都没动，
+    配对解决的是「**怎么拿到 open_id**」，而白名单为空仍然拒绝启动
+    （见 ``feishu/config.py::check_ready``）。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": "配对码"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": f"你的配对码（{ttl_seconds // 60} 分钟内有效）："}},
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": f"**{code}**"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": (
+                "在**这台机器的终端**里敲：\n"
+                f"`/pair {code}`\n\n"
+                "配对只做一件事：把这个对话的你的身份写进白名单。"
+                "它**不会**替你执行任何命令。")}},
+        ],
+    }
+
+
+def send_pairing_card(
+    sender: Any, *, open_id: str, code: str, ttl_seconds: int
+) -> str:
+    """发配对卡，返回 message_id。"""
+    if not open_id:
+        raise ValueError("发配对卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = pairing_card(code, ttl_seconds=ttl_seconds)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发配对卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
+
 #: 与 :data:`VIEW_CHOICE_ACTION` **同族**：都是「点了就执行，不落库、
 #: 不等回复」的即时动作。菜单不需要 pending 记录，因为菜单项本身
 #: 没有「过期即拒」的安全含义 —— 点错了顶多跑一次只读视图或重发一张卡。

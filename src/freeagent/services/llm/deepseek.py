@@ -40,6 +40,7 @@ from .rules import (
     TITLE_MAX_LEN,
     _MIN_PREFIX,
     _WS_RE,
+    strip_title_edges,
 )
 
 __all__ = [
@@ -315,7 +316,10 @@ class DeepSeekProvider(LLMProvider):
             title = self._chat(system, f"输入：{text}", max_tokens=64).strip()
         except LLMError as exc:
             return self._degrade(exc).refine_title(text)
-        cleaned = title.strip(" \t\n\"'「」《》")
+        # 剥两端时**必须连标点一起剥**：模型照提示词剥掉了「记一下」，
+        # 但常把后面的冒号留在标题头上（实测「记一下：X」→「：X」）。
+        # 只 strip 空白和引号挡不住这种 —— 见 rules.TITLE_EDGE_CHARS。
+        cleaned = strip_title_edges(title)
         if not cleaned:
             return self._degrade(
                 LLMError("模型返回了空标题", provider=PROVIDER_NAME)

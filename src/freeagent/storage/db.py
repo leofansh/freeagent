@@ -31,7 +31,13 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-SCHEMA_VERSION = 12
+#: 13 = 配对码表（设计文档 11.9.8）。
+#:
+#: ⚠️ 加了 ``_MIGRATIONS`` 条目**必须**同时改这个数，否则那条迁移永远跑不到
+#: ——而症状是「表不存在」，不是「版本号不对」：
+#: 迁移循环是 ``range(current, SCHEMA_VERSION)``，版本停在 12 时
+#: 「12 → 13」那一格根本不在循环里。
+SCHEMA_VERSION = 14
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -132,6 +138,53 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 可空：终端发起的没有飞书身份，那是正常情况——
         # 不该为了非空而填一个「随便某个人」。
         "ALTER TABLE tasks ADD COLUMN delegate_requested_by TEXT",
+    ),
+    (
+        "12 → 13：pairing_codes（配对流程，设计文档 11.9.8）",
+        # 治「第一次装时手里没有 open_id」的死循环：陌生私聊里 bot 回一条
+        # 带配对码的卡，用户把码粘回终端，码过期即失效。
+        #
+        # ## 为什么**单独一张表**，而不是复用 pending_approvals
+        #
+        # 那张表的语义是「**有人要批准某件事**」：有 subject / decision /
+        # decided_by / kind，且 resolve() 里写死了「首次决定不可篡改」。
+        # 配对码不是批准 —— 它是「**证明我认识这个人**」，没有「谁批准谁」
+        # 这一层，硬塞进去会让「决策不可篡改」那条纪律跑到不相干的地方。
+        #
+        # ## 为什么存**哈希**而不是明文
+        #
+        # 配对码是「谁能指挥本机」的一次性门票。明文落库 = 多一份可被
+        # 读走的凭据；而这里没有任何查询需求（校验就是「拿码算哈希比对」）。
+        # 代价是「码丢了只能重新生成」，而那本来就是短 TTL 的一次性码。
+        #
+        # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等。
+        """
+        CREATE TABLE IF NOT EXISTS pairing_codes (
+            code_hash   TEXT PRIMARY KEY,
+            open_id     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            used_at     TEXT
+        )
+        """,
+    ),
+    (
+        "13 → 14：stop_requests（第六道闸门「停止」—— 补上漏掉的迁移）",
+        # ``663c3f0`` 把这张表加进了 ``_SCHEMA``，但**既没升版本号也没加迁移
+        # 条目** —— ``init_schema`` 只在 ``user_version < 1`` 的新库上跑，
+        # 于是所有既有库永远缺这张表。症状不是「版本不对」而是
+        # ``no such table: stop_requests``，且只在执行器真的走到
+        # 「等人点停止」那一步才炸（本文件头部注释预言过的那种病）。
+        #
+        # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等；
+        # 新库走 init_schema 时已有同款建表，重复执行无害。
+        """
+        CREATE TABLE IF NOT EXISTS stop_requests (
+            credential  TEXT PRIMARY KEY,
+            requested_by TEXT,
+            requested_at TEXT NOT NULL
+        )
+        """,
     ),
 )
 
@@ -324,6 +377,28 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     decided_at      TEXT,
     open_message_id TEXT,
     requested_by    TEXT
+);
+
+-- 配对码（设计文档 11.9.8）。治「第一次装时手里没有 open_id」的死循环：
+-- 陌生**私聊**里 bot 回一张带配对码的卡，用户把码粘回终端 ``/pair <码>``。
+--
+-- 跨进程：桥接**签发**、终端**核销**，所以必须落盘（进程一挂就没了）。
+--
+-- ⚠️ 为什么**只存哈希**：配对码是「谁能指挥本机」的一次性门票，而这张表
+-- 没有任何查询需求（校验就是「拿码算哈希比对」）。明文落库等于**多一份
+-- 可被读走的凭据**，而它的代价只是「码丢了重新生成」—— 那本来就是
+-- 短 TTL 的一次性码。
+--
+-- ⚠️ 为什么**不**复用 pending_approvals：那张表的语义是「**有人要批准
+-- 某件事**」，有 subject / decision / decided_by，且 resolve() 里写死了
+-- 「首次决定不可篡改」。配对码不是批准 —— 它是「证明我认识这个人」，
+-- 没有「谁批准谁」这一层，硬塞进去会让那条纪律跑到不相干的地方。
+CREATE TABLE IF NOT EXISTS pairing_codes (
+    code_hash   TEXT PRIMARY KEY,
+    open_id     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    used_at     TEXT
 );
 
 -- Plan 模式（12.7.2）的会话状态。**刻意独立成表，不进 tasks**：

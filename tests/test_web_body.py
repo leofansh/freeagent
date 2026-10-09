@@ -19,6 +19,7 @@ from freeagent.web.body import (
     MAX_BODY,
     MAX_IMAGE_BODY,
     _DRAIN_LIMIT,
+    discard_body,
     read_json,
 )
 
@@ -160,3 +161,68 @@ def test_malformed_json_path_needs_no_drain():
     with pytest.raises(ValueError, match="合法 JSON"):
         read_json(rfile, headers(len(raw)))
     assert rfile.read_bytes == len(raw)
+
+
+# --- discard_body：拒绝路径的那道闸 ---------------------------------------- #
+#
+# 为什么单独一组：``_drain`` 只在「体积超限」时被调用，而 **401 / 404 两条
+# 拒绝路压根不经过 read_json** —— 它们直接回响应，请求体一个字节都没读。
+#
+# 实测（2026-10-08）：``tests/test_web.py::test_wrong_post_path_404`` 偶发
+# ``WinError 10053``，凶手就在这里。它之所以**看起来**像「测试不稳」，是因为
+# :func:`_drain` 文档里写的第2 层后果 —— 被中止的套接字会**连累之后无关的
+# 连接**，于是受害者每次都不一样。
+
+
+def test_declared_body_is_drained():
+    """拒绝前必须把已声明的请求体**读干净**。
+
+    不读就关连接 → Windows 发 RST → 客户端**连已经发出的 404 都读不到**。
+    """
+    declared = 4096
+    rfile = FakeRfile(b"x" * declared)
+    discard_body(rfile, headers(declared))
+    assert rfile.read_bytes == declared, "拒绝前没读干净，连接会以 RST 收尾"
+
+
+def test_no_content_length_reads_nothing():
+    """没有 Content-Length（GET 落到这条路上）就不该去读。
+
+    刻意不是「读一点试试」—— 那会阻塞在一个没有长度的流上。
+    """
+    rfile = FakeRfile(b"")
+    discard_body(rfile, {})
+    assert rfile.read_bytes == 0
+
+
+def test_zero_length_reads_nothing():
+    rfile = FakeRfile(b"")
+    discard_body(rfile, headers(0))
+    assert rfile.read_bytes == 0
+
+
+def test_undecodable_length_is_ignored_not_raised():
+    """Content-Length 不可解析时**不抛**。
+
+    这条路的调用方正在「准备拒绝这个请求」，而拒绝一个请求时抛异常
+    会把 404 变成 500 —— 拒绝失败比拒绝本身更糟。
+    """
+    rfile = FakeRfile(b"abc")
+    discard_body(rfile, {"Content-Length": "abc"})   # 不抛即通过
+    assert rfile.read_bytes == 0
+
+
+def test_discard_is_bounded_by_the_drain_limit():
+    """声明 10 GB 不能真读 10 GB —— 那本身就是 DoS 面。"""
+    huge = 10 * 1024 * 1024 * 1024
+    rfile = FakeRfile(b"x" * _DRAIN_LIMIT)
+    discard_body(rfile, headers(huge))
+    assert rfile.read_bytes == _DRAIN_LIMIT
+    assert rfile.read_bytes < huge
+
+
+def test_discard_stops_when_peer_sent_less_than_declared():
+    """对端谎报长度（或中途断开）时不能死等。"""
+    rfile = FakeRfile(b"x" * 10)
+    discard_body(rfile, headers(999_999))
+    assert rfile.read_bytes == 10, "对端已经关了还在读就是挂死"

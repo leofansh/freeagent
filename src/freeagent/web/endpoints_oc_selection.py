@@ -1,25 +1,33 @@
-"""OpenCode 四段选择的 Web 端点：读选项、改「日常可选模型」清单。
+"""OpenCode 四段选择的 Web **读**端点。
 
-## 为什么单独一个模块
+## 为什么读与写是两个模块（2026-10 拆）
+
+这个模块的 docstring 一直写着「只读 / 写**刻意拆成两条**」，而实际上两个
+方向挤在同一个文件里——**说了没做**。写侧搬去了
+:mod:`.endpoints_oc_selection_write`（改选择、改清单）与
+:mod:`.endpoints_oc_dispatch`（建委派事务）。
+
+分三条而不是两条，是因为第三件事**根本不是「改选择」**：
+:func:`~.endpoints_oc_dispatch.oc_dispatch` 建的是一条**事务**，
+落的是 ``tasks`` 表。把它塞进 ``oc_selection_write`` 会让模块名与内容
+不符——而模块名不符的代价是后来的人以为改选择会连带建事务。
+
+**为什么要拆**：``tests/test_web.py::TestWebPackageStaysSmall`` 守着
+web 包每个文件 ≤ 250 行。那条守卫的意义正是逼这种职责分流，
+所以「超了就拆」不是绕过它，是照它行事。
+
+## 为什么这个页签与飞书共用一份选项
 
 编程页签要的东西和飞书那四张卡**完全一样**，所以它必须走
 :mod:`freeagent.services.oc_discovery` —— 那是两个前端共用的发现层。
 如果 Web 自己查一遍 OpenCode，就会变成两套实现，而它们的症状是
 「Web 上选得到、飞书里选不到」，且没人知道该信哪个。
 
-## 只读 / 写**刻意拆成两条**
+## 读是**纯观测**，可以随手做
 
-照抄委派白名单那条规矩（设计文档 12.7.1）：
-
-- 读是纯观测，可以随手做（页面每次打开都要读）
-- 写清单是**配置变更**，得单独一步，且要能审计
-
-## 为什么不提供「连接提供商」
-
-``/config/providers`` 只有 GET，而且实测**返回明文 API Key**
-（2 个 provider 带 key）。让凭据流经一个**无鉴权**的 Web 界面，等于把
-密钥摊在页面上。所以「配凭据」留在 OpenCode Desktop 里做 ——
-FreeAgent 只管「日常用哪些模型」。
+页面每次打开都要读，且一次请求给全——选项来自**同一个快照**
+（起一次 opencode 进程约 7 秒，缓存 30 秒），而四个下拉框是**同时**
+要渲染的。分四次请求只会让用户看四次转圈。
 
 ## 为什么清单放 FreeAgent 侧而不是推进 OpenCode
 
@@ -33,86 +41,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..app import App
-from ..domain import FreeAgentError
 from ..services import oc_discovery as discovery
 from ..services import oc_selection as sel
 from .endpoints_feishu import state_home_for
-
-def oc_dispatch(app: App, body: dict[str, Any]) -> dict[str, Any]:
-    """``POST /api/oc/dispatch`` —— 用当前这套选择，建一条委派事务。
-
-    ## 为什么**不**拼一条 ``/delegate …`` 命令发给 ``/api/chat``
-
-    看着更省事（复用 ``command_payload``），但有两个真问题：
-
-    1. **空脉络会把参数错位。** :func:`freeagent.cli.app.parse_delegate_args`
-       用 ``if seg`` 过滤空段，于是 ``proj | | brief`` 变成**两**段 →
-       角色取到 brief、需求为空 → 报「格式不对」。而脉络恰恰常常该留空
-       （由 :meth:`Repl._create_delegation` 退回第一条）。
-    2. 命令字符串是**第二份参数契约**。字段顺序、分隔符规则一旦和
-       :meth:`Repl._cmd_delegate` 那边的理解错开，症状是「建出来的任务
-       需求是空的」—— 而那看着像用户没写清楚。
-
-    所以直接调 :meth:`Repl._create_delegation`：它就是命令与自然语言
-    **共用**的那个唯一入口，白名单闸门、脉络归属、
-    ``delegate_chat_id`` / ``delegate_requested_by`` 全在那一处（12.1.1
-    「一份能力一份实现」）。
-
-    ## 需求必须**单行**
-
-    实测：提示里只要有换行，opencode 就判定为「复杂任务」并升级到主 agent
-    的强模型、**无视** ``--model``，于是必然失败。那是 opencode 的行为，
-    不是我们的 —— 所以在这里挡，并说清原因。
-
-    ## 建了事务**不等于**开始跑
-
-    执行器是独立进程，它扫「已确认且已 ``/start``」的事务。所以这里
-    **不**假装任务已经在跑；返回的话术里说清下一步。
-    """
-    from .commands import _web_repl
-
-    home = state_home_for(app)
-    selection = sel.load_selection(home)
-
-    brief = str(body.get("brief") or "").strip()
-    if not brief:
-        raise FreeAgentError("先说要做什么 —— 一句话就行")
-    if "\n" in brief or "\r" in brief:
-        raise FreeAgentError(
-            "需求要写成一行。含换行时 opencode 会判成复杂任务、"
-            "升级到它自己的强模型并无视你选的模型，然后失败。"
-        )
-
-    project = str(body.get("project") or "").strip() or selection.project
-    if not project:
-        raise FreeAgentError(
-            "还没选项目。上面选一个，或用 `/delegate <项目> | <脉络> | <需求>`。")
-
-    role_name = str(body.get("role") or "").strip()
-
-    repl = _web_repl(app)
-    task, err, role, by_default = repl._create_delegation(project, role_name, brief)
-    if err:
-        raise FreeAgentError(err)
-
-    note = "（你没指定脉络，用了第一条）" if by_default else ""
-    return {
-        "ok": True,
-        "task_id": task.id,
-        "title": task.title,
-        "role": role.name,
-        "role_by_default": by_default,
-        "selection": {
-            "project": selection.project, "agent": selection.agent,
-            "model": selection.model, "variant": selection.variant,
-        },
-        "next": (
-            "已建好事务" + note + "。执行器是独立进程，只跑「已确认且已 /start」 的。"
-            f"所以还要两步：发 `/start {task.id[:8]}`，"
-            "然后跑执行器（tools 目录里那个 delegate）。"
-            "之后 opencode 每要动手一次，会在飞书给你一张授权卡。"
-        ),
-    }
 
 
 def _options_as_dict(options: list[sel.Option]) -> list[dict[str, str]]:
@@ -139,6 +70,16 @@ def oc_options(app: App) -> dict[str, Any]:
 
     current = sel.load_selection(home)
     snap = discovery.snapshot()
+    # 工作模式失效可见化（设计文档 11.13.8 / 11.14）：复用同一份 snapshot 里的
+    # agents，不额外起 opencode 进程。取不到列表时不误报（discovery_ok 已单独提示）。
+    agent_rows = snap.agents or []
+    agent_warning = None
+    if current.agent and agent_rows:
+        if not sel.current_agent_is_valid(agent_rows, current.agent):
+            agent_warning = (
+                f"工作模式「{current.agent}」已失效（该项目可能没有它，"
+                "或 OpenCode 已更新）。请在上方重选。"
+            )
     curated = sel.load_curated_models(home)
 
     # 「全部已连接模型」= 把清单临时清空再查。这看着绕，但它是**唯一**
@@ -159,6 +100,7 @@ def oc_options(app: App) -> dict[str, Any]:
             "model": current.model,
             "variant": current.variant,
         },
+        "agent_warning": agent_warning,
         "curated": {
             "models": curated,
             # 空 = 未挑过 = 界面应显示「全部 85 个」而不是「一个都没配」。
@@ -167,124 +109,3 @@ def oc_options(app: App) -> dict[str, Any]:
         },
         "discovery_ok": snap.projects is not None and snap.providers is not None,
     }
-
-
-def _validate_stage(stage: Any, value: Any) -> tuple[str, str]:
-    """校验并归一一个选择值。**空串是合法值**（=「不指定」）。
-
-    ``variant`` 段的空串表示「用模型基线」，而其余段的空串表示「用默认」——
-    所以这里不许把空串当非法，否则用户**清空**下拉框就会报错。
-    """
-    if not isinstance(stage, str) or not stage.strip():
-        raise FreeAgentError("缺少 stage")
-    stage = stage.strip()
-    # 段名就是 Selection 的字段名 —— 写错一个就在 getattr 时炸，
-    # 而 getattr 那个名字来自**用户载荷**，所以必须先过白名单。
-    if stage not in ("project", "agent", "model", "variant"):
-        raise FreeAgentError(
-            f"不认识的段：{stage}（应为 project/agent/model/variant）")
-    if value is None:
-        value = ""
-    if not isinstance(value, str):
-        raise FreeAgentError(f"{stage} 必须是字符串")
-    return stage, value.strip()
-
-
-def oc_selection_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
-    """``POST /api/oc/selection`` —— 记住四段选择。
-
-    ## 必须**按依赖顺序**落，不能照载荷顺序
-
-    推理档位是**依附于模型**的（``:func:`variant_options` 要拿模型去查它有哪些
-    档）。第一版照 ``body`` 的键顺序逐段校验，于是同一次请求里
-    ``{"model": "…fledge", "variant": "high"}`` 会失败：轮到 ``variant``
-    时模型**还没落盘**，于是拿不到档位列表、``high`` 被判成不可选。
-
-    症状是「选模型 + 选 High」——**最常见的那个组合**——根本提交不了，
-    而用户看到的只是一句「这个variant不可选」，指向完全错误的方向。
-
-    所以改成：先把四段归一到一个目标 :class:`Selection`，再**按
-    project → agent → model → variant 的顺序**依次校验并写入。
-
-    ## 为什么值要对着选项校验
-
-    载荷来自浏览器，而浏览器载荷用户可以随便改（改 JS、重发请求）。
-    不校验就等于「任何本地页面都能让机器人把活派到任意目录」——
-    那正好绕过项目白名单这唯一一道准入闸门。
-
-    而 ``variant`` 还要**额外交叉验一次**：它在 OpenCode 侧**不校验**
-    （实测错档也返回 204），所以错档只会表现成「选了 High 却没生效」。
-    """
-    home = state_home_for(app)
-    given = body.get("selection")
-    if not isinstance(given, dict):
-        raise FreeAgentError("缺少 selection")
-
-    # 1) 先把这次要改的四段归一，落到**目标状态**上。
-    #    clear_from 在每段赋值后清下游，于是「换了模型」会自动带走旧档位。
-    target = sel.load_selection(home)
-    incoming: dict[str, str] = {}
-    for key, raw in given.items():
-        stage, value = _validate_stage(key, raw)
-        # **赋值必须在 if 外面**：空串是合法输入，意思是「清掉这一段」。
-        # 把它也放进 ``if value:`` 里，症状就是「用户在下拉框里清空模型、
-        # 点保存，旧模型还在」—— 界面上看不出任何错误。
-        setattr(target, stage, value)
-        target.clear_from(stage)
-        if value:
-            incoming[stage] = value
-
-    # 2) 按依赖顺序校验。``variant`` 用的是 **target.model**（本次请求里的
-    #    那个），不是盘上那个 —— 这正是第一版的 bug。
-    snap = discovery.snapshot()
-    for stage in ("project", "agent", "model", "variant"):
-        value = incoming.get(stage, "")
-        if not value:
-            continue
-        if stage == "variant":
-            options = sel.variant_options(snap.providers or {}, target.model)
-        else:
-            options, _ = discovery.stage_options(stage, home=home)
-        if value not in {o.value for o in options}:
-            raise FreeAgentError(
-                f"这个{stage}不可选：{value[:40]}。"
-                "（可能已从清单里去掉，或 OpenCode 不再提供）")
-
-    sel.save_selection(target, home)
-    return {"ok": True, "selection": {
-        "project": target.project, "agent": target.agent,
-        "model": target.model, "variant": target.variant}}
-
-
-def oc_curation_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
-    """``POST /api/oc/curation`` —— 增删一个「日常可选模型」。
-
-    一次只动一个，因为界面上每个模型是一个开关；而批量替换（整份清单
-    PUT）需要一个「这份清单从哪来」的权威来源 —— 现在没有，
-    将来有了再说。**不做不存在的能力**比留一个空壳好。
-    """
-    home = state_home_for(app)
-    action = body.get("action")
-    model = body.get("model")
-    if action not in ("add", "remove"):
-        raise FreeAgentError("action 只能是 add 或 remove")
-    if not isinstance(model, str):
-        raise FreeAgentError("model 必须是字符串")
-
-    snap = discovery.snapshot()
-    available = {
-        o.value for o in sel.list_model_options(
-            snap.providers or {},
-            provider_filter=sel.connected_providers(snap.providers or {}))
-    }
-    model = model.strip()
-    if model not in available:
-        raise FreeAgentError(
-            f"这个模型现在不可用：{model[:40]}。"
-            "（只有已连接凭据的 provider 下的模型才能进清单）")
-
-    try:
-        models = sel.curate(action, model, home)
-    except ValueError as exc:
-        raise FreeAgentError(str(exc)) from exc
-    return {"ok": True, "models": models}

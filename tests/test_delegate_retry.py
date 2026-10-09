@@ -17,7 +17,7 @@ import pytest
 
 from freeagent.app import build_app
 from freeagent.delegate import run_once
-from freeagent.domain import RecordType
+from freeagent.domain import RecordType, ValidationError
 from freeagent.services.clock import FrozenClock
 from freeagent.services.delegate import (
     DelegationPolicy,
@@ -300,3 +300,202 @@ class TestErrorReasonReachesTheDatabase:
         body = app.artifacts.list_for_task(task.id)[-1].content
         app.close()
         assert "失败详情" not in body
+
+
+class TestManualRedispatch:
+    """``/redispatch``：人显式要求重来（设计文档 11.8 那条已知缺口）。
+
+    ## 为什么需要这一整类
+
+    「派发前就被拒」被**刻意不自动重派** —— 改配置前重试多少次都是同一个
+    结果，而 ``--watch`` 实测过那个坑：180 秒扫 60 轮、写 60 个产物版本，
+    真正的委派一条没干成。
+
+    但那是「没改配置」的判定。用户改好配置之后总得有办法让它重来，而落库
+    那句「可以 /note 记下原因后重派」是**空头承诺**：``note`` 对判定完全
+    不可见。于是那条只能变成死任务。
+
+    这类测试锁的是**恢复入口达成度**，不是机制 —— 机制那侧
+    （``TestPreDispatchRefusalIsNotRetriedForever`` 已经锁住了「没有 reset
+    记录时绝不放行」）不能被本类放宽。
+    """
+
+    def _records(self, *types):
+        return [_Rec(t) for t in types]
+
+    # ---- 纯形状：不碰数据库 ------------------------------------------------ #
+
+    def test_reset_unlocks_a_refused_attempt(self):
+        """派发前被拒 + 人要求重来 ⇒ 可以派了。"""
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_FAILED,
+                          RecordType.DELEGATION_RESET)
+        ) is False, "reset 之后必须可派，否则恢复入口没生效"
+
+    def test_reset_is_a_noop_without_a_previous_attempt(self):
+        """没派过就 reset 不该凭空造出一次「已尝试」—— 它本来就该派。"""
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_RESET)
+        ) is False
+
+    def test_reset_does_NOT_unlock_a_running_delegation(self):
+        """⚠️ **最关键的一条**：reset **不许**解除「正在跑」。
+
+        它只清「上次结局」，不清「在跑」。若一并清掉，就放行了一个还在跑
+        的委派 —— 而 ``--watch`` 每轮都扫，于是**两个进程改同一个项目目录**。
+        那正是 dangling 检查当初要防的事（第一版漏了它，回归测试当场抓住）。
+
+        所以 ``[failed, dispatched, reset]`` 仍判「别派」。
+        """
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_FAILED,
+                          RecordType.DELEGATION_DISPATCHED,
+                          RecordType.DELEGATION_RESET)
+        ) is True, "reset 绝不能放行正在跑的委派"
+
+    def test_reset_does_not_unlock_succeeded(self):
+        """已成功的也不该被 reset 放行 —— 判定侧保守，放行由服务层校验把关。
+
+        这条锁的是**判定侧不越权**：真正的拒绝理由在
+        :meth:`reset_delegation`，那里给的是一句面向用户的话。
+        """
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_DISPATCHED,
+                          RecordType.DELEGATION_SUCCEEDED,
+                          RecordType.DELEGATION_RESET)
+        ) is True
+
+    def test_reset_then_really_dispatched_blocks_again(self):
+        """reset 后真的又派了一次 ⇒ 又进入「在跑」，必须重新锁上。
+
+        顺序敏感：只清「有没有失败过」会放进第二个并发进程。
+        """
+        assert already_dispatched(
+            self._records(RecordType.DELEGATION_FAILED,
+                          RecordType.DELEGATION_RESET,
+                          RecordType.DELEGATION_DISPATCHED)
+        ) is True
+
+    # ---- 服务层校验：三条拒绝必须**互相可区分** ---------------------------- #
+
+    def test_refuses_a_running_delegation(self, tmp_path):
+        _app, db, _project, task, _policy = _wire(tmp_path)
+        # ``_wire`` 返回的 app 已经 close() 了（既有测试都自己 build_app 重开），
+        # 复用它会撞「Cannot operate on a closed database」。
+        app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        app.record_repo.append(task.id, RecordType.DELEGATION_DISPATCHED,
+                               "派出去了", app.clock.now())
+        with pytest.raises(ValidationError) as exc:
+            app.tasks.reset_delegation(task.id)
+        assert "正在跑" in str(exc.value)
+        app.close()
+
+    def test_refuses_a_succeeded_delegation(self, tmp_path):
+        _app, db, _project, task, _policy = _wire(tmp_path)
+        app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        app.record_repo.append(task.id, RecordType.DELEGATION_DISPATCHED,
+                               "派出去了", app.clock.now())
+        # ⚠️ 必须**推进时钟**再落第二条：``list_for_task``按 ``ts ASC, id ASC``
+        # 排序，而 ``id`` 是随机的 —— 同一时刻的两条记录顺序**不确定**。
+        # 不推进的话这条测试是「有时过有时不过」，而那种 flaky 会被当成
+        # 偶发而不被追。
+        app.clock.advance(seconds=1)
+        app.record_repo.append(task.id, RecordType.DELEGATION_SUCCEEDED,
+                               "做完了", app.clock.now())
+        with pytest.raises(ValidationError) as exc:
+            app.tasks.reset_delegation(task.id)
+        assert "做完" in str(exc.value)
+        app.close()
+
+    def test_refuses_when_never_dispatched(self, tmp_path):
+        _app, db, _project, task, _policy = _wire(tmp_path)
+        app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        with pytest.raises(ValidationError) as exc:
+            app.tasks.reset_delegation(task.id)
+        assert "还没派出去过" in str(exc.value)
+        app.close()
+
+    def test_refuses_a_non_delegation_task(self, tmp_path):
+        """普通事务没有「重派」这回事 —— 理由必须与上面三条不同。
+
+        四个理由若都含糊成一句「不能重派」，用户不知道自己该做什么。
+        """
+        app = build_app(tmp_path / "a.db", clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        role = app.roles.create("工作")
+        plain = app.tasks.create("普通事", [role.id])
+        with pytest.raises(ValidationError) as exc:
+            app.tasks.reset_delegation(plain.id)
+        assert "不是委派事务" in str(exc.value)
+        app.close()
+
+    # ---- 端到端：恢复入口真的让执行器再派一次 -------------------------------- #
+
+    def test_end_to_end_reset_lets_the_executor_dispatch_again(self, tmp_path):
+        """被拒 → reset → **真的再派一次**（不是只改了判定）。
+
+        三步都要成立，否则就是「命令说成功了但库里那条还是不让派」——
+        症状是用户以为修好了，扫 sixty 轮什么也没发生。
+        """
+        _app, db, _project, task, policy = _wire(tmp_path)
+
+        # 1) 真机形状的「派发前就被拒」：只有 failed，前面没有 dispatched。
+        app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17, 1)))
+        app.record_repo.append(task.id, RecordType.DELEGATION_FAILED,
+                               "项目不在白名单里", app.clock.now())
+        assert eligible_tasks(app.task_repo, app.record_repo) == [], (
+            "前提不成立：refused 本来就该被挡住"
+        )
+
+        # 2) 人改好配置后要求重来。
+        #    ⚠️ 先推进时钟：``reset_delegation`` 内部用 ``clock.now()``，
+        #    与上面那条 failed 会是同一刻。而 ``list_for_task`` 按
+        #    ``ts ASC, id ASC`` 排、``id`` 随机 —— 不推进就可能读到
+        #    「reset 在前、failed 在后」，于是又变回 refused，这条测试
+        #    就变成「有时过有时不过」。
+        app.clock.advance(seconds=1)
+        app.tasks.reset_delegation(task.id, "白名单加好了")
+        assert len(eligible_tasks(app.task_repo, app.record_repo)) == 1, (
+            "reset 之后它必须重新够格 —— 这条不成立就等于没做恢复入口"
+        )
+        app.close()
+
+        # 3) 执行器真的跑起来了。
+        ok = _RecordingRunner(
+            out=json.dumps({"type": "text", "text": "这回成了", "sessionID": "s10"})
+        )
+        report = run_once(db_path=db, runner=ok, policy=policy, gate=_AllowAllGate())
+        assert len(ok.calls) == 1, "执行器应当真的又派了一次"
+        assert report.succeeded == 1, report.notes
+
+    def test_reset_is_recorded_with_its_reason(self, tmp_path):
+        """reset 落进只追加日志：谁、何时、为何要求重来必须可查。
+
+        不落库就等于「这次重派没有出处」，而审计一条委派为什么重跑
+        是排查重复副作用的前提。
+        """
+        _app, db, _project, task, _policy = _wire(tmp_path)
+        app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        app.record_repo.append(task.id, RecordType.DELEGATION_FAILED,
+                               "没有闸门", app.clock.now())
+        app.tasks.reset_delegation(task.id, "配好闸门了")
+        resets = [r for r in app.record_repo.list_for_task(task.id)
+                  if r.type is RecordType.DELEGATION_RESET]
+        app.close()
+        assert len(resets) == 1, "reset 应当恰好落一条"
+        assert "配好闸门了" in resets[0].content
+        assert "refused" in resets[0].content, (
+            "记录里应当写清上次是什么结局，否则事后看不出重派理由"
+        )
+
+    def test_reason_is_optional(self, tmp_path):
+        """不写原因也该能用 —— 强制填一个「随便某句话」只会让人瞎填。"""
+        _app, db, _project, task, _policy = _wire(tmp_path)
+        app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17)))
+        app.record_repo.append(task.id, RecordType.DELEGATION_FAILED,
+                               "没有闸门", app.clock.now())
+        app.tasks.reset_delegation(task.id)
+        resets = [r for r in app.record_repo.list_for_task(task.id)
+                  if r.type is RecordType.DELEGATION_RESET]
+        app.close()
+        assert len(resets) == 1
+        assert resets[0].content.strip(), "内容不能是空串"

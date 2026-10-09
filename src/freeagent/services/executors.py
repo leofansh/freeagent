@@ -2,7 +2,11 @@
 
 ## 为什么要这一层
 
-委派要启动一个外部执行器（当前只有 opencode），而**那个东西的协议会变**。
+委派要启动一个外部执行器，而**那个东西的协议会变**。
+
+注册表里现有两个执行器：**opencode**（V1 已验证、V2 未验证）与
+**hermes**（未验证）。后者**只能登记、不能派发**，而且它与 opencode
+**不是同一种接法**（HTTP+SSE vs stdio JSON-RPC）—— 见下面 hermes 那节。
 
 V1 → V2 时 permission 模型的字段名全变了（``permission`` 对象 / ``bash`` /
 ``task`` → ``permissions`` 数组 / ``shell`` / ``subagent``），而**旧字段被静默
@@ -45,8 +49,10 @@ __all__ = [
     "all_adapters",
     "known_majors",
     "dispatchable_majors",
+    "known_executors",
     "V1_FIELD_NAMES",
     "V2_FIELD_RENAMES",
+    "HERMES_FIELD_NAMES",
 ]
 
 
@@ -127,6 +133,12 @@ class ExecutorAdapter:
     #: 可以被测试断言，而不是埋在拼 dict 的代码里。
     field_names: dict[str, str]
     build_permission_config: Callable[[], dict[str, Any]]
+    #: ``/ask`` 用的**只读**权限配置（11.10.3 的 ``read`` 桶）。
+    #:
+    #: 刻意与 :attr:`build_permission_config` 分开：委派要「改了文件问人」，
+    #: 而 ``/ask`` 必须「**改不了**」。合成一份的话，其中一条路必然拿到
+    #: 错误的权限 —— 而错的那一侧是「``/ask`` 变成了无人监督的代码执行」。
+    build_read_only_config: Callable[[], dict[str, Any]]
     parse_request: Callable[[Any], ToolPermission | None]
     build_reply: Callable[[str], dict[str, str]]
     #: 提问链路。与上面两个**同样**把版本差异关在这里：
@@ -184,6 +196,49 @@ def _v1_permission_config() -> dict[str, Any]:
             f["shell"]: "ask",
             f["web_fetch"]: "ask",
             f["web_search"]: "ask",
+            f["subagent"]: "deny",
+            f["external_dir"]: "deny",
+        },
+    }
+
+
+def _v1_read_only_config() -> dict[str, Any]:
+    """V1 的**只读**权限配置 —— ``/ask`` 用的那一份（设计文档 11.10.3 的 ``read`` 桶）。
+
+    ## 为什么必须单独一份，而不能复用 :func:`_v1_permission_config`
+
+    11.10.6 说 ``/ask`` 「不落库、不问任何审批」，理由是「它不改任何东西，
+    所以没有『有副作用』可拦」。**那句话是个假设**：V1 未命中规则时大多默认
+    ``allow``（见 11.8.1 的版本陷阱表），所以一个「不配权限」的 ``/ask``
+    就是一个**无人监督的、能改代码的**自主运行 —— 恰好是那六道闸门要防的
+    东西。
+
+    所以「不改任何东西」必须由**配置强制**，不能指望执行器自觉：
+    ``edit`` / ``bash`` 一律 ``deny``（不是 ``ask`` —— ``/ask`` 没有闸门，
+    ``ask`` 等于挂死在那儿等人点，而这条命令的设计就是「随手用」）。
+
+    ## 逐条
+
+    - ``*: allow`` —— 底子，``read``/``grep``/``glob`` 是「问一句」必需的
+    - ``edit`` / ``bash``: ``deny`` —— **这就是「不改任何东西」的实现**
+    - ``webfetch`` / ``websearch``: ``deny`` —— 出网等于把问题送到别处；
+      11.10.3 的 ``read`` 桶只含「只读地看这个项目的文件」
+    - ``task``: ``deny`` —— 不让执行器拉子代理。11.10.4 明确「不因为
+      『预算还够』而放行」
+    - ``external_directory``: ``deny`` —— 永不越界（与委派同一道）
+
+    ⚠️ **键序仍然有意义**：V1 是 ``last matching rule wins``，
+    ``*: allow`` 必须**放最前**，所有 ``deny`` 放最后。
+    """
+    f = V1_FIELD_NAMES
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        f["container"]: {
+            "*": "allow",
+            f["edit"]: "deny",
+            f["shell"]: "deny",
+            f["web_fetch"]: "deny",
+            f["web_search"]: "deny",
             f["subagent"]: "deny",
             f["external_dir"]: "deny",
         },
@@ -335,6 +390,7 @@ _V1 = ExecutorAdapter(
     verified=True,
     field_names=V1_FIELD_NAMES,
     build_permission_config=_v1_permission_config,
+    build_read_only_config=_v1_read_only_config,
     parse_request=_v1_parse_request,
     build_reply=_v1_build_reply,
     parse_question=_v1_parse_question,
@@ -380,6 +436,10 @@ _V2 = ExecutorAdapter(
     verified=False,
     field_names=V2_FIELD_RENAMES,
     build_permission_config=_v2_unverified("permission 配置形状"),
+    # 只读那份同样未验证 —— 而它**更**不能猜：`/ask` 的全部安全性就是
+    # 「edit/bash 一律 deny」，猜错的形状若让 deny 落空，`/ask` 就变成了
+    # 无人监督的代码执行，而这条命令的设计是「随手用」。
+    build_read_only_config=_v2_unverified("只读 permission 配置形状"),
     parse_request=_v2_unverified("permission.asked 事件形状"),
     build_reply=_v2_unverified("reply 载荷形状"),
     # 提问链路一样：V2 有没有换路径或换了字段名，都未验证。
@@ -390,9 +450,129 @@ _V2 = ExecutorAdapter(
 )
 
 
-# ── 注册表 ──────────────────────────────────────────────────────────────
+# ── hermes（**未验证**：照文档看形状很顺，但一次真机都没验过）────────────
+#
+# ## 它有**两个**接口面，别只看一个
+#
+# 1. **ACP**（``hermes acp`` / ``acp_adapter.entry``）—— stdio 上的 JSON-RPC
+# 2. **API Server**（``hermes gateway`` 起的 HTTP 端点，默认 8642）
+#    —— **OpenAI 兼容**的 ``POST /v1/chat/completions``，以及
+#    一组**有状态**的 run 端点：``POST /v1/runs``、
+#    ``GET /v1/runs/{id}/events``（SSE）、``POST /v1/runs/{id}/stop``、
+#    ``POST /v1/runs/{id}/approval``，能力面见 ``GET /v1/capabilities``
+#    （``run_submission`` / ``run_events_sse`` / ``run_stop`` / ``run_approval``）。
+#
+# ## 所以「接第二个执行器」比想象中容易，但仍然不能现在就派
+#
+# 值得高兴的那半：走 **API Server** 那条面，形状与 opencode **同构** ——
+# 同为 HTTP + SSE，同样「建会话 → 流式读数 → 中止 → 回应授权」，
+# 连授权事件都对得上（opencode ``permission.asked`` ↔ hermes
+# ``approval.request`` + ``waiting_for_approval``）。**不需要引 ACP SDK，
+# 也不需要换传输层**：本仓给 opencode 用的就是标准库 ``urllib``。
+#
+# 仍然不能派的那半：上面这些都是**读文档读来的，一次都没对着真机验过**。
+# 而这正是 11.8.1 吃过的亏 —— 照文档接线、字段名对不上时**不报错**，
+# 配置被静默忽略，闸门失效，且失效方向是回到 allow
+# （见 :mod:`docs.postmortem.0001`）。
+#
+# 所以这里能做、且只做的是：把它**登记**成「本仓知道它存在」，
+# 但**一个协议函数都不实现** —— 猜一个「看起来很像对的」形状比拒绝更危险。
+#
+# > ⚠️ 另一条**绝不能走**的捷径：直接把 hermes 当 OpenAI 兼容后端来问
+# > （``/v1/chat/completions``）。那条面**工具已在服务端执行完毕**，
+# > 回放出来的 ``function_call`` 一律是 ``"status": "completed"`` ——
+# > 也就是说 agent 已经动过 terminal 和文件系统了，本仓**看不到也拦不住**。
+# > 那等于绕开 11.8 的全部闸门，而症状只是「能用」。
+#
+# ## 一个反向结论：这条面**走不了 11.8 委派**
+#
+# 读 ``tools/approval_context.py``（**未实测**）：它把 **``api_server``
+# 判为 unattended 平台**，注释原话是「there is no human who can resolve a
+# pending approval … blocks the session for the full approval timeout」。
+# 所以这条面上**做不了** 11.8 那条「执行期逐次授权」——
+# pending 产生后没人能答，只会阻塞到超时再 fail-closed。
+#
+# 好消息是危险命令改由 ``approvals.unattended_mode`` 裁决，而它
+# **默认 deny，未知值也 deny**（``_binary_approval_mode`` 只放行
+# ``approve``/``off``/``allow``/``yes``）—— 连配错了都是 fail-closed。
+#
+# **结论**：hermes 在这条面上**只适合 ``/ask``（只读问答），不适合 11.8 委派**。
+# 这与 19.4 的领域划分对得上 —— 编程走 opencode（有逐次授权、能委派），
+# 办公走 hermes（问答）。不是妥协，是两个执行器的能力面本来就不一样。
 
-_ADAPTERS: tuple[ExecutorAdapter, ...] = (_V1, _V2)
+#: hermes 侧**没有**与 V1 对位的「按工具名写 permission 配置」那一面。
+#:
+#: 它的闸门是**两套东西加起来的**：
+#:
+#: - **profile 级三档审批模式**（``manual`` / ``smart`` / ``off``）——
+#:   回答「这类操作要不要**问人**」；
+#: - **run 级授权端点** —— 命中策略时 run 发 ``approval.request`` 事件、
+#:   停在 ``waiting_for_approval``，由客户端 ``POST /v1/runs/{id}/approval``
+#:   决定 ``once``（放行这一次）或 ``deny``（拦下）。
+#:
+#: 而本仓 11.10.3 的三桶回答的是第三个问题：「这个执行器**能不能**做这类事」。
+#: **三者不是同一语义** —— 尤其 ``manual`` **仍会执行**，只是先问一句；
+#: 本仓要的是「``/ask`` 根本改不了」（11.10.6），靠三档模式是拿不到的。
+#:
+#: 所以这里**刻意留空**，不把 ``manual`` 之类塞进 ``field_names`` 假装是
+#: 键名映射。留空以后，任何试图按 opencode 那套拼 permission 配置的代码
+#: 都会立刻拿到空字典而炸掉，而不是拿到一份看起来合理、实则无效的映射。
+HERMES_FIELD_NAMES: dict[str, str] = {}
+
+
+def _hermes_unverified(what: str) -> Callable[..., Any]:
+    def _raise(*_args: Any, **_kwargs: Any) -> Any:
+        raise UnverifiedExecutorError(
+            f"hermes 的 {what} 尚未验证。"
+            "照文档看，它的 API Server（HTTP + SSE，默认 8642）与 opencode "
+            "**同构**：建 run、读 SSE 事件、``/stop`` 中止、``/approval`` 回应授权，"
+            "连 ``approval.request`` 都对得上 opencode 的 ``permission.asked``。"
+            "但那些是**读来的，没对着真机验过一次** —— 而 11.8.1 的教训正是"
+            "「照文档接线、字段名对不上时不报错、闸门静默失效」。"
+            "要接它：先起 `hermes gateway`（需 `API_SERVER_ENABLED=true` "
+            "与 `API_SERVER_KEY`），按设计文档 11.10.8 那组验收判据逐项实测，"
+            "再回来填这几个函数并把 `verified` 改成 True。"
+        )
+
+    return _raise
+
+
+_HERMES_0 = ExecutorAdapter(
+    executor="hermes",
+    major=0,
+    verified=False,
+    field_names=HERMES_FIELD_NAMES,
+    build_permission_config=_hermes_unverified("permission 配置形状"),
+    build_read_only_config=_hermes_unverified("只读配置形状"),
+    parse_request=_hermes_unverified("授权请求事件形状"),
+    build_reply=_hermes_unverified("答复载荷形状"),
+    parse_question=_hermes_unverified("提问事件形状"),
+    build_question_reply=_hermes_unverified("提问答复载荷形状"),
+)
+
+
+# ── 注册表 ──────────────────────────────────────────────────────────────
+#
+# 11.10.7：**不做动态加载**，注册表就是代码里这一份元组。加一个执行器是
+# 加代码，不是加配置 —— 这样「有哪些执行器」永远是写代码时审过的，
+# 而不是运行时从别处下载来的。
+
+_ADAPTERS: tuple[ExecutorAdapter, ...] = (_V1, _V2, _HERMES_0)
+
+
+def known_executors() -> tuple[str, ...]:
+    """本仓**知道**的执行器名字，按注册表里的出现顺序去重。
+
+    这就是 11.10.2 说的「有哪些执行器」那份清单 —— 刻意**由注册表导出**
+    而不是另写一份常量：两份清单迟早会漂移，而漂移的方向是「探针说没有、
+    注册表里其实有」。
+
+    注意「知道」不等于「能派」：hermes 在列，但它 ``verified=False``。
+    """
+    seen: dict[str, None] = {}
+    for a in _ADAPTERS:
+        seen.setdefault(a.executor, None)
+    return tuple(seen)
 
 
 def all_adapters(executor: str = "opencode") -> tuple[ExecutorAdapter, ...]:

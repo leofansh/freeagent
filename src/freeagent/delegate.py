@@ -81,7 +81,8 @@ __all__ = ["Runner", "subprocess_runner", "run_once", "main",
            "ToolCardSender", "ServerFactory",
            "SUPPORTED_OPENCODE_MAJOR", "KNOWN_OPENCODE_MAJORS",
            "parse_major_version",
-           "detect_opencode_version", "version_mismatch_reason"]
+           "detect_opencode_version", "detect_hermes_version",
+           "version_mismatch_reason"]
 
 #: 回推飞书失败之类的问题走日志，不走 stdout —— stdout 是给用户看的报告，
 #: 混进 traceback 只会让人以为委派本身炸了。
@@ -155,11 +156,11 @@ def parse_major_version(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def detect_opencode_version(command: str = "opencode") -> int | None:
+def _detect_major_by_version_flag(command: str) -> int | None:
     """跑一次 ``<command> --version``，返回主版本号。
 
-    刻意**不在热路径上调用** —— 每次派发都多一个进程不合算，
-    所以只在 :func:`main` 启动时探一次，探不到就拒绝（见下）。
+    刻意与 :func:`parse_major_version` 分开：**解析**是纯函数（可测），
+    **调用**才有 IO。版本探测要能被测，就得先拆开。
     """
     import subprocess as _sp
 
@@ -176,6 +177,30 @@ def detect_opencode_version(command: str = "opencode") -> int | None:
     except (OSError, _sp.TimeoutExpired):
         return None
     return parse_major_version(f"{proc.stdout or ''}\n{proc.stderr or ''}")
+
+
+def detect_opencode_version(command: str = "opencode") -> int | None:
+    """跑一次 ``<command> --version``，返回主版本号。
+
+    刻意**不在热路径上调用** —— 每次派发都多一个进程不合算，
+    所以只在 :func:`main` 启动时探一次，探不到就拒绝（见下）。
+    """
+    return _detect_major_by_version_flag(command)
+
+
+def detect_hermes_version(command: str = "hermes") -> int | None:
+    """探测 hermes 的主版本。
+
+    ⚠️ **探到版本不等于能派发。** hermes 目前只**登记**在注册表里
+    （``verified=False``），它的传输层与 opencode 不同
+    （stdio JSON-RPC vs HTTP+SSE），协议形状一个都还没验。
+    探版本只是为了让 :mod:`freeagent.services.executor_probe` 能把
+    「没装 / 装了但探不到 / 装了但没验过」这三种状态**分开说**。
+
+    实测输出形如 ``Hermes Agent v0.21.3 (2026.9.14)``，
+    :func:`parse_major_version` 会取到 ``0``。
+    """
+    return _detect_major_by_version_flag(command)
 
 
 def version_mismatch_reason(
@@ -818,6 +843,27 @@ def run_with_tool_gate(
     try:
         with make_server(project, policy.command) as oc:
             session_id = oc.create_session()
+            # 工作模式失效守卫（设计文档 11.13.8 / 11.14）。
+            # OpenCode 对不存在的 agent 是「查表取不到就静默用默认」，
+            # 所以必须在这里显式判：失效就**响亮失败**，而不是派出去却
+            # 用了别的模式（那正是「看起来成功、实则退化」）。
+            if policy.agent:
+                try:
+                    _live_agents = oc.list_agents()
+                except Exception as exc:  # noqa: BLE001
+                    # 取不到列表 ≠ agent 失效。连不上时不误杀，只告警。
+                    log.warning("【执行期】取 /agent 失败，跳过工作模式校验：%s", exc)
+                else:
+                    from .services.oc_selection import agent_is_executable
+                    if not agent_is_executable(_live_agents, policy.agent):
+                        oc.abort(session_id)
+                        return DispatchOutcome(
+                            ok=False,
+                            summary=(
+                                f"工作模式「{policy.agent}」已失效：该项目可能没有它，"
+                                "或 OpenCode 已更新。请到「编程」页签重选工作模式后再派发。"
+                            ),
+                        )
             oc.prompt_async(session_id, brief, model=policy.model,
                             agent=policy.agent, variant=policy.variant)
             for kind, props in oc.events():
@@ -978,6 +1024,30 @@ def run_with_tool_gate(
         ok=True, summary=f"完成（{note}）",
         session_id=session_id or None, tool_calls=tuple(handled),
     )
+
+
+def pick_approver(users: frozenset[str] | set[str]) -> str:
+    """从白名单里选出**唯一审批人**。
+
+    ## 为什么不是 ``sorted()[0]``
+
+    白名单可能同时装着同一个人的两种 id：``open_id``（``ou_`` 开头，
+    卡片点击回传的身份）与租户级 ``user_id``（裸串）。两者是**互相独立
+    的串**，靠后缀比对认不出是同一人（:func:`_same_person` 只能做后缀
+    匹配，而实测 user_id 并不是 open_id 的后缀）。
+
+    实测踩坑（2026-10-09）：Web 建的委派没有飞书发起人，审批人兜底取
+    ``sorted()[0]`` —— 数字开头的 ``user_id`` 排在 ``ou_`` 前面被选中，
+    发出去的卡主人**自己点不动**，被「只有发起人能批」误拒。
+
+    所以：**优先选 ``ou_`` 开头的条目**（它与点击身份同一类型，必然能
+    比对）；没有才退回字典序第一个。发卡侧（``_receive_id_type``）两种
+    id 都能发，但**比对**只有 open_id 这一头是可靠的。
+    """
+    open_ids = sorted(u for u in users if u.startswith("ou_"))
+    if open_ids:
+        return open_ids[0]
+    return next(iter(sorted(users)), "")
 
 
 def task_requester(task, fallback: str = "") -> str:
@@ -1344,10 +1414,20 @@ def _record_result(app, task, outcome: DispatchOutcome) -> None:
         (summary_text or outcome.detail or "")[:300],
         now,
     )
+    # 这句承诺必须指向**真能重置**的入口。原文写「可以 /note 记下原因后重派」
+    # 是个空头承诺：note 不在 terminal 集合里，对幂等判定完全不可见，
+    # 什么也重置不了 —— 于是「一次失败变死任务」而用户拿到一句「可以重派」。
+    # 现在指向 /redispatch，那条真的会落一条 DELEGATION_RESET。
+    #
+    # 刻意不提「执行期失败才重派」这种区分：那句话要求这里知道「本次失败
+    # 属于哪一类」，而判定在 services/delegate.py 里、这里只看得到 ok 与
+    # summary —— **断言一个本函数无权确认的全局状态就是撒谎**（与设计文档
+    # 8.2 那条「文本必须能从本函数持有的事实推出」同源）。
+    # 真正分「派发前 / 执行期」的地方是 :func:`attempt_state`，它才是权威。
     app.tasks.note(
         task.id,
         ("执行器已产出结果，待你验收"
-         if outcome.ok else "执行失败，可以 /note 记下原因后重派"),
+         if outcome.ok else "执行失败；改好原因后 /redispatch <id> 可以重新派发"),
     )
     # 本地已经落好了，**这时才**往飞书推。顺序不能反：飞书挂了也不能
     # 让本地少一条记录 —— 本地是权威，飞书只是通知渠道。
@@ -1526,7 +1606,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - 配置错也要给出可读原因
             print(f"⚠ 飞书配置不可用（{exc}）—— 委派闸门无法发卡，故不派发任何委派")
             return None
-        approver = next(iter(sorted(cfg.allowed_users)), "")
+        approver = pick_approver(cfg.allowed_users)
         if not approver:
             print("⚠ 飞书白名单为空，没人能批准 —— 不派发任何委派")
             return None
@@ -1541,7 +1621,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     def current_approver() -> str:
-        """唯一有资格批准的人。**取白名单第一人**（与 :class:`ApprovalGate` 同源）。
+        """唯一有资格批准的人。**经 :func:`pick_approver` 选取**（优先 ``ou_``
+        条目，理由见彼处；与 :class:`ApprovalGate` 同源）。
 
         刻意**只认一个人**而不是「白名单里谁都行」：设计文档要求
         「只有发起人能批」，而多批准人等于把「谁能指挥本机」的范围扩大。
@@ -1553,7 +1634,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg.check_ready()
         except Exception:  # noqa: BLE001 - 取不到就空，由调用方拒绝
             return ""
-        return next(iter(sorted(cfg.allowed_users)), "")
+        return pick_approver(cfg.allowed_users)
 
     def build_feishu_sender():
         """造发卡器。**失败返回 None**，由 :func:`run_with_tool_gate` 拒绝派发。

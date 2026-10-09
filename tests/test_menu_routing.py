@@ -89,14 +89,23 @@ class _Reply:
     刻意**不用** ``getattr(reply, "plan_confirm", ())`` 兜底：那样真正的
     ``ChannelReply`` 若哪天少了这个字段，也会被悄悄当成「没有要确认的」
     —— 确认卡**静默不发出**，而用户以为点一下就行。
+
+    ``deny_reason`` 同理：桥接靠它认出「这是白名单拒绝」并只在私聊里发
+    配对卡（11.9.8）。它与 ``plan_confirm`` 是同一类字段 —— 桥接**摸**它，
+    所以替身必须声明，缺失就该炸而不是被兜底成空串。
+
+    ``task_action`` 同理：桥接摸它来决定要不要发事务动作卡（11.9.8）。
     """
 
     def __init__(self, text: str, *, choices=(), denied: bool = False,
-                 plan_confirm=()) -> None:
+                 plan_confirm=(), deny_reason: str = "",
+                 task_action=None) -> None:
         self.text = text
         self.choices = list(choices)
         self.denied = denied
         self.plan_confirm = tuple(plan_confirm)
+        self.deny_reason = deny_reason
+        self.task_action = task_action
 
 
 class _Dedup:

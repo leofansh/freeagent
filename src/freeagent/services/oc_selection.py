@@ -59,6 +59,8 @@ __all__ = [
     "Selection",
     "list_project_options",
     "list_agent_options",
+    "current_agent_is_valid",
+    "agent_is_executable",
     "list_model_options",
     "daily_model_options",
     "model_list_note",
@@ -222,6 +224,81 @@ def list_agent_options(rows: Iterable[dict[str, Any]]) -> list[Option]:
         hint = f"{provider}/{model_id}" if provider and model_id else ""
         out.append(Option(value=name, label=name, hint=hint))
     return out
+
+
+def current_agent_is_valid(rows: Iterable[dict[str, Any]], agent: str) -> bool:
+    """当前选择里的工作模式**现在还在吗**？
+
+    :meth:`Selection.clear_from` 只在**用户改了上游**时清下游，而 agent
+    这一段的失效**不来自用户操作**：
+
+    - agent 定义可以是**项目级**的（``.opencode/agent/*.md``），而
+      ``Selection.agent`` 是**全局一份**（``~/.freeagent/oc_selection.json``），
+      不随项目变 —— 在 A 项目里选的 agent，切到 B 项目可能压根不存在。
+    - OpenCode 升级后内置 agent 会变；用户也可能自己删了某个 agent 文件。
+
+    ## 为什么必须显式判：OpenCode 这边是**查表**，不是校验
+
+    ``src/agent/agent.ts`` 里 ``get`` 的实现就一句：
+
+    .. code-block:: js
+
+        const get = Effect.fnUntraced(function* (agent) {
+          return agents[agent]
+        })
+
+    取不到就返回 ``undefined``，**不抛错、不报「没有这个 agent」**。
+    （对比：内置 ``default_agent`` 配错时那里**会** ``throw`` —— 但经
+    ``--agent`` / ``payload["agent"]`` 传进来的**不走那道检查**。）
+
+    所以「指定的工作模式已经不存在」这件事**没有任何报错可查**，症状表现为
+    「派发出去了，但用的不是你选的那个模式」。这正是 11.9.9 要防的同型故障。
+
+    ## 为什么复用 :func:`list_agent_options` 而不是再写一遍过滤
+
+    过滤规则（``mode == "primary"``、model 非 null、排除内部件）只准有一份。
+    在这里另写一遍，就会出现「列表里看得见、校验时说不认识」的错位。
+    """
+    if not agent:
+        return True
+    return any(opt.value == agent for opt in list_agent_options(rows))
+
+
+def agent_is_executable(rows: Iterable[dict[str, Any]], agent: str) -> bool:
+    """**执行期**校验：这个工作模式在「执行世界」里真的用得了吗？
+
+    ## 为什么和 :func:`current_agent_is_valid` 是两个函数
+
+    二者回答的是**不同世界**的问题（实测踩过，见设计文档 11.13.8 / 11.14）：
+
+    - **选择世界**（Web 四段选择器，``discovery()`` 非隔离实例）：看得见
+      真实配置 —— 登录态、云端 agent（如 ``Prometheus - Plan Builder``）、
+      云端模型。展示过滤要求 ``model`` 非空，因为列表要连 hint 一起渲染。
+    - **执行世界**（执行器，隔离实例）：``HOME`` 关进 jail、不继承 provider
+      配置（V1.14 定下的安全属性），只看得到内置 agent，且**全部**
+      ``model is None`` —— 模型由 ``prompt_async`` **显式**传，不靠 agent 自带。
+
+    于是两条规则必然分叉：在执行世界拿「model 非空」当门槛会**错杀一切**
+    （连 ``build`` / ``plan`` 都被判无效）。执行期真正要紧的只有三件事：
+
+    1. 名字存在（OpenCode 对不存在的 agent 是查表取 ``undefined``，静默退化）；
+    2. ``mode == "primary"``（``subagent`` 不能被 ``--agent`` 选中）；
+    3. 不是内部件（``compaction`` / ``summary`` / ``title`` 不该当工作模式）。
+
+    与 :func:`current_agent_is_valid` 的分叉是**有意的**，不是漂移：
+    那边答「目录里还有没有它」，这边答「执行器用它跑不跑得起来」。
+    """
+    if not agent:
+        return True
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name or name in _INTERNAL_AGENTS:
+            continue
+        if name == agent:
+            return str(row.get("mode") or "") == "primary"
+    return False
 
 
 # ── 模型 ──────────────────────────────────────────────────────────────── #

@@ -1,4 +1,4 @@
-"""编程页签：四段下拉 + 日常可选模型清单。
+"""编程页签：四段下拉 + 这一页的渲染与加载。
 
 ## 为什么这个页签与飞书共用一份选项
 
@@ -15,11 +15,12 @@
 ``<select>``，能做到 Desktop 那个样子：按 provider 分组、显示档位数、
 一个搜索框（``<datalist>`` 由浏览器提供输入过滤）。
 
-## 清单区为什么**默认折叠**
+## 两张动作卡不在这里
 
-85 个模型全列出来是一屏看不完的滚动条，而日常要勾的通常不到十个。
-默认展开只会让人陷在一堆不需要的模型里 —— 所以默认折叠，只显示
-「已勾 N 个」。
+「日常可选模型」与「派发事务」是**动作**、不是选择器，挪到
+:mod:`js_oc_cards` 了（原先挤在一起，把这个文件顶过了 250 行守卫）。
+两张卡由本文件的 :func:`renderOcSelection` 调用—— 同属一个
+``<script>``，所以调用得到。
 """
 
 from __future__ import annotations
@@ -28,22 +29,12 @@ __all__ = ["JS_OC_SELECTION"]
 
 JS_OC_SELECTION = r"""
 // 四段的展示顺序 = 依赖顺序（档位依附于模型）。与后端
-// endpoints_oc_selection.oc_selection_save 的校验顺序**必须一致** ——
+// endpoints_oc_selection_write.oc_selection_save 的校验顺序**必须一致** ——
 // 那不是巧合：顺序错了，「选模型 + 选 High」这个组合就会提交失败。
 const OC_STAGES = ["project", "agent", "model", "variant"];
 const OC_STAGE_LABEL = {
   project: "项目", agent: "工作模式", model: "模型", variant: "推理档位",
 };
-
-// provider 分组用的显示名 → 回传值用 providerID。
-// 不能只靠 value.split("/")[0] 当组名：用户看到的是 "OpenCode Zen"，
-// 而载荷里是 "opencode"。混用会让界面出现两个看起来一样的组。
-function ocGroupOf(options, modelValue) {
-  const hit = options.find((o) => o.value === modelValue);
-  if (!hit || !hit.hint) return "";
-  // hint 形如「OpenCode Zen」或「OpenCode Zen · 3 档」
-  return hit.hint.split("·")[0].trim();
-}
 
 function ocOptionLabel(o) {
   // 显示名 + 档位数。不显示 providerID：那是内部标识。
@@ -77,128 +68,8 @@ function ocSelect(stage, options, value, note, onChange) {
   return wrap;
 }
 
-// 日常可选模型清单：每个模型一个开关（对应 Desktop「管理模型」那个页面）。
-//
-// 刻意**默认折叠**：85 个模型是一屏看不完的滚动条，而日常要勾的不到十个。
-function ocCurationView(curated, repaint) {
-  const box = el("div", "card");
-  const on = curated.models || [];
-  const available = curated.available || [];
-  const head =
-    '<div class="row1"><span class="title">日常可选模型</span>' +
-    '<span class="meta">' + (curated.configured
-      ? "已勾 " + on.length + " 个"
-      : "没挑过 —— 上面给的是全部 " + available.length + " 个") + "</span></div>";
-  box.innerHTML = head;
-  if (!available.length) {
-    box.appendChild(el("div", "note",
-      "现在读不到可用的模型（OpenCode 没起来，或没有已连接凭据的 provider）。"));
-    return box;
-  }
-
-  const details = el("details", "");
-  if (curated.configured) details.open = true;
-  const sum = el("summary", "", curated.configured
-    ? "增删（已勾 " + on.length + " 个）"
-    : "挑几个放进日常清单");
-  details.appendChild(sum);
-
-  const toggle = (o, isOn) => {
-    api("/api/oc/curation", {
-      method: "POST",
-      body: JSON.stringify({ action: isOn ? "add" : "remove", model: o.value }),
-    }).then(repaint, (e) => toast("改不了：" + e.message));
-  };
-
-  // 按 provider 分组：用户认的是 provider（它在 OpenCode 里要单独登录），
-  // 而 85 个模型平铺着根本看不出「哪些要凭据」。
-  const groups = {};
-  available.forEach((o) => {
-    const g = ocGroupOf(available, o.value);
-    (groups[g || "其他"] = groups[g || "其他"] || []).push(o);
-  });
-  Object.keys(groups).sort().forEach((g) => {
-    details.appendChild(el("div", "hint",
-      esc(g) + "（" + groups[g].length + " 个）"));
-    const list = el("div", "currow");
-    groups[g].forEach((o) => {
-      const id = "occ-" + o.value.replace(/[^a-z0-9]/gi, "-");
-      const isOn = on.indexOf(o.value) >= 0;
-      const item = el("label", "curopt");
-      item.innerHTML = '<input type="checkbox" id="' + id + '"' +
-        (isOn ? " checked" : "") + "><span>" + esc(o.label) + "</span>" +
-        (o.hint ? '<span class="tag">' + esc(o.hint) + "</span>" : "");
-      item.querySelector("input").addEventListener("change", (e) =>
-        toggle(o, e.target.checked));
-      list.appendChild(item);
-    });
-    details.appendChild(list);
-  });
-
-  box.appendChild(details);
-  box.appendChild(el("div", "hint",
-    "清单<strong>只影响 FreeAgent 的选择器</strong>（飞书 + 这里）。" +
-    "OpenCode Desktop 里仍然是你自己的那份 —— 两边各管各的，" +
-    "FreeAgent 不会去改 OpenCode 的配置（那是 Desktop 的文件，" +
-    "两个进程抢一个配置文件迟早互相覆盖）。<br>" +
-    "「连接提供商 / 配 API Key」也不在这里做：" +
-    "OpenCode 那个接口会返回明文 Key，而这个页面没有鉴权（只监听回环）。" +
-    "配凭据请在 OpenCode 里做。"));
-  return box;
-}
-
-function ocDispatchView(data, root, repaint) {
-  const box = el("div", "card");
-  box.innerHTML = '<div class="row1"><span class="title">要做什么</span>' +
-    '<span class="meta">建一条委派事务</span></div>';
-
-  const ta = el("textarea", "");
-  ta.id = "ocbrief";
-  ta.rows = 2;
-  ta.placeholder = "一句话说清，例如：把 README 的用法那节补上";
-  ta.style.width = "100%";
-  box.appendChild(ta);
-
-  const btn = el("button", "btn primary", "开始");
-  btn.id = "ocgo";
-  const note = el("div", "hint", "");
-  btn.addEventListener("click", () => {
-    const brief = ta.value.trim();
-    if (!brief) { toast("先说一句要做的事"); return; }
-    if (/[\r\n]/.test(brief)) {
-      // 服务端也会挡，但这里先说 —— 免得用户莫名其妙看到失败。
-      toast("需求要写成一行（换行会让 opencode 判成复杂任务然后失败）");
-      return;
-    }
-    btn.disabled = true;
-    api("/api/oc/dispatch", {
-      method: "POST",
-      body: JSON.stringify({ brief: brief, project: data.selection.project }),
-    }).then((r) => {
-      note.innerHTML = '<strong>已建好事务</strong>：' + esc(r.title) +
-        "（脉络：" + esc(r.role) + (r.role_by_default ? "，自动选的" : "") + "）" +
-        "<br>" + esc(r.next);
-      ta.value = "";
-      btn.disabled = false;
-      toast("已建好事务");
-    }, (e) => {
-      note.innerHTML = '<span class="log-err">' + esc(e.message) + "</span>";
-      btn.disabled = false;
-    });
-  });
-  box.appendChild(btn);
-  box.appendChild(note);
-
-  box.appendChild(el("div", "hint",
-    "<strong>建了事务 ≠ 已经在跑。</strong> 执行器是独立进程，只跑「已确认且已 /start」" +
-    "的事务 —— 所以建好之后还要两步（上面会写出来）。<br>" +
-    "opencode 每要动手一次，仍然会在<strong>飞书</strong>给你一张授权卡。" +
-    "代码不该在你没点过的情况下动。"));
-  return box;
-}
-
 function renderOcSelection(data, root) {
-  // **清空再画**。刻意不在这里清 —— 调用方 :func:`loadOcSelection` 会清，
+  // **清空再画**。刻意不在这里清 —— 调用方 loadOcSelection 会清，
   // 而清单的 repaint 回调也走它，所以只有一个地方负责清。
   //
   // 第一版的 repaint 直接调本函数，于是每勾一个模型就**叠一份**：
@@ -256,6 +127,13 @@ function renderOcSelection(data, root) {
 
   paint(data.selection);
   root.appendChild(card);
+
+  // 工作模式失效：当前选的模式在 OpenCode 侧已经不存在（项目级 agent 被删、
+  // 或 OpenCode 升级后内置 agent 改名）。必须显式点出来，否则派发会静默
+  // 退化成用别的模式（设计文档 11.13.8 / 11.14）。
+  if (data.agent_warning) {
+    root.appendChild(el("div", "note warn", esc(data.agent_warning)));
+  }
 
   // 派发卡紧跟选择卡 —— 顺序就是操作顺序：先定「用哪个」，再说「做什么」。
   root.appendChild(ocDispatchView(data, root));

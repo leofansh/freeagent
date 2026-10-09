@@ -96,6 +96,103 @@ def test_agent_hint_shows_its_default_model():
     assert got.value == "Prometheus - Plan Builder", "回传必须用精确名"
 
 
+# ── 工作模式的失效校验 ────────────────────────────────────────────────── #
+
+_AGENT_ROWS = [
+    {"name": "Sisyphus - ultraworker", "mode": "primary",
+     "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+    {"name": "Prometheus - Plan Builder", "mode": "primary",
+     "model": {"providerID": "opencode", "modelID": "claude-fable-5"}},
+    # 下面三条都会被 list_agent_options 过滤掉，但名字是真实存在的 ——
+    # 它们正是「列表里看不见、校验却说认识」这种错位的来源。
+    {"name": "explore", "mode": "subagent",
+     "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+    {"name": "summary", "mode": "primary", "model": None},
+    {"name": "mystery", "mode": "primary", "model": None},
+]
+
+
+def test_unspecified_agent_is_always_valid():
+    """不指定 = 用 OpenCode 默认，这不是失效。"""
+    assert sel.current_agent_is_valid(_AGENT_ROWS, "")
+
+
+def test_agent_still_present_is_valid():
+    assert sel.current_agent_is_valid(_AGENT_ROWS, "Sisyphus - ultraworker")
+
+
+def test_agent_that_vanished_is_invalid():
+    """核心场景：昨天选的，今天这份清单里没有了。"""
+    assert not sel.current_agent_is_valid(_AGENT_ROWS, "Oracle - reviewer")
+
+
+def test_agent_filtered_out_by_the_list_is_not_valid():
+    """**最要紧的一条**：名字在原始数据里，但过滤规则不要它。
+
+    若校验另写一套过滤，这里就会通过 —— 于是界面下拉里看不到它，
+    派发时却又认它，两边漂移。
+    """
+    for name in ("explore", "summary", "mystery"):
+        assert not sel.current_agent_is_valid(_AGENT_ROWS, name), name
+
+
+def test_switching_project_can_invalidate_the_same_name():
+    """agent 定义可以是项目级的，而选择是全局一份 —— 换项目即失效。"""
+    project_b = [
+        {"name": "build", "mode": "primary",
+         "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+    ]
+    assert sel.current_agent_is_valid(_AGENT_ROWS, "Sisyphus - ultraworker")
+    assert not sel.current_agent_is_valid(project_b, "Sisyphus - ultraworker")
+
+
+# ── 执行期校验（隔离执行世界，规则与展示校验有意分叉）──────────────────── #
+
+#: 隔离执行世界的真实形状（实测）：只有内置 agent，**全部** model=None。
+_ISOLATED_ROWS = [
+    {"name": "build", "mode": "primary", "model": None},
+    {"name": "plan", "mode": "primary", "model": None},
+    {"name": "compaction", "mode": "primary", "model": None},
+    {"name": "explore", "mode": "subagent",
+     "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+]
+
+
+def test_builtin_with_null_model_is_executable():
+    """执行世界 model 全是 None（模型显式传）—— 按「model 非空」判会错杀一切。"""
+    assert sel.agent_is_executable(_ISOLATED_ROWS, "build")
+    assert sel.agent_is_executable(_ISOLATED_ROWS, "plan")
+
+
+def test_subagent_is_not_executable_even_if_present():
+    assert not sel.agent_is_executable(_ISOLATED_ROWS, "explore")
+
+
+def test_internal_agents_are_never_executable():
+    for name in ("compaction", "summary", "title"):
+        rows = _ISOLATED_ROWS + [{"name": name, "mode": "primary", "model": None}]
+        assert not sel.agent_is_executable(rows, name), name
+
+
+def test_missing_agent_is_not_executable():
+    """执行世界没有 Prometheus —— 选择世界选的它，执行世界必须拒。"""
+    assert not sel.agent_is_executable(_ISOLATED_ROWS, "Prometheus - Plan Builder")
+
+
+def test_unspecified_agent_is_always_executable():
+    assert sel.agent_is_executable(_ISOLATED_ROWS, "")
+
+
+def test_two_rules_diverge_on_the_same_rows():
+    """同一份隔离世界清单：展示校验拒 build（model=None），执行校验放行。
+
+    这条分叉是**有意的**：展示答「目录里有没有」，执行答「跑不跑得起来」。
+    钉住它，防止将来有人好心把它们「统一」回去。
+    """
+    assert not sel.current_agent_is_valid(_ISOLATED_ROWS, "build")
+    assert sel.agent_is_executable(_ISOLATED_ROWS, "build")
+
+
 # ── 模型 ──────────────────────────────────────────────────────────────── #
 
 def _provider_payload() -> dict:

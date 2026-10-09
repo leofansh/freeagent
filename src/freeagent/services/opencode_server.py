@@ -120,6 +120,21 @@ def delegation_permission_config() -> dict[str, Any]:
     return current_adapter().build_permission_config()
 
 
+def read_only_permission_config() -> dict[str, Any]:
+    """当前适配器的**只读** permission 配置（``/ask`` 用的那份）。
+
+    与 :func:`delegation_permission_config` **同源**（都走适配器），但取的是
+    另一个方法 —— 因为两份配置必须是**不同的东西**：委派要「改了文件问人」，
+    而 ``/ask`` 必须「**改不了**」。
+
+    为什么 ``/ask`` 需要一份单独的配置（设计文档 11.10.6 写「它不改任何东西，
+    所以没有『有副作用』可拦」）：那句话是**假设**。V1 未命中规则时大多默认
+    ``allow``，所以「不改任何东西」必须由这里这份配置**强制**。
+    详见 :func:`freeagent.services.executors._v1_read_only_config`。
+    """
+    return current_adapter().build_read_only_config()
+
+
 def build_isolated_config(config: dict[str, Any] | None = None) -> str:
     """把配置写成 JSON 文本。**返回文本而不写文件** —— 写文件是 IO，要可测。"""
     return json.dumps(
@@ -372,6 +387,7 @@ class OpenCodeServer:
         startup_timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         isolate: bool = True,
+        permission_config: dict[str, Any] | None = None,
     ) -> None:
         self._project = pathlib.Path(project)
         self._exe = executable
@@ -379,6 +395,13 @@ class OpenCodeServer:
         self._startup_timeout = startup_timeout
         self._extra_env = dict(extra_env or {})
         self._isolate = isolate
+        # 权限配置可注入。默认委派那份（``edit: ask``，有人点），
+        # 而 ``/ask`` 传 :func:`read_only_permission_config`（``edit: deny``）。
+        #
+        # 刻意**存下整个 dict 而不是一个布尔开关**：将来若还有第三种
+        # （比如「只读 + 允许出网」），加一个参数比加一个 if 分支更容易看清
+        # 「有几种权限形状、分别是谁在用」。
+        self._permission_config = permission_config
         self._proc: Any = None
         self._home: pathlib.Path | None = None
         self._password = uuid.uuid4().hex
@@ -398,7 +421,7 @@ class OpenCodeServer:
         # 配置**在启动前**写好，不走 PATCH —— 少一次往返，也少踩
         # 「PATCH 返回 200 但没落盘」那个坑（实测踩过）。
         (cfg_dir / "opencode.json").write_text(
-            build_isolated_config(), encoding="utf-8"
+            build_isolated_config(self._permission_config), encoding="utf-8"
         )
 
         env = build_child_env(

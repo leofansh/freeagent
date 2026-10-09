@@ -64,6 +64,7 @@ _NOTE_WORTHY: frozenset[RecordType] = frozenset(
         RecordType.ROLLOVER,
         RecordType.PAUSE,
         RecordType.RESUME,
+        RecordType.DELEGATION_RESET,
     }
 )
 
@@ -396,6 +397,69 @@ class TaskService:
     def note(self, task_id: str, content: str) -> Task:
         now = self._clock.now()
         self._records.append(task_id, RecordType.NOTE, content, now)
+        self.rebuild_progress_note(task_id)
+        return self._tasks.get(task_id)
+
+    # -- 委派：恢复入口 -------------------------------------------------------- #
+    def reset_delegation(self, task_id: str, reason: str | None = None) -> Task:
+        """落一条 :attr:`RecordType.DELEGATION_RESET`，让这条委派**可以重派**。
+
+        ## 为什么需要这个方法（而不是让用户去 ``/note``）
+
+        「派发前就被拒」（白名单不符 / 没有闸门）被判定侧**刻意不自动重派** ——
+        改配置前重试多少次都是同一个结果，而 ``--watch`` 实测过这个坑：
+        180 秒扫 60 轮、写 60 个产物版本，而真正的委派一条没干成。
+
+        但那是「没改配置」的判定。**用户改好配置之后总得有办法让它重来**，
+        而落库那句「可以 /note 记下原因后重派」是**空头承诺**：``note`` 不在
+        terminal 集合里，对判定完全不可见，什么也重置不了。
+
+        刻意**不复用** :meth:`note`：它没有任何校验，于是 ``/note`` 会变成
+        一个隐形后门—— 而「用错入口就静默无效」正是这句话原本的病根。
+
+        ## 校验：三条不许重派的情形，各给一句准确的话
+
+        拒绝的理由必须**互相可区分**，否则用户不知道自己该做什么
+        （同一个「不能重派」会让人以为是 bug）。
+
+        函数内 import :func:`~freeagent.services.delegate.attempt_state` ——
+        形状推导必须与判定侧**同一份实现**，否则「校验说能重派」与
+        「判定说别派」会在真跑起来时才互相打架。
+        """
+        from .delegate import attempt_state
+
+        current = self._tasks.get(task_id)
+        if not current.project_path:
+            raise ValidationError(
+                f"「{current.title}」不是委派事务，没有东西可重派"
+                "（委派是有项目路径的事务）"
+            )
+
+        in_flight, last = attempt_state(self._records.list_for_task(task_id))
+        if in_flight:
+            raise ValidationError(
+                f"「{current.title}」正在跑，不能重派 —— 派第二个进程去改同一个"
+                "项目目录会互相覆盖。等它跑完，或者先 /pause 把它移出来。"
+            )
+        if last == "succeeded":
+            raise ValidationError(
+                f"「{current.title}」已经做完了，重派没有意义"
+                "（要再做一遍的话，这是件新事，建条新事务）"
+            )
+        if last is None:
+            raise ValidationError(
+                f"「{current.title}」还没派出去过，不需要重派"
+                "（执行器下一次扫到它就会派）"
+            )
+
+        now = self._clock.now()
+        why = reason.strip() if reason and reason.strip() else "未说明原因"
+        self._records.append(
+            task_id,
+            RecordType.DELEGATION_RESET,
+            f"要求重新派发（上次结局：{last}）：{why}",
+            now,
+        )
         self.rebuild_progress_note(task_id)
         return self._tasks.get(task_id)
 

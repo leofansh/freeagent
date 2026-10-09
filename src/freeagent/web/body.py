@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-__all__ = ["read_json", "MAX_BODY", "MAX_IMAGE_BODY"]
+__all__ = ["read_json", "discard_body", "MAX_BODY", "MAX_IMAGE_BODY"]
 
 #: 普通 JSON 请求的上限。刻意小 —— 这些接口收的都是文字。
 MAX_BODY = 64 * 1024
@@ -56,6 +56,37 @@ def _drain(rfile, length: int) -> None:
         if not chunk:
             return          # 客户端没发够就关了，没什么可丢的
         remaining -= len(chunk)
+
+
+def discard_body(rfile, headers) -> None:
+    """把**声明了但没读**的请求体丢弃 —— 关连接前必须做。
+
+    ## 为什么 :func:`_drain` 不够
+
+    ``_drain`` 只在 :func:`read_json` 的「体积超限」分支被调用，而**拒绝
+    请求的那些路压根不经过 ``read_json``**：
+
+    - ``401``（令牌不对，见 :meth:`_reject_unauthorized`）
+    - ``404``（路径不认识，见 :meth:`_post` 里 ``dispatch_post`` 返回 ``None``）
+
+    这两条路直接回响应，**请求体一个字节都没读**。于是接收缓冲区里还留着
+    数据，``close()`` 就变成 abort —— 客户端**连已经发出的 401/404 都读不到**，
+    只看到 ``ConnectionAbortedError``。
+
+    实测（2026-10-08）：``tests/test_web.py::test_wrong_post_path_404``
+    偶发 ``WinError 10053``，而凶手不在那个测试里 —— 是这里。
+    更麻烦的是它会**连累之后无关的连接**（见 :func:`_drain` 的第2 层），
+    表现为「随机失败」，连对着干净树对照都会被误导。
+
+    刻意做成「读 ``Content-Length`` 再丢」而不是要求调用方自己算：
+    算错一个数（漏了、算错单位）就会重新踩坑，而那是**沉默**的。
+    """
+    try:
+        length = int(headers.get("Content-Length") or 0)
+    except ValueError:
+        return          # 长度不可解析就无从得知该丢多少，只能直接关
+    if length > 0:
+        _drain(rfile, length)
 
 
 def read_json(

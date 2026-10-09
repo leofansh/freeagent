@@ -7,7 +7,22 @@ from __future__ import annotations
 
 __all__ = ["JS_BOOT"]
 
-JS_BOOT = r"""async function refreshHeader() {
+JS_BOOT = r"""// 全局错误陷阱（12.7 的对称面：接口有令牌，脚本异常也必须有形）。
+// 背景：.then(成功, 失败) 里**成功回调抛的异常不会走失败分支**，会变成
+// unhandledrejection 被浏览器吞掉 —— 症状就是「按钮点了没反应」。
+// 所以在入口处挂两个全局钩子，把任何漏网异常变成可见的 toast + console。
+window.addEventListener("error", (ev) => {
+  try { toast("脚本错误：" + (ev.message || "未知")); } catch (_) {}
+  if (window.console && console.error) console.error("[freeagent]", ev.error || ev.message);
+});
+window.addEventListener("unhandledrejection", (ev) => {
+  const r = ev.reason;
+  const m = r && r.message ? r.message : String(r);
+  try { toast("未处理错误：" + m); } catch (_) {}
+  if (window.console && console.error) console.error("[freeagent]", r);
+});
+
+async function refreshHeader() {
   try {
     const h = await api("/api/health");
     $("#hdr").textContent =

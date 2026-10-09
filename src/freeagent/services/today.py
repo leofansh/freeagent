@@ -55,6 +55,16 @@ class TodayView:
     items: tuple[ScoredTask, ...]
     rollover: RolloverReport
 
+    #: 敞开但**没排期**的事务条数。它们按设计不进今天视图 ——
+    #: 设计方案 6.2 把今天视图定义成 ``scheduled_for == today``，
+    #: 6.4 的 ``unschedule`` 正是靠置 ``None`` 把事务移出今天。
+    #:
+    #: 但「不进」不等于「不存在」。不报这个数的话，用户记完一件事
+    #: （没说日期 → 没排期）再问「今天该做什么」，会拿到「今天没有
+    #: 排进来的事务」—— 而那件事明明在库里。这就是**静默**：东西丢了
+    #: 却没有任何一处说它不在今天。所以计数**照报**，由界面去说。
+    unscheduled_count: int = 0
+
     @property
     def rolled_over_ids(self) -> frozenset[str]:
         return frozenset(item.task_id for item in self.rollover.items)
@@ -119,7 +129,19 @@ class TodayService:
             dependents_of=self._tasks.count_dependents,
             energy_windows=self._energy_windows,
         )
-        return TodayView(day=today, items=tuple(scored), rollover=report)
+        # 没排期的不进今天视图（设计如此），但条数要报 —— 理由见
+        # :attr:`TodayView.unscheduled_count`。
+        unscheduled = sum(
+            1
+            for t in self._tasks.list_all()
+            if t.is_open and t.scheduled_for is None
+        )
+        return TodayView(
+            day=today,
+            items=tuple(scored),
+            rollover=report,
+            unscheduled_count=unscheduled,
+        )
 
     def scheduled_for(self, day: date) -> list[ScoredTask]:
         """指定日期的视图（不触发顺延）。"""

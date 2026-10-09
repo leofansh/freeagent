@@ -27,7 +27,25 @@ __all__ = [
     "ROLE_MATCH_THRESHOLD",
     "ROLE_KEEP_MIN",
     "TITLE_MAX_LEN",
+    "TITLE_EDGE_CHARS",
+    "strip_title_edges",
 ]
+
+#: 标题两端要剥掉的字符：空白、引号、**以及残留的标点**。
+#:
+#: 为什么必须含标点：开场白表 :data:`_LEADING_FILLERS` 里只有「记一下」，
+#: 不含它后面那个冒号。于是「记一下：给客户A发季度报价单」剥完开场白，
+#: 冒号就留在标题头上 —— 实测建出的标题是「：给客户A发季度报价单」。
+#: 只剥空白和引号是不够的。
+#:
+#: 放在这里而不是各 provider 各写一份：两份必然漂移，而漂移的症状是
+#: 「联网时标题干净、离线降级时带冒号」—— 没人会注意到。
+TITLE_EDGE_CHARS = " \t\r\n\"'「」《》`:：,，、；;"
+
+
+def strip_title_edges(text: str) -> str:
+    """剥标题两端。两个 provider 共用，理由见 :data:`TITLE_EDGE_CHARS`。"""
+    return text.strip(TITLE_EDGE_CHARS)
 
 #: 低于此置信度就必须追问用户，不允许静默猜测。
 ROLE_MATCH_THRESHOLD = 0.34
@@ -231,7 +249,9 @@ class RuleBasedProvider:
         cleaned = _WS_RE.sub(" ", text).strip()
         for filler in _LEADING_FILLERS:
             if cleaned.startswith(filler):
-                cleaned = cleaned[len(filler) :].lstrip()
+                # 用 strip_title_edges 而不是 lstrip()：后者只剥空白，
+                # 于是「记一下：X」剥完变成「：X」（实测）。
+                cleaned = strip_title_edges(cleaned[len(filler) :])
                 break
 
         # 先按句子终止符切
@@ -240,7 +260,7 @@ class RuleBasedProvider:
             if ch in _TERMINATORS:
                 cut = idx
                 break
-        cleaned = cleaned[:cut].strip()
+        cleaned = strip_title_edges(cleaned[:cut])
 
         # 前段足够长时，在最后一个逗号/顿号处收口
         last_break = max(
@@ -248,7 +268,7 @@ class RuleBasedProvider:
             default=-1,
         )
         if last_break > 0:
-            cleaned = cleaned[:last_break].strip()
+            cleaned = strip_title_edges(cleaned[:last_break])
 
         if len(cleaned) > TITLE_MAX_LEN:
             cleaned = cleaned[: TITLE_MAX_LEN - 1] + "…"

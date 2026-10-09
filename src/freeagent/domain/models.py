@@ -69,6 +69,10 @@ class Role:
     updated_at: datetime
     note: str | None = None
     default_definition_of_done: str | None = None
+    #: 该角色默认的**工作模式**（OpenCode 的 agent 精确名）。
+    #: 选段（Web「编程」页签）留空时，用这个兜底；
+    #: 优先级：显式选择 > 角色默认 > 策略默认（设计文档 11.13.6 / 11.14）。
+    default_agent: str | None = None
     active: bool = True
     icon: str | None = None
     color: str | None = None

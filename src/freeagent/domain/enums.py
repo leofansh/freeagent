@@ -82,6 +82,19 @@ class RecordType(str, Enum):
     DELEGATION_DISPATCHED = "delegation_dispatched"
     DELEGATION_SUCCEEDED = "delegation_succeeded"
     DELEGATION_FAILED = "delegation_failed"
+    #: 「这次尝试作废，允许重新派发」——**人显式要求重来**时才落这条。
+    #:
+    #: 为什么需要它：``delegation_failed`` 若是**派发前就被拒**（白名单不符 /
+    #: 没有闸门），重试一万次也是同一个结果，所以判定侧**刻意不自动重派**。
+    #: 但那是「没改配置」的判定 —— 一旦用户改好配置，就该有个办法让它重来，
+    #: 而落库那句「可以 /note 记下原因后重派」是**空头承诺**：``note`` 不在
+    #: terminal 集合里，对判定完全不可见，什么也重置不了。
+    #:
+    #: 形状上它是**只追加**的第四条路，不改写历史：判定侧认它，于是
+    #: 「它之后才算新的一次尝试」。这与本项目「判据从记录形状推出来，
+    #: 不给失败加标签」是同一条纪律 —— reset 本身就是形状的一部分，
+    #: 而且天然可审计（谁、何时、为何要求重来）。
+    DELEGATION_RESET = "delegation_reset"
 
 
 class ArtifactStatus(str, Enum):

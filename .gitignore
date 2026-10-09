@@ -27,3 +27,10 @@ venv/
 
 # 批处理变量未展开时留下的字面量目录（FreeAgentProvider 的已知环境隐患）
 %FREEAGENT_HOME%/
+
+# 工具会话状态（跨会话记忆），与项目内容无关。
+# 与上面 .omo/ 同理：存的是会话与时间戳，对项目没有价值。
+.workbuddy/
+
+# tests/manual/e2e_browser_smoke.py 每次冒烟都会重新生成的截图。
+e2e_final.png

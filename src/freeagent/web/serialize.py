@@ -88,6 +88,9 @@ def today_payload(view: TodayView, names: dict[str, str]) -> dict:
         "day": view.day.isoformat(),
         "disclaimer": DISCLAIMER_MARKER,
         "count": len(view.items),
+        # 没排期的**不进**今天视图（设计如此），但条数照报 —— 不报的话
+        # 界面显示「今天 0 条」，而用户刚记的那件事其实在库里。
+        "unscheduled_count": view.unscheduled_count,
         "items": [
             scored_payload(s, names, rolled_over=s.task.id in rolled)
             for s in view.items

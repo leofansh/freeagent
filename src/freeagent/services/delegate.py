@@ -217,6 +217,50 @@ _DISPATCH_TERMINAL = (
 )
 
 
+def attempt_state(records: Sequence) -> tuple[bool, str | None]:
+    """从只追加日志推出 ``(正在跑, 最后一次尝试的结局)``。
+
+    **这是形状推导的唯一实现** —— :func:`already_dispatched` 与
+    :meth:`~freeagent.services.tasks.TaskService.reset_delegation` 都用它。
+    刻意不写两遍：两份推导一旦漂移，「判定说该派」与「校验说不能重派」
+    就会对不上，而那种不一致只在真跑起来时才暴露。
+
+    ``结局`` 取值：``None`` = 没试过；``"refused"`` = 试了但派发前就被拒
+    （确定性失败，重试无用）；``"failed"`` = 执行期失败（可重派）；
+    ``"succeeded"`` = 做完了。
+
+    :attr:`RecordType.DELEGATION_RESET` 只清 ``结局``，**不清** ``正在跑`` ——
+    理由见 :func:`already_dispatched` 那条⚠️。
+    """
+    in_flight = False
+    last: str | None = None
+    for record in records:
+        kind = record.type
+        if kind is RecordType.DELEGATION_RESET:
+            # 「这次尝试作废」—— 之后才算新的一次尝试。
+            #
+            # 只清 ``last``，**刻意不清** ``in_flight``：reset 的语义是
+            # 「上次那个失败不算数」，不是「现在没人跑」。两者混起来就会
+            # 放行一个还在跑的委派，而那正是「两个进程改同一个项目目录」。
+            #
+            # **且不清 succeeded**：reset 的语义是「那次**失败**不算数」，
+            # 而不是「把它做过的事也抹了」。重跑一条已经成功的委派等于
+            # 把改过的代码再改一遍 —— 那个代价比「派不出去」大得多。
+            # 服务层本来就拒绝这种用法，这里是**第二道**：万一有人绕过
+            # 服务层直接落记录，判定侧也不该放行。
+            if last != "succeeded":
+                last = None
+        elif kind is RecordType.DELEGATION_DISPATCHED:
+            in_flight = True
+        elif kind in _DISPATCH_TERMINAL:
+            if kind is RecordType.DELEGATION_FAILED and not in_flight:
+                last = "refused"
+            else:
+                last = "failed" if kind is RecordType.DELEGATION_FAILED else "succeeded"
+            in_flight = False
+    return in_flight, last
+
+
 def already_dispatched(records: Sequence) -> bool:
     """这条事务**现在**该不该被跳过。
 
@@ -240,38 +284,28 @@ def already_dispatched(records: Sequence) -> bool:
     最后一次尝试                        记录形状          判定
     ==============================  ==============  ================
     （没有）                          —               没试过 → 派
-    派发前就被拒                        failed（无前置）    **不重试**（本轮新增）
+    派发前就被拒                        failed（无前置）    **不重试**
     执行期失败                        dispatched→failed  可重试
     跑着                              dispatched        别再派（会并发）
     做完                              succeeded         别再派
+    人显式要求重来                     reset             **可派**（见下）
     ==============================  ==============  ================
 
-    「派发前就被拒」不再自动重试，代价是：**修好配置后这条不会自动恢复**。
-    那个恢复入口（让 ``/note`` 能重置）**至今没有实现** —— 落库那句
-    「可以 /note 记下原因后重派」是**空头承诺**（note 不是 terminal 记录，
-    什么也重置不了）。要么手工建新事务，要么将来真做那个入口。
-    明确写在这里，免得下一个人以为有重试机制。
+    「派发前就被拒」不自动重试的代价是：**改好配置后这条不会自动恢复**。
+    那个代价由 :meth:`~freeagent.services.tasks.TaskService.reset_delegation`
+    补掉—— 它落一条 :attr:`RecordType.DELEGATION_RESET`，本函数认它。
 
-    ⚠️ ``--watch`` 下的**另一类**副作用仍然存在：``--tool-gate`` 路径下，
-    持续失败会**周期性地重新发批准卡**（闸门仍要人点，不会静默重跑，
-    但会刷卡片）。盯着失败任务排查时**别开** ``--watch``。
+    ⚠️ **reset 不解除「正在跑」**：它只清 ``last``，**不清**
+    ``dispatched_in_attempt``。理由是「别并发派」比「能重派」更要紧 ——
+    放行一个还在跑的委派，代价是两个进程改同一个项目目录，
+    而那正是这条 dangling 检查当初要防的事（第一版漏了它，
+    回归测试当场抓住）。所以 ``[failed, dispatched, reset]`` 仍然判「别派」。
+    要重派正在跑的委派，正确做法是先 ``/pause`` 把它移出active。
+
+    ⚠️ 2026-09-30 补的 ``--watch`` 实测教训仍然适用：上面那条「执行期失败可重派」
+    是**给配置类失败放大**的出口。真要盯一条失败任务，**别开** ``--watch``。
     """
-    #: 本次尝试里**真的**派出去过吗。派发前就被拒的（缺闸门 / 白名单不符）
-    #: 压根没走到 :func:`subprocess_runner`，所以这个标记是 ``False``。
-    dispatched_in_attempt = False
-    #: 最后一次尝试的结局。``None`` = 还没试过；
-    #: ``"refused"`` = 试了但**派发前就被拒**（确定性失败，重试无用）。
-    last: str | None = None
-    for record in records:
-        kind = record.type
-        if kind is RecordType.DELEGATION_DISPATCHED:
-            dispatched_in_attempt = True
-        elif kind in _DISPATCH_TERMINAL:
-            if kind is RecordType.DELEGATION_FAILED and not dispatched_in_attempt:
-                last = "refused"
-            else:
-                last = "failed" if kind is RecordType.DELEGATION_FAILED else "succeeded"
-            dispatched_in_attempt = False
+    in_flight, last = attempt_state(records)
 
     # 末尾是「已派出但还没有收尾记录」—— **正在跑**。
     #
@@ -279,7 +313,7 @@ def already_dispatched(records: Sequence) -> bool:
     # 的话，「在跑」和「没试过」都落在「没有 terminal」上，
     # 于是 ``--watch`` 会在 opencode 还在跑的时候再派一遍 ——
     # 两个进程改同一个项目目录。宁可漏派也不能并发派。
-    if dispatched_in_attempt:
+    if in_flight:
         return True
     if last is None:
         return False

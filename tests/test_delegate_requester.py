@@ -232,3 +232,34 @@ class TestEndToEndInChannel:
             assert row[0] == "ou_Bob"
         finally:
             app.close()
+
+
+class TestPickApprover:
+    """白名单兜底选审批人：**必须优先 ``ou_`` 条目**。
+
+    实测踩坑（2026-10-09）：白名单同时装着 open_id 与租户级 user_id 时，
+    ``sorted()[0]`` 落在数字开头的 user_id 上；user_id 与 open_id 后缀
+    互不相干，后缀比对认不出同一人 → 卡主人自己点卡被「只有发起人能批」
+    误拒。修法：兜底优先选 ``ou_`` 开头的条目。
+    """
+
+    def test_mixed_ids_prefers_open_id(self):
+        from freeagent.delegate import pick_approver
+        users = {"ou_f4f16affe349b16ba04d81711594d51f", "2d1b7bec"}
+        assert pick_approver(users) == "ou_f4f16affe349b16ba04d81711594d51f"
+
+    def test_digits_sort_before_letters_is_exactly_the_trap(self):
+        # 数字开头排在 ou_ 前面 —— 旧的 sorted()[0] 恰好踩中，钉死防回归。
+        assert sorted({"ou_f4f16", "2d1b7bec"})[0] == "2d1b7bec"
+
+    def test_open_id_only_whitelist(self):
+        from freeagent.delegate import pick_approver
+        assert pick_approver({"ou_a", "ou_b"}) == "ou_a"
+
+    def test_no_open_id_falls_back_to_sorted_first(self):
+        from freeagent.delegate import pick_approver
+        assert pick_approver({"2d1b7bec", "abc12345"}) == "2d1b7bec"
+
+    def test_empty_whitelist(self):
+        from freeagent.delegate import pick_approver
+        assert pick_approver(set()) == ""

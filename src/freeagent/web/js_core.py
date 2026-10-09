@@ -83,6 +83,16 @@ function renderList(data, emptyText) {
   } else {
     data.items.forEach((it, i) => root.appendChild(taskCard(it, i)));
   }
+  // 只有今天视图带这个字段（serialize.today_payload 给的）。
+  // 「不进今天视图」是设计（设计方案 6.2），但**不告诉你它在别处**是缺陷 ——
+  // 界面显示「今天 0 条」而用户刚记的事明明在库里，他会以为没记上。
+  if (data.unscheduled_count) {
+    root.appendChild(el(
+      "div", "note",
+      "另有 " + data.unscheduled_count + " 条没排期 —— 没排期的不进今天视图，"
+      + "排个期或到「全部」里找它们。"
+    ));
+  }
   $("#foot").textContent =
     data.disclaimer + " —— 助手不替你决定先做哪个。点任意一条可打开恢复契约。";
 }

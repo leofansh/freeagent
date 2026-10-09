@@ -188,10 +188,9 @@ def chat(app: App, body: dict) -> dict:
         raise FreeAgentError("last_items 必须是数组")
     context = [str(x) for x in raw_context[:MAX_CONTEXT_IDS] if isinstance(x, str)]
     # 什么该走 Repl、什么该走只读问答，三种情形都写在
-    # :func:`.commands.wants_repl` 的 docstring 里（含代价说明）。
-    if wants_repl(app, text, is_planning=is_planning(app)):
-        return command_payload(app, text)
-    #    判据是那个**闭合动作集**（LLM 判）：关键词穷举不完这些说法。
+    # :func:`.commands.wants_repl` 的 docstring 里（含代价说明）——
+    # 三种都在它内部判完了，这里只问一次。重复问同一件事不只是冗余：
+    # 两处判据若哪天漂成不一致，命令就会走岔路而没人发现。
     if wants_repl(app, text, is_planning=is_planning(app)):
         return command_payload(app, text)
     return serialize_api.chat_payload(app.chat.respond(text, context_ids=context))

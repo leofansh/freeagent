@@ -1,4 +1,8 @@
-"""Web 表面的**命令层**（设计文档 12.7.2「通道的统一边界」）。
+"""Web 表面的**命令层**（设计文档 11.8.1「通道的统一边界」）。
+
+段号更正：这里原先写「12.7.2」，而 12.7.2 是「委派交互：两阶段」——
+「通道的统一边界」实际在 11.8.1 下。写错段号比不写更费事：
+读者按 12.7.2 找过去，看到的是另一件事，于是以为自己读到了规范。
 
 ## 为什么单独一个模块
 
@@ -17,12 +21,12 @@ from __future__ import annotations
 import io
 
 from ..app import App
-from ..cli.app import MODE_BUILD, Repl, _ChannelCtx
+from ..cli.app import CHANNEL_WEB, MODE_BUILD, Repl, _ChannelCtx
 from . import serialize_api
 
 __all__ = ["WEB_CHAT_ID", "command_payload", "is_planning"]
 
-#: Web 侧的「会话 id」。只用于 Plan 状态的落盘键（设计文档 12.7.2）。
+#: Web 侧的「会话 id」。只用于 Plan 状态的落盘键（设计文档 11.8.1）。
 #:
 #: 为什么需要它：``Repl.restore_plan()`` 靠 ``channel_ctx.chat_id`` 找盘上的
 #: Plan。没有它，``/mode-build`` 在浏览器里就永远读不回上一轮攒的计划。
@@ -50,7 +54,9 @@ def _web_repl(app: App):
         repl = Repl(
             app,
             out=io.StringIO(),
-            channel_ctx=_ChannelCtx(chat_id=WEB_CHAT_ID, sender_open_id=""),
+            channel_ctx=_ChannelCtx(
+                chat_id=WEB_CHAT_ID, sender_open_id="", channel=CHANNEL_WEB
+            ),
         )
         # 建好就把上一轮攒的计划读回来 —— 浏览器关掉再开也算数。
         try:

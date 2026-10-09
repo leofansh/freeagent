@@ -50,11 +50,14 @@ from .sender import (  # noqa: E402
     _approval_card,
     _card_action_response,
     _decided_card,
+    COMMAND_ACTION,
     VIEW_CHOICE_ACTION,
     MENU_ACTION,
     PLAN_CONFIRM_ACTION,
     SELECT_ACTION,
     send_menu_card,
+    send_pairing_card,
+    send_task_action_card,
 )
 from .status import (
     SEEN_SENDERS_KEY,
@@ -79,6 +82,38 @@ log = logging.getLogger("freeagent.feishu")
 #: 队列上限。满了就**丢最旧的**而不是无限增长 —— 助手落后几十条消息
 #: 毫无价值，但把内存吃光会影响机器上别的事。
 _QUEUE_MAX = 256
+
+#: 同一个 open_id 至少隔这么久才再给一张配对卡（秒）。
+#:
+#: 为什么需要限流：陌生人的 ``event_id`` **不进**去重表（设计文档 11.9.2
+#: 明确「白名单检查必须在去重之前」，否则陌生人能拿垃圾事件把表撑爆）。
+#: 于是重投事件时 :meth:`ChannelService.handle` 会**再拒一次**，而没有任何
+#: 东西记住「已经给过卡」—— 对方每重投一次就多收一张。
+#:
+#: 为什么按**open_id** 而不是 event_id 去重：event_id 我们**故意不记**
+#: （见上），而这个只需要知道「这个人刚拿过一张」。
+#:
+#: 刻意**只做内存限流、不做持久**：配对卡不是安全边界 —— 白名单判定在
+#: :meth:`ChannelService.handle` 的第一行、一个字都没动。重复发一张只是
+#: 难看，不是危险，不值得为它引入一份跨重启状态。
+_PAIRING_RATE_LIMIT_SECONDS = 3600.0
+
+#: 卡片按钮**允许合成哪些命令**（设计文档 11.9.8「卡片按钮 → 合成命令」）。
+#:
+#: **刻意只放三个状态迁移。** 按钮 ``value`` 是客户端回传的，而
+#: :meth:`ChannelService.handle`` 见 ``/`` 开头就当命令派发 —— 照单全收等于
+#: 开一个「点一下就能执行任意命令」的口子，伪造载荷即可借桥接跑到
+#: ``/merge``、``/role-del``、``/delegate`` 上。
+#:
+#: 设计文档 11.8.1 引的官方警告是同一件事：*不要试图枚举所有危险命令，
+#: 要用**窄白名单***。所以这里是白名单而不是黑名单：新增按钮要**显式**
+#: 加一行，而不是「没被列出来就自动放行」。
+#:
+#: 三个命令都只改``state``，且真伪由 :meth:`TaskService.set_state` 自己校验
+#: （``ALLOWED_TRANSITIONS`` + 不变式），非法迁移会报错而不会静默改坏数据。
+_CARD_COMMAND_ALLOWLIST: frozenset[str] = frozenset({
+    "/start", "/done", "/pause",
+})
 
 #: 身份探测失败后的重试退避（秒）。取值抄 openclaw 的
 #: ``monitor.bot-identity.ts``：1min → 2min → 5min → 10min → 15min。
@@ -124,6 +159,20 @@ class FeishuBridge:
         self.bot_open_id = bot_open_id or None
         self.reporter = reporter
         self._seen_senders: dict[str, dict[str, object]] = {}
+        #: 「最近给这个 open_id 发过配对卡」的时刻。**内存态、刻意不落盘**。
+        #:
+        #: 为什么需要它：陌生人的 ``event_id`` **不进**去重表（设计文档 11.9.2
+        #: 白名单检查必须在去重之前，否则陌生人能拿垃圾事件把表撑爆），所以
+        #: 重投事件时 :meth:`ChannelService.handle` 会**再拒一次**，而没有
+        #: 任何东西记住「已经给过卡」—— 于是对方每重投一次就多收一张卡。
+        #:
+        #: 为什么是「按 open_id 限流」而不是「按 event_id 去重」：后者的键
+        #: 我们**故意不记**（见上），而前者只需要知道「这个人刚拿过一张」。
+        #:
+        #: 刻意**只做限流不做持久**：配对卡不是安全边界（白名单判定在
+        #: :meth:`ChannelService.handle` 第一行，一个字都没动），重复发一张
+        #: 只是难看，不是危险。所以不值得为它引入一份跨重启状态。
+        self._pairing_sent_at: dict[str, float] = {}
         self._queue: queue.Queue[IncomingMessage | None] = queue.Queue(
             maxsize=_QUEUE_MAX
         )
@@ -542,6 +591,16 @@ class FeishuBridge:
                     "未派发（bot 回复=%r）：%s（%s）",
                     reply.text[:40], msg.sender_label, detail,
                 )
+            # 白名单被拒时，**私聊**里额外给一张配对卡（设计文档 11.9.8）。
+            #
+            # 为什么不改那句「没有权限。」：它是既有行为，有测试锁着，
+            # 而且**它说得对** —— 这个人现在确实没权限。配对卡是**追加**的
+            # 一条出路，不是把拒绝换成同意。
+            #
+            # ⚠️ 群里**绝不发**：群里发卡等于向全群确认「这里有个 bot」，
+            # 而那正是白名单要挡的泄露面（设计文档 11.9.1 边界 2）。
+            if reply.deny_reason == "allowlist" and not msg.is_group:
+                self._maybe_send_pairing_card(msg)
             if not reply.text:
                 return                    # 重复事件：静默，不打扰
         elif not reply.text:
@@ -603,6 +662,30 @@ class FeishuBridge:
                          msg.chat_id, len(reply.plan_confirm))
             except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
                 log.warning("发确认卡失败，回退成纯文本", exc_info=True)
+        if reply.task_action:
+            # **事务动作卡**（设计文档 11.9.8）：`/delegate` 建好委派之后，
+            # 正文已经说了「确认要派的话：/start<id>」—— 那是要用户**手打**
+            # 的一条命令。这张卡就是那句话的按钮版。
+            #
+            # 刻意**排在选项卡之后**：两者互斥（选项卡只在 CLARIFY 时有，
+            # 动作卡只在 `/delegate` 后有），真同时出现时两张都发比二选一诚实。
+            #
+            # 正文**照发**（上面已经 `send_text` 了）：发卡可能失败，而
+            # 「点了没反应」比「多点一次」糟得多。
+            task_id, title = reply.task_action
+            try:
+                send_task_action_card(
+                    self.sender,
+                    open_id=msg.sender_open_id,
+                    title=title,
+                    task_id=task_id,
+                    chat_id=msg.chat_id,
+                    state="待办（执行器不会碰它）",
+                )
+                log.info("已发事务动作卡：chat=%s，task=%s", msg.chat_id, task_id[:8])
+            except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
+                log.warning("发事务动作卡失败，正文已说过 /start，不影响使用",
+                            exc_info=True)
         if reply.choices:
             from .sender import send_view_choice_card
 
@@ -619,6 +702,73 @@ class FeishuBridge:
             except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
                 log.warning("发选项卡失败，回退成纯文本", exc_info=True)
         self.sender.send_text(msg.chat_id, reply.text)
+
+    def _maybe_send_pairing_card(self, msg: IncomingMessage) -> None:
+        """陌生**私聊**里给一张配对卡（设计文档 11.9.8）。
+
+        ## 它**不是**放行，是给一条出路
+
+        白名单判定在 :meth:`ChannelService.handle` 第一行、一个字都没动；
+        这张卡只解决「**怎么拿到 open_id**」，而白名单为空仍然拒绝启动
+        （:func:`freeagent.feishu.config.check_ready`）。所以「配对」与
+        「不配对」的用户，权限完全一样。
+
+        ## 绝不抛出去
+
+        发卡失败只记日志。这条路在 :meth:`_process` 的**拒绝分支**里，
+        抛出去会连带吃掉那条既有的「没有权限。」回复 —— 而那条回复有测试
+        锁着、且它是对的。**新增能力不该有能力让旧能力坏掉。**
+
+        ## 为什么按 open_id 限流而不是按 event_id 去重
+
+        见 :data:`_PAIRING_RATE_LIMIT_SECONDS` 的说明：陌生人的
+        ``event_id`` 故意不记（11.9.2），所以只能记「这个人刚拿过一张」。
+        """
+        open_id = msg.sender_open_id or ""
+        if not open_id:
+            # 没有 open_id 就**没法当白名单条目**（白名单认的是这一层）。
+            # 这种情况极少（飞书总会带），但静默发一张没用的卡更糟。
+            log.info("想发配对卡却没有 open_id，放弃（chat=%s）", msg.chat_id)
+            return
+
+        now = time.monotonic()
+        last = self._pairing_sent_at.get(open_id)
+        if last is not None and now - last < _PAIRING_RATE_LIMIT_SECONDS:
+            log.info(
+                "%s 一小时内已经发过配对卡，不重复发", open_id,
+            )
+            return
+
+        if _card_conn is None:
+            # 与 :meth:`_route_answer` 同一纪律：没带库 = 不能落盘，
+            # 而配对码**必须**落库（另一个进程要来核销它）。
+            log.info("没带库，发不了配对卡（open_id=%s）", open_id)
+            return
+
+        from ..services.pairing import PAIRING_TTL_SECONDS, PairingStore
+
+        try:
+            issued = PairingStore(_card_conn, clock=_card_clock).issue(
+                open_id, ttl_seconds=PAIRING_TTL_SECONDS,
+            )
+            send_pairing_card(
+                self.sender,
+                open_id=open_id,
+                code=issued.code,
+                ttl_seconds=PAIRING_TTL_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 - 发卡失败不得拖垮处理
+            log.exception("发配对卡失败（open_id=%s）", open_id)
+            return
+
+        self._pairing_sent_at[open_id] = now
+        # 顺手清掉过期的键，免得这张表随陌生人增长而**永不回收** ——
+        # 公开的 bot 会遇到大量一次性id，那是缓慢的内存泄漏。
+        cutoff = now - _PAIRING_RATE_LIMIT_SECONDS
+        for key in [k for k, t in self._pairing_sent_at.items() if t < cutoff]:
+            del self._pairing_sent_at[key]
+        log.info("已给 %s 发一张配对卡（%d 分钟内有效）",
+                 open_id, PAIRING_TTL_SECONDS // 60)
 
     def _reply_unsupported(self, msg: IncomingMessage) -> None:
         """回一句「我只处理文字」，然后就此打住。
@@ -1023,6 +1173,14 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         # 几乎一样（都是 action/choice/chat），先判更具体的那个。
         if value.get("action") == SELECT_ACTION:
             return _run_oc_select(value, who=who)
+
+        # **卡片按钮 → 合成命令**（设计文档 11.9.8）。放在凭据流程之前：
+        # 它无状态、不查库，与 menu / select 同族。
+        #
+        # 载荷形状刻意**不是 JSON**：``Repl._command`` 按空白切分，JSON 里的
+        # 空格会把一条命令切成好几段 —— 症状是「点了没反应」，且日志干净。
+        if value.get("action") == COMMAND_ACTION:
+            return _run_card_command(value, who=who)
 
         credential = value.get("id")
         choice = value.get("action")
@@ -1756,6 +1914,81 @@ def _run_plan_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
             else "**好，先留着。** 计划还在，随时可以再确认。")
     return _card_action_response(
         _decided_card(heading, body, granted=(choice == "ok")),
+        "success", heading,
+    )
+
+
+def _run_card_command(value: dict[str, Any], *, who: str) -> dict[str, Any]:
+    """点了事务动作卡 → 路由成 ``<命令> <id>``，结果发回窗口并收掉按钮。
+
+    与 :func:`_run_plan_confirm` **同一套做法**：路由回命令而不是在这里直接
+    改状态，这样白名单判定、去重、截断、状态迁移表全都白送（12.1.1
+    「一份能力一份实现」）。
+
+    ## 为什么必须**窄白名单**（这是本函数最要紧的一行）
+
+    按钮 ``value`` 是**客户端回传**的，而 :meth:`ChannelService.handle`
+    按 ``/`` 开头就当命令派发。所以若照单全收，一个伪造的点击载荷就能
+    借桥接执行**任意**命令 —— 包括 ``/merge``、``/role-del``、
+    ``/delegate`` 这些会改组织结构或触发本地代码执行的。
+
+    白名单里的 ``who`` 校验挡的是「**谁**在点」，而这里挡的是「**能点什么**」——
+    两件事。设计文档 11.8.1 引的官方警告是同一件事：
+    *不要试图枚举所有危险命令，要用**窄白名单***。
+
+    所以只放三个状态迁移，且**刻意不含** ``/start`` 之外的任何写操作 ——
+    ``/done`` / ``/pause`` 走 :meth:`TaskService.set_state`，
+    而它自己会校验 ``ALLOWED_TRANSITIONS`` 与不变式，非法迁移会报错。
+    """
+    cmd = str(value.get("cmd") or "").strip()
+    task_id = str(value.get("id") or "").strip()
+    chat_id = str(value.get("chat") or "").strip()
+    if not cmd or not task_id or not chat_id:
+        return _no_card_change("载荷不完整，未处理")
+
+    # 窄白名单。**先判白名单再判别的** —— 一个不认识的动作不该先被追问细节。
+    if cmd not in _CARD_COMMAND_ALLOWLIST:
+        log.info("【动作卡】命令不在窄白名单内（cmd=%r who=%s）—— 丢弃", cmd, who)
+        return _no_card_change(f"不接受这个操作：{cmd}")
+
+    if _card_channel is None or _card_sender is None:
+        # 没有通道 = 没人能执行。**不猜**：绝不报「已做」。
+        log.warning("【动作卡】没连上通道，不处理（cmd=%r chat=%r）", cmd, chat_id)
+        return _card_action_response(
+            _decided_card("没法执行", "**没连上，执行不了。**", granted=False),
+            "error", "没连上",
+        )
+
+    try:
+        # 白名单判定在 ``handle`` 内部就有 —— 与 plan_confirm 同一条路，
+        # 所以**不必**在这里自己比一遍 allowed 列表（两份逻辑迟早漂移）。
+        with _card_channel.app.lock:
+            reply = _card_channel.handle(chat_id, who, f"{cmd} {task_id}")
+    except Exception:  # noqa: BLE001 - 点卡不该把桥接带崩
+        log.exception("【动作卡】执行失败（cmd=%r id=%r chat=%r）",
+                      cmd, task_id, chat_id)
+        return _card_action_response(
+            _decided_card("没能执行", "**没能执行。** 稍后再试。", granted=False),
+            "error", "没能执行",
+        )
+
+    if reply.denied:
+        # 沉默即拒绝的同一条纪律：被拒就**如实说没做**，
+        # 绝不能回一句「已完成」—— 那比不做更糟。
+        log.info("【动作卡】被拒（cmd=%r who=%s）：%s", cmd, who, reply.text[:40])
+        return _card_action_response(
+            _decided_card("没有执行", f"**没有执行**：{reply.text}", granted=False),
+            "error", "没执行",
+        )
+
+    try:
+        _card_sender.send_text(chat_id, reply.text)
+    except Exception:  # noqa: BLE001 - 发不出去不该让「已执行」变成假的
+        log.warning("【动作卡】回话失败（chat=%s）", chat_id, exc_info=True)
+
+    heading = f"已{cmd.lstrip('/')}"
+    return _card_action_response(
+        _decided_card(heading, f"**{reply.text}**", granted=True),
         "success", heading,
     )
 

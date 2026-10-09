@@ -672,6 +672,11 @@ class ChatService:
         bits = [f"形状 {task.kind.label}", f"角色 {'、'.join(self._role_names(task))}"]
         if scheduled is not None:
             bits.append(f"排到 {scheduled}")
+        else:
+            # 必须明说。不说的话用户记完一件事、再问「今天该做什么」，
+            # 会拿到「今天没有排进来的事务」—— 而这条明明刚记进去。
+            # 静默的代价是用户以为没记上，于是再记一遍。
+            bits.append("没排期，不在今天视图里")
         if reminder is not None:
             bits.append(f"提醒 {reminder:%H:%M}")
         return ChatReply(
@@ -686,9 +691,17 @@ class ChatService:
     def _answer_today(self) -> ChatReply:
         view = self._today.view()        # 顺延仍在这里触发
         if not view.items:
+            # 「没有排进来的」不等于「没有事」。没排期的那些按设计不进
+            # 今天视图，但**必须报出来** —— 否则用户刚记的事凭空消失，
+            # 而回答还斩钉截铁地说「没有」。
+            extra = (
+                f"另有 {view.unscheduled_count} 条没排期，它们也不在今天视图里。"
+                if view.unscheduled_count
+                else ""
+            )
             return ChatReply(
                 ChatReplyKind.ANSWER,
-                f"{view.day} 今天没有排进来的事务。",
+                f"{view.day} 今天没有排进来的事务。{extra}",
                 suggestions=("我上周完成了什么", "有什么提醒"),
             )
         items = tuple(self._item(s) for s in view.items)

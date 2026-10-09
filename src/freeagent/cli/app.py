@@ -83,6 +83,11 @@ _USAGE: dict[str, str] = {
     "/dod": "/dod <id> <完成标准|off>",
     "/today-pin": "/today-pin <id> [YYYY-MM-DD|off]",
     "/note": "/note <id> <内容>",
+    # 刻意与 /note 分开成两条：/note 无校验，而这条要挡三种不许重派的情形。
+    # 合成一条就等于把「用错入口静默无效」又请回来（见 _cmd_redispatch）。
+    "/redispatch": "/redispatch <id> [原因]",
+    # 配对码**只能由桥接签发**（它看得见发消息的人），终端只负责核销。
+    "/pair": "/pair <配对码>",
     "/draft": "/draft <id> [要求]",
     "/revise": "/revise <id> <新内容>",
     "/artifact": "/artifact <id> [版本号]",
@@ -101,6 +106,9 @@ _USAGE: dict[str, str] = {
     ),
     "/tick": "/tick",
     "/llm": "/llm            查看当前智能层与配置（不显示 Key）",
+    # 用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
+    "/agents": "/agents       有哪些执行器可用、装了没、能不能派（只看不派）",
+    "/ask": "/ask <问题>    问执行器一句（只读：不改文件、不建事务、不问审批）",
     "/help": "/help",
     "/quit": "/quit",
 }
@@ -146,6 +154,10 @@ _HELP = """\
         建一条委派事务。**必须 /start 之后**执行器才会动它；
         项目路径要在 config.json 的 delegate.projects 白名单里。
         另开终端跑：python -m freeagent.delegate --dry-run
+  /redispatch <id> [原因]
+        让这条委派可以**重新派发**。「派发前就被拒」（白名单不符 / 没闸门）
+        不会自动重试 —— 改配置前重试多少次都是同一个结果。
+        改好配置后跑这条，执行器下次扫到就会再派一次。
 
   ── 角色归属 ──
   /move <id> <角色>   只挂到这个角色
@@ -160,6 +172,9 @@ _HELP = """\
   ── 其它 ──
   /tick               手动检查提醒
   /llm                当前智能层与配置（不显示 Key）
+  /agents             执行器探针：装了没、什么版本、能不能派（**只看不派**）
+  /ask <问题>         问执行器一句就回来（**只读**：不改文件、不建事务、不问审批）
+  /pair <配对码>      把飞书某个人加进白名单（码来自 bot 私聊发的那张卡）
   /help               这份帮助
   /quit               退出
 
@@ -240,16 +255,49 @@ MODE_PLAN = "plan"
 MODE_BUILD = "build"
 
 
+#: 通道标识。**不同的通道有不同的送达方式**，所以它是一个维度而不是装饰
+#: （设计文档 11.11）。
+#:
+#: 为什么必须显式区分：``delegate_chat_id`` 是「回推目的地」，而它的值来自
+#: ``channel_ctx.chat_id``。在只有飞书一个通道时，那个字段里装的**总是**
+#: 一个真会话 ID，于是「能不能推」这个问题不需要问。多一个 WEB 通道之后，
+#: 往同一个列里塞进去的是常量 ``"web"`` —— 它**不是会话 ID**，库里于是多了
+#: 一条假地址，而执行器会拿着它去发消息（实测症状：一条指向错误方向的
+#: 「缺少 FEISHU_APP_ID」警告）。
+CHANNEL_TERMINAL = "terminal"
+CHANNEL_WEB = "web"
+CHANNEL_FEISHU = "feishu"
+
+#: **能主动推送**的通道。终端的 ``None`` 与 WEB 的请求-响应都不在其中 ——
+#: 它们的结果靠「落库 + 下次拉取」送达，没有「推」这回事（11.11.2）。
+#:
+#: 刻意做成集合而不是 ``if ctx.channel == CHANNEL_FEISHU``：将来加微信时
+#: 要改的是**一处名单**，而不是散落在各处的等值比较。
+PUSH_CHANNELS = frozenset({CHANNEL_FEISHU})
+
+
 @dataclass(frozen=True, slots=True)
 class _ChannelCtx:
-    """这条命令来自哪个远程会话（飞书等）。
+    """这条命令来自哪个通道的哪个会话（飞书 / WEB / 终端）。
 
     终端发起的为 ``None``。有了它，「在飞书里派一件事、结果自己飞回来」
     才成立 —— 委派得知道往哪儿回。
+
+    :attr:`channel` 是 11.11 补的**维度**。在此之前这个类只有 ``chat_id``，
+    而 ``chat_id`` 的**语义随通道变**：飞书的是一个真会话 ID
+    （``oc_xxx``），WEB 的是一个常量（``"web"``）。两件事装在同一个字段里，
+    调用方就无法回答「这个地址能不能推」—— 于是唯一的写法是猜。
     """
 
     chat_id: str
     sender_open_id: str = ""
+    #: 通道标识，取 :data:`CHANNEL_TERMINAL` / :data:`CHANNEL_WEB` /
+    #: :data:`CHANNEL_FEISHU`。
+    #:
+    #: 默认 ``terminal``：这个类**多数**构造点是终端。给默认值而不是必填，
+    #: 是因为「不知道自己是哪个通道」时的正确姿态是**最保守的那个** ——
+    #: 终端不推送，于是漏判的后果是「少推一次」，而不是「推错地方」。
+    channel: str = CHANNEL_TERMINAL
 
 
 class Repl:
@@ -303,6 +351,13 @@ class Repl:
         #: 上一条回复附带的**只读视图选项**，供通道层（飞书）渲染按钮卡。
         #: 终端不读它 —— 终端本来就能直接敲命令，给它加按钮没有意义。
         self._last_choices: tuple[str, ...] = ()
+        #: 上一条回复附带的**事务动作卡**（``(task_id, title)``），供通道层发卡。
+        #: 终端不读它 —— 终端能直接敲 ``/start``，加按钮没有意义。
+        #:
+        #: 归属与 :attr:`_last_choices` **同类**（「那一条回复的卡片」），
+        #: 所以每条消息都要清（见 ``ChannelService._run``）——
+        #: 粘住的后果是「下一句无关的话也长出一张动作卡」。
+        self._last_task_action: tuple[str, str] | None = None
         #: 远程来源。**刻意做成构造参数而不是全局** —— 这样「谁发起的」
         #: 是显式传入的，不会因为某个 handler 忘了传递就静默变成「来自终端」。
         self.channel_ctx = channel_ctx
@@ -1047,6 +1102,10 @@ class Repl:
             "/dod": self._cmd_dod,
             "/today-pin": self._cmd_pin,
             "/note": self._cmd_note,
+            # 委派恢复入口。与 /note 分开：那条无校验，这条要挡三种不许重派。
+            "/redispatch": self._cmd_redispatch,
+            # 飞书配对（设计文档 11.9.8）。码由桥接侧签发，终端只核销。
+            "/pair": self._cmd_pair,
             "/draft": self._cmd_draft,
             "/revise": self._cmd_revise,
             "/artifact": self._cmd_artifact,
@@ -1059,6 +1118,11 @@ class Repl:
             "/plan": self._cmd_plan,
             "/tick": self._cmd_tick,
             "/llm": self._cmd_llm,
+            # 能力探针（设计文档 11.10.2）。只看不派 —— 见 _cmd_agents。
+            "/agents": self._cmd_agents,
+            # 问一句（设计文档 11.10.6）。刻意放在委派**旁边**而不是混进
+            # 委派那张表：它不建事务、不落库，混进去会让人以为它能存东西。
+            "/ask": self._cmd_ask,
         }
 
     # ---- 视图 ---- #
@@ -1123,6 +1187,70 @@ class Repl:
         degraded = getattr(self.app.llm, "degraded_reason", None)
         if degraded:
             self._say(f"  最近降级：{degraded}")
+
+    def _cmd_agents(self, args: list[str]) -> None:
+        """``/agents`` —— 有哪些执行器可用、装了没、能不能派（设计文档 11.10.2）。
+
+        **只看不派。** 刻意不给「派一个」的参数：本命令是探针，
+        而探针一旦能顺手派出去，就有了「点错就跑」的形状
+        （11.10.5：绝不自动触发委派）。
+
+        列的是**注册表里登记的全部**执行器，不是「装了的那几个」——
+        没装的也要列出来并说清为什么不可用，否则用户会以为
+        「没列出 = 本仓不支持」，而那与「装了但没验过」是两件不同的事。
+
+        函数内导入：探针要跑一次 ``--version``（起进程），
+        那是**有代价**的操作，不该在模块导入期就发生。
+        """
+        from ..services.executor_probe import probe_all, render_probes
+
+        self._say(render_probes(probe_all()))
+
+    def _cmd_ask(self, args: list[str]) -> None:
+        """``/ask <问题>`` —— 把一句话交给执行器，把答复拿回来（设计文档 11.10.6）。
+
+        **和 ``/delegate`` 的区别**：那是「把一件事做掉」，这是「问一句」。
+        所以不落库、不进今天视图、不产出 artifact、**不问任何审批**。
+
+        「不问审批」的前提是「**改不了**」，而那由 ``services/ask.py`` 传入的
+        **只读权限配置**强制 —— 不是靠执行器自觉（V1 未命中规则时大多默认
+        ``allow``，见设计文档 11.8.1 的版本陷阱表）。
+
+        函数内导入：``ask_executor`` 会起一个**真进程**，那是本文件导入期
+        绝不该发生的事。
+        """
+        question = " ".join(args).strip()
+        if not question:
+            self._say("用法：/ask <问题>。例如：/ask 这个项目是干什么的？")
+            return
+
+        import pathlib
+
+        from ..services.ask import ask_executor
+        from ..services.opencode_server import OpenCodeServer
+
+        project = pathlib.Path.cwd()
+        self._say(f"（问的是这个目录：{project}）")
+        outcome = ask_executor(
+            question,
+            project=project,
+            make_server=lambda p, c, **kw: OpenCodeServer(
+                project=p, executable=c, **kw
+            ),
+            model=(self.app.config.model if self.app.config else None),
+        )
+        if outcome.ok:
+            self._say("")
+            self._say(outcome.text or "（它没给出文字答复。）")
+            return
+        self._say("")
+        self._say(f"没答成：{outcome.reason}")
+        if outcome.partial:
+            self._say("")
+            self._say("已拿到的部分：")
+            self._say(outcome.partial)
+        for note in outcome.notes:
+            self._say(note)
 
     def _cmd_tick(self, args: list[str]) -> None:
         digest = self.app.reminders.due()
@@ -1299,14 +1427,32 @@ class Repl:
             kind=TaskKind.ACTION,
             intent=f"在 {project} 里完成：{requirement}",
             project_path=str(project),
-            # 从飞书发起的，**记下是哪个会话** —— 执行器靠它把结果推回去，
-            # 闭环才合得上。终端发起的为 None，结果只进产物链（终端本来就能看）。
+            # 从**能推送的**通道发起的，才记下是哪个会话 —— 执行器靠它把结果
+            # 推回去，闭环才合得上。
+            #
+            # ⚠️ ``channel_ctx`` 存在**不等于**有地方可推（设计文档 11.11.2）。
+            # WEB 是请求-响应通道，它的 ``chat_id`` 是个常量 ``"web"`` 而不是
+            # 会话 ID —— 写进这个语义为「往哪儿发消息」的列，就是**在库里存了
+            # 一条假地址**。执行器那侧会拿着它去发消息，症状是打出一条指向
+            # 错误方向的「缺少 FEISHU_APP_ID」（实测，2026-10-09）。
+            #
+            # 所以判据是**通道能不能推**，而不是**有没有 channel_ctx**。
+            # 终端（``None``）与 WEB 都落 ``None``：结果只进产物链，
+            # 由各自的前端拉取 —— 那是它们的正确送达方式，不是降级。
             delegate_chat_id=(
-                self.channel_ctx.chat_id if self.channel_ctx else None
+                self.channel_ctx.chat_id
+                if self.channel_ctx
+                and self.channel_ctx.channel in PUSH_CHANNELS
+                else None
             ),
             # 「谁发起的」—— 与上面那个「发到哪」取自**同一个** channel_ctx，
             # 所以两者天然一致：不会出现「A 发起的、
             # 结果却推给 B 的会话」。终端发起时 channel_ctx 是 None。
+            #
+            # 刻意**不**跟着上面那条一起收窄：那是「往哪儿推」（推送能力），
+            # 这是「谁发起的」（身份，11.9.7 的「只有发起人能批」要用）。
+            # WEB 侧的 ``sender_open_id`` 是空串，于是落库仍是 ``None`` ——
+            # 结果相同，但**理由不同**，写下来免得将来有人以为这里漏了。
             delegate_requested_by=(
                 (self.channel_ctx.sender_open_id or None)
                 if self.channel_ctx else None
@@ -1350,6 +1496,10 @@ class Repl:
         self._say("它现在是「待办」，执行器不会碰它。")
         self._say(f"确认要派的话：/start {task.id[:8]}")
         self._say("然后另开一个终端跑：python -m freeagent.delegate --dry-run")
+        # 让通道层（飞书）能发一张动作卡：否则用户看到「确认要派的话：
+        # /start ab12」却还得**手打这条命令**—— 而 11.9.8 说的「点一下即可」
+        # 就没兑现。终端不读这个字段，所以这里设了也无副作用。
+        self._last_task_action = (task.id, task.title)
 
     def _cmd_task(self, args: list[str]) -> None:
         if not args:
@@ -1510,6 +1660,53 @@ class Repl:
             return
         task = self.app.tasks.note(self._resolve_id(args[0]), " ".join(args[1:]))
         self._say(f"已记：{task.title}")
+
+    def _cmd_redispatch(self, args: list[str]) -> None:
+        """``/redispatch <id> [原因]`` —— 让一条委派可以重新派发。
+
+        刻意**不**做成「``/note`` 的特殊写法」：``/note`` 没有任何校验，
+        而这条要挡三种不许重派的情形（正在跑 / 已完成 / 还没派过）。
+        混进 ``/note`` 的话，「用错入口就静默无效」又回来了 ——
+        而那正是原来那句「可以 /note 记下原因后重派」的病根。
+        """
+        if not args:
+            self._usage("/redispatch")
+            return
+        task = self.app.tasks.reset_delegation(
+            self._resolve_id(args[0]), " ".join(args[1:])
+        )
+        self._say(f"已标记重派：{task.title}")
+        self._say("执行器下次扫到就会再派一次（它是独立进程，不会立刻跑）。")
+
+    def _cmd_pair(self, args: list[str]) -> None:
+        """``/pair <配对码>`` —— 核销码，把对方写进飞书白名单。
+
+        码从哪儿来：给 bot 发一条**私聊**，它会回一张带配对码的卡。
+
+        刻意**不在终端生成码** —— 终端不知道对方的 ``open_id``，生成不出
+        能用的码。能生成码的地方是桥接（它看得见发消息的人）。
+
+        它与「白名单失败关闭」**不冲突**：配对解决的是「怎么拿到
+        open_id」，而白名单为空仍然拒绝启动飞书通道。
+        """
+        # 函数内导入：``feishu.pairing_cmd`` 属于通道侧，而本文件是核心 CLI
+        # —— 顶层导入会让「不装飞书通道」这件事在**导入期**就变成硬依赖。
+        # 该模块只依赖 stdlib（secret_store / config 都不 import lark_oapi），
+        # 所以这里导入不会把 ``lark-oapi`` 拖进来。
+        from ..feishu.pairing_cmd import pair_command
+
+        if not args:
+            self._say(
+                "用法：/pair <配对码>。\n"
+                "码从哪儿来：给 bot 发一条**私聊**，它会回一张带配对码的卡。\n"
+                "（群里不会发 —— 群里发卡等于向全群确认「这里有个 bot」。）"
+            )
+            return
+        # home 取 ``app.config.home``：它跟着 ``--db`` 走，所以配对写进的
+        # feishu.env 与桥接读的是**同一份**。取错目录的症状是「配对说成功了，
+        # 但还是进不来」—— 而那正是本次要治的病。
+        home = self.app.config.home if self.app.config is not None else None
+        self._say(pair_command(self.app.conn, args[0], home=home))
 
     # ---- 草稿与助手产出 ---- #
     def _cmd_draft(self, args: list[str]) -> None:

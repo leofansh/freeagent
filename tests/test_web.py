@@ -387,6 +387,51 @@ class TestCreate:
         status, _data = post(served[0], "/api/nope", {})
         assert status == 404
 
+    def test_reject_paths_stay_readable_over_many_rounds(self, served):
+        """⚠️ **回归**：拒绝响应必须**读得到**，而不仅仅是状态码对。
+
+        实测（2026-10-08）：这条曾偶发 ``WinError 10053``
+        （``ConnectionAbortedError``）—— 服务端明明打了 404，客户端却读不到。
+
+        根因不在这个测试里：未知路径那条路**压根不读请求体**，于是接收缓冲区
+        里还留着数据，``close()`` 就变成 abort（Windows 发 RST 而不是 FIN）。
+        更麻烦的是被中止的套接字会**连累之后复用同一四元组的无关连接**，
+        于是受害者每次都不一样 —— 表现为「随机失败」，连对着干净树对照
+        都会被误导。
+
+        所以这里**跑很多轮**：一轮通过说明不了问题，而这条断言的价值
+        恰恰在于「它本来是随机的」。
+        """
+        for _ in range(30):
+            status, data = post(served[0], "/api/nope", {"x": 1})
+            assert status == 404, f"状态码错了：{status}"
+            # ``post`` 已经 json.loads 过了 —— 能走到这一行就说明**正文读到了**
+            # （修复前是 ConnectionAbortedError）。
+            assert "没有这个接口" in data["error"]
+
+    def test_unauthorized_post_body_is_still_readable(self, served):
+        """401 那条路同样要丢请求体，否则连 401 都读不到。
+
+        POST 一律带体，所以这不是边角情况而是**常态**。
+        """
+        host, port = served[0].split(":")
+        conn = HTTPConnection(host, int(port), timeout=5)
+        try:
+            payload = json.dumps({"x": 1}).encode("utf-8")
+            conn.request(
+                "POST", "/api/nope", body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                    # 刻意**不带**会话令牌 —— 走的就是 401 那条拒绝路。
+                },
+            )
+            res = conn.getresponse()
+            assert res.status == 401
+            assert "需要会话令牌" in json.loads(res.read().decode("utf-8"))["error"]
+        finally:
+            conn.close()
+
 
 # =============================================================================
 # 安全边界

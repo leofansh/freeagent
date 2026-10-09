@@ -60,7 +60,11 @@ def store(conn):
 
 class TestMigration:
     def test_version(self):
-        assert SCHEMA_VERSION == 12
+        # 13 = 配对码表（11.9.8）。改 SCHEMA_VERSION 时**必须**同步改这里，
+        # 而这条断言存在的意义就是让「加了迁移忘了改版本号」当场暴露 ——
+        # 那个 bug 的症状是「新表不存在」，而迁移循环
+        # ``range(current, SCHEMA_VERSION)`` 会安静地跳过最后一条。
+        assert SCHEMA_VERSION == 13
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

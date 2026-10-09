@@ -50,6 +50,7 @@ __all__ = [
     "ChannelService",
     "Deduplicator",
     "InMemoryDeduplicator",
+    "DEFAULT_CHANNEL",
 ]
 
 #: 回复里明确告知「这条没生效」时的统一措辞。宁可啰嗦也不能让用户
@@ -66,6 +67,16 @@ MAX_REPLY_CHARS = 3500
 #: ``tests/test_feishu_dedup.py`` 断言两者相等，防止悄悄漂移。
 DEFAULT_DEDUP_TTL_SECONDS = 24 * 3600
 DEFAULT_DEDUP_MAX_ENTRIES = 2048
+
+#: 本服务默认服务的通道。**与** :data:`freeagent.cli.app.CHANNEL_FEISHU`
+#: **刻意重复**，理由同上面那对去重常量：本模块不能 import ``cli``
+#: （:mod:`freeagent.cli.app` 很重，且它的通道常量住在那里只是因为
+#: :class:`~freeagent.cli.app._ChannelCtx` 住在那里）。两份值由
+#: ``tests/test_channel_channels.py`` 断言相等，防止悄悄漂移。
+#:
+#: 加微信时**不要**在这里改默认值 —— 默认值说的是「本类当前服务谁」，
+#: 而新通道应该**新构造一个实例**并显式传 ``channel="wechat"``。
+DEFAULT_CHANNEL = "feishu"
 
 
 #: ``@runtime_checkable`` 是刻意的：``isinstance`` 只校验方法**存在**，
@@ -134,6 +145,19 @@ class ChannelReply:
     text: str
     #: 是否被拒（不在白名单 / 被去重丢弃）。用于日志与测试。
     denied: bool = False
+
+    #: **为什么**被拒。空串 = 不给理由（默认）；非空时是一句面向调用方的
+    #: 短标签，如 ``"allowlist"``。
+    #:
+    #: 为什么需要它：``denied=True`` 之前把**三种完全不同的东西**混在一起 ——
+    #: 白名单拒绝、重复事件（要静默）、空消息（要回「说点什么吧」）。
+    #: 传输层只能靠 ``text`` 是否为空去猜，而那个启发式在
+    #: 「白名单拒绝恰好回空串」时会误判成重复事件，于是**陌生人被静默**。
+    #: 给一个可枚举的理由，各条路径自己认自己的那种。
+    #:
+    #: 刻意**只放标签不放文案**：文案属于呈现，是桥接的事；
+    #: 这一层不能碰传输，也不该替用户决定他看到什么。
+    deny_reason: str = ""
     #: **只读视图选项**。非空时，飞书侧应渲染成**按钮卡**而不是纯文字。
     #:
     #: 为什么需要它：低置信度时 :class:`ChatService` 返回 ``CLARIFY``
@@ -152,6 +176,16 @@ class ChannelReply:
     #: **建事务**，是写操作。把两者塞进同一个字段，桥接就没法区分该不该
     #: 走审批凭据，而漏判的后果是「点一下就建了事务」。
     plan_confirm: tuple[str, ...] = ()
+
+    #: 本轮要发的**事务动作卡**（``(task_id, title)``）。空 = 本轮不发。
+    #:
+    #: 与 :attr:`choices` / :attr:`plan_confirm` 分开而不合并：那张卡回答的是
+    #: 「我选哪个」（读），这张卡回答的是「对这条事务做什么」（写）。混在一个
+    #: 字段里桥接就得猜「点了要不要落库」，而漏判的后果是「点一下就改了状态」。
+    #:
+    #: 只在**委派建好**这一轮非空（:meth:`Repl._cmd_delegate` 置位）。那时
+    #: 文本里让人手打 ``/start <id>``，而这张卡就是那句话的按钮版。
+    task_action: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +217,7 @@ class ChannelService:
         allowed_senders: frozenset[str] = frozenset(),
         max_chats: int = 64,
         dedup: Deduplicator | None = None,
+        channel: str = DEFAULT_CHANNEL,
     ) -> None:
         """``allowed_senders`` 是飞书 ``open_id`` 集合。
 
@@ -191,10 +226,21 @@ class ChannelService:
 
         ``dedup`` 默认内存表；桥接会注入落盘版（跨重启记得住）。
         刻意允许替换 —— 跨重启去重要落盘，可本模块不能碰文件系统与 SDK。
+
+        ``channel`` 是这条通道的标识（设计文档 11.11）。它会被写进
+        :class:`~freeagent.cli.app._ChannelCtx`，用来回答一个二值问题：
+        **这条通道能不能主动推送**（11.11.2）。此前那个问题不需要问 ——
+        因为飞书是唯一的远程通道；多一个 WEB 通道之后，把 ``"web"`` 当成
+        「回推目的地」写进库里就会让执行器发错地方（实测过）。
+
+        它**不是**授权判据：那在 :meth:`is_allowed`，看的是
+        ``allowed_senders``。两者是不同的东西，别合并 ——
+        「谁能指挥本机」和「结果往哪儿送」是两件事。
         """
         self.app = app
         self.allowed = allowed_senders
         self.max_chats = max_chats
+        self.channel = channel
         self.dedup: Deduplicator = dedup if dedup is not None else InMemoryDeduplicator()
         # 标注成 ``Any`` 而不是 ``object``：这里存的是 :class:`Repl` 实例，
         # 而 ``object`` 会让下面每一次 ``repl.out = …`` / ``repl.handle(…)``
@@ -223,6 +269,9 @@ class ChannelService:
         self._last_choices: tuple[str, ...] = ()
         #: 本轮要请人确认的计划行（Plan → Build）。空 = 不发确认卡。
         self._last_plan_confirm: tuple[str, ...] = ()
+        #: 本轮要发的**事务动作卡**（``(task_id, title)``）。``None`` = 不发。
+        #: 只有 ``/delegate`` 建好委派那一轮会非空（设计文档 11.9.8）。
+        self._last_task_action: tuple[str, str] | None = None
 
     # -- 白名单 ------------------------------------------------------------- #
     def is_allowed(self, sender_ids: str | Iterable[str]) -> bool:
@@ -284,7 +333,14 @@ class ChannelService:
         if not self.is_allowed(sender_ids):
             # 回给对方的仍然只有「没有权限」—— 说清「你差哪个 ID」等于给
             # 陌生人一个可探测的开关。详细对照只进日志（见 allowlist_mismatch）。
-            return ChannelReply(text="没有权限。", denied=True)
+            #
+            # ``deny_reason`` 让传输层能认出「这是白名单拒绝」并**只**在私聊
+            # 里发配对卡（设计文档 11.9.8）。它是标签不是文案：文案由桥接决定。
+            #
+            # ⚠️ 这条**不削弱白名单**：配对解决的是「怎么拿到 open_id」，
+            # 拿不到仍然拒绝启动（``feishu/config.py::check_ready``），
+            # 而且这里的判定本身一个字都没变。
+            return ChannelReply(text="没有权限。", denied=True, deny_reason="allowlist")
 
         if event_id is not None and self._is_duplicate(event_id):
             return ChannelReply(text="", denied=True)
@@ -315,6 +371,7 @@ class ChannelService:
             text=self._clip(reply),
             choices=self._last_choices,
             plan_confirm=self._last_plan_confirm,
+            task_action=self._last_task_action,
         )
 
     @staticmethod
@@ -350,7 +407,9 @@ class ChannelService:
             #
             # 恢复失败（没存过 / 已过期）不是错误：那就是「本来就没在规划」，
             # 属于正常状态。restore_plan 自己吞异常正是为此。
-            repl.channel_ctx = _ChannelCtx(chat_id=chat_id, sender_open_id="")
+            repl.channel_ctx = _ChannelCtx(
+                chat_id=chat_id, sender_open_id="", channel=self.channel
+            )
             try:
                 repl.restore_plan()
             except Exception:  # noqa: BLE001 - 恢复不了就当没在规划
@@ -376,6 +435,10 @@ class ChannelService:
         # 清空上一轮的选项：每条消息都要重设，否则上一句触发的按钮卡
         # 会**粘**到这一句上 —— 而这两句可能毫无关系。
         repl._last_choices = ()
+        # 事务动作卡与 ``_last_choices`` **同归属**（「那一条回复的卡片」），
+        # 所以同样每条消息清空 —— 粘住的后果是「下一句无关的话也长出一张
+        # 动作卡」，而那张卡上的按钮会真的去改状态。
+        repl._last_task_action = None
         # ⚠️ **刻意不重置** ``_last_plan_confirm``（与 ``_last_choices`` 相反）。
         #
         # 我第一版把它和 ``_last_choices`` 一样每条消息清掉，**结果是确认永远
@@ -392,7 +455,9 @@ class ChannelService:
         # 每条消息都重设来源：一个群里多个被授权的人，发送者是会变的。
         # 有了它，``/delegate`` 才能把「结果推回哪个会话」记在事务上 ——
         # 闭环靠的就是这个。
-        repl.channel_ctx = _ChannelCtx(chat_id=chat_id, sender_open_id=sender_id)
+        repl.channel_ctx = _ChannelCtx(
+            chat_id=chat_id, sender_open_id=sender_id, channel=self.channel
+        )
 
         # check_reminders=False：提醒由 due_reminders() 单独推。
         # 顺带消费的话，一条无关消息就能把提醒吞掉（见模块 docstring）。
@@ -400,6 +465,13 @@ class ChannelService:
         self._last_choices = tuple(getattr(repl, "_last_choices", ()) or ())
         self._last_plan_confirm = tuple(
             getattr(repl, "_last_plan_confirm", ()) or ())
+        # 用 getattr 兜底，与上面两项同一写法：旧 Repl 或替身缺这个属性时
+        # 退化成「本轮不发卡」，而**不是** AttributeError 把整条消息带崩。
+        # 这里的兜底是安全的 —— 与 ``plan_confirm`` 不同，卡片缺失只是「少张
+        # 卡」，而 :meth:`_cmd_delegate` 的**文本**已经说了要 ``/start``，
+        # 所以功能并没有因此消失。
+        action = getattr(repl, "_last_task_action", None)
+        self._last_task_action = (str(action[0]), str(action[1])) if action else None
         return buffer.getvalue().strip()
 
     @staticmethod

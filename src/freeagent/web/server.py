@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from ..app import App
 from ..domain import FreeAgentError
 from . import endpoints_read
-from .body import read_json
+from .body import discard_body, read_json
 from .page import INDEX_HTML
 from .routes import READ_ROUTES as _READ_ROUTES
 from .routes_write import dispatch_post
@@ -132,6 +132,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         return token_matches(self.headers.get(SESSION_HEADER))
 
     def _reject_unauthorized(self) -> None:
+        # ⚠️ **必须先丢弃请求体再回响应**（见 :func:`.body.discard_body`）。
+        # 不丢的话接收缓冲区里还留着数据，``close()`` 变成 abort ——
+        # 客户端**连这个 401 都读不到**，只看到 ConnectionAbortedError。
+        # 而 POST 一律带体，所以这条在写接口上是常态而不是边角。
+        discard_body(self.rfile, self.headers)
         self._send(self._error("需要会话令牌", HTTPStatus.UNAUTHORIZED))
 
     # -- 路由 ---------------------------------------------------------------- #
@@ -180,6 +185,13 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         try:
             found = dispatch_post(self.app, parts, self._read_json)
             if found is None:
+                # ⚠️ 同 :meth:`_reject_unauthorized`：**先丢弃请求体**。
+                # 路径不认识时 ``dispatch_post`` 压根不碰请求体，于是缓冲区
+                # 里还留着数据，``close()`` 变成 abort —— 客户端连这个 404
+                # 都读不到。实测会表现为随机的 ConnectionAbortedError，
+                # 而且会**连累之后无关的连接**，凶手不在现场（见
+                # :func:`.body.discard_body`）。
+                discard_body(self.rfile, self.headers)
                 self._send(self._error("没有这个接口", HTTPStatus.NOT_FOUND))
                 return
             status, payload = found
