@@ -202,10 +202,24 @@ _INTERNAL_AGENTS = frozenset({"compaction", "summary", "title", "internal"})
 
 
 def list_agent_options(rows: Iterable[dict[str, Any]]) -> list[Option]:
-    """``GET /agent`` → 可选工作模式。
+    """``GET /agent`` → 可选工作模式：``mode == "primary"`` 且不是内部件。
 
-    只要 ``mode == "primary"`` **且** ``model`` 非 null 的。
-    ``mode`` 字段实测存在（primary / subagent / all）。
+    ## 为什么**不再**要求 ``model`` 非空
+
+    原来这条门槛把内置模式（``build`` / ``plan``）整个挡在下拉外面 ——
+    它们的 ``model`` 就是 null（执行世界的模型由派发时**显式**传，不靠
+    agent 自带，见 :func:`agent_is_executable`）。结果是一个**双重错误**：
+
+    1. 唯一真跑得起来的 ``build`` / ``plan`` 在下拉里**根本不出现**；
+    2. 留下来的全是云端/项目级模式，而那些在隔离执行世界里不存在 ——
+       用户选哪个，派发都报「工作模式已失效」。
+
+    实测（2026-10-09）：用户连选 ``Atlas - Plan Executor``、
+    ``Sisyphus - ultraworker`` 两个都失败，就是这个原因。
+
+    能不能跑由 :func:`agent_is_executable` 判（在端点里标到选项上），
+    **不是**在这里用 ``model`` 当代理指标提前筛掉。``mode`` 字段实测存在
+    （primary / subagent / all）。
     """
     out: list[Option] = []
     for row in rows:
@@ -217,11 +231,11 @@ def list_agent_options(rows: Iterable[dict[str, Any]]) -> list[Option]:
         if str(row.get("mode") or "") != "primary":
             continue
         model = row.get("model")
-        if not isinstance(model, dict):
-            continue
-        provider = str(model.get("providerID") or "").strip()
-        model_id = str(model.get("modelID") or "").strip()
-        hint = f"{provider}/{model_id}" if provider and model_id else ""
+        hint = ""
+        if isinstance(model, dict):
+            provider = str(model.get("providerID") or "").strip()
+            model_id = str(model.get("modelID") or "").strip()
+            hint = f"{provider}/{model_id}" if provider and model_id else ""
         out.append(Option(value=name, label=name, hint=hint))
     return out
 
@@ -256,8 +270,11 @@ def current_agent_is_valid(rows: Iterable[dict[str, Any]], agent: str) -> bool:
 
     ## 为什么复用 :func:`list_agent_options` 而不是再写一遍过滤
 
-    过滤规则（``mode == "primary"``、model 非 null、排除内部件）只准有一份。
-    在这里另写一遍，就会出现「列表里看得见、校验时说不认识」的错位。
+    过滤规则（``mode == "primary"``、排除内部件）只准有一份。在这里另写
+    一遍，就会出现「列表里看得见、校验时说不认识」的错位。
+
+    （**不再**要求 model 非 null —— 那条门槛会把内置模式整个挡在下拉外，
+     见 :func:`list_agent_options`。）
     """
     if not agent:
         return True

@@ -53,6 +53,8 @@ __all__ = [
     "snapshot",
     "stage_options",
     "reset_cache",
+    "exec_world_agents",
+    "reset_exec_cache",
 ]
 
 log = logging.getLogger(__name__)
@@ -127,6 +129,70 @@ def snapshot() -> Snapshot:
         log.exception("【发现】起 opencode 服务失败")
     _SNAPSHOT = snap
     return snap
+
+
+#: 「执行世界」快照有效期（秒）。
+#:
+#: 比 :data:`_TTL` 长得多，因为查它要**再起一次** opencode（隔离实例，
+#: 约 7 秒），不能每次刷新页面都付一遍；而内置工作模式几乎不变。
+_EXEC_TTL = 600.0
+
+#: 项目路径 → ``(时刻, 工作模式列表或 None)``。**按项目**缓存：项目级
+#: agent（``.opencode/agents/*.md``）在隔离实例里也看得见，所以列表与
+#: 项目有关，不能全局共用一份。
+_EXEC: dict[str, tuple[float, list[dict[str, Any]] | None]] = {}
+
+
+def reset_exec_cache() -> None:
+    """清「执行世界」缓存。给测试与「我刚装了新 opencode」用。"""
+    _EXEC.clear()
+
+
+def exec_world_agents(project: str = "") -> list[dict[str, Any]] | None:
+    """**执行世界**（隔离实例）里有哪些工作模式。查不到返回 ``None``。
+
+    ## 为什么不能直接用 :func:`snapshot` 那份
+
+    两个世界看得见的东西不一样（设计文档 11.13.8 / 11.14，实测踩过两次）：
+
+    - :func:`snapshot` 用**非隔离**实例，看得见登录态与云端工作模式
+      （``Sisyphus - ultraworker``、``Atlas - Plan Executor`` 之类）；
+    - 真正派发出去用的是**隔离**实例，那里只有内置的几个
+      （实测：``build`` / ``plan`` 可用，其余是内部件或 subagent）。
+
+    于是只拿 snapshot 判「有没有这个模式」会得出「选什么都行」的错觉 ——
+    用户照着下拉选了云端模式，派发必然 ``工作模式「X」已失效``。**判
+    「跑不跑得起来」必须问执行世界**（与执行期
+    :func:`~.oc_selection.agent_is_executable` 同一条规则）。
+
+    ## 为什么失败是 ``None`` 而不是 ``[]``
+
+    ``[]`` = 真的一个都没有，``None`` = 没查到。用 ``[]`` 会把「起不来
+    服务」误报成「你的 opencode 一个工作模式都没有」，于是界面把**所有**
+    模式标成不可用 —— 那是一次环境抖动把功能全废掉。取不到就**降级不过滤**。
+    """
+    key = str(project or "")
+    now = time.monotonic()
+    hit = _EXEC.get(key)
+    if hit is not None and now - hit[0] < _EXEC_TTL:
+        return hit[1]
+    try:
+        import tempfile
+        from pathlib import Path
+
+        from .opencode_server import OpenCodeServer
+
+        cwd = Path(key) if key else Path(tempfile.gettempdir())
+        # isolate=True 是**安全属性**，不给开关：只有与派发时同样的隔离
+        # 条件，查到的列表才对得上派发时的校验。
+        with OpenCodeServer(project=cwd, executable="opencode",
+                            isolate=True) as oc:
+            rows = oc.list_agents()
+    except Exception:  # noqa: BLE001 - 起不来就降级，不误杀选项
+        log.exception("【执行世界】隔离实例查工作模式失败")
+        rows = None
+    _EXEC[key] = (now, rows)
+    return rows
 
 
 def stage_options(stage: str, *, home: Any = None) -> tuple[list[sel.Option], str]:

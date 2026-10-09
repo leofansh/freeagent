@@ -38,7 +38,15 @@ const OC_STAGE_LABEL = {
 
 function ocOptionLabel(o) {
   // 显示名 + 档位数。不显示 providerID：那是内部标识。
-  return o.hint ? o.label + "（" + o.hint + "）" : o.label;
+  const base = o.hint ? o.label + "（" + o.hint + "）" : o.label;
+  // 执行世界不可用 —— 直接写在选项上。
+  //
+  // 界面读的是非隔离实例（有登录态，看得见云端/项目级模式），而派发出去
+  // 用的是隔离实例，那里只有内置的几个。于是不标的话，用户选了云端模式
+  // 界面一路绿灯、派发时才报「工作模式已失效」（实测连踩两次）。
+  // 写在选项上，用户**选之前**就知道。
+  return o.executable === false ? base + " —— 隔离环境不可用，派发会失败"
+    : base;
 }
 
 function ocSelect(stage, options, value, note, onChange) {
@@ -58,8 +66,12 @@ function ocSelect(stage, options, value, note, onChange) {
   sel.innerHTML = (hasEmpty ? "" : '<option value="">（用默认）</option>') +
     options.map((o) =>
       '<option value="' + esc(o.value) + '"' +
-      (o.value === value ? " selected" : "") + ">" +
-      esc(ocOptionLabel(o)) + "</option>").join("");
+      (o.value === value ? " selected" : "") +
+      // 不可用的禁选 —— 但**已选中的那个不禁**：disabled + selected 会让
+      // 下拉显示成空白，用户反而看不出自己当前选的是什么。那种情况由
+      // agent_warning 那条红色提示去说。
+      (o.executable === false && o.value !== value ? " disabled" : "") +
+      ">" + esc(ocOptionLabel(o)) + "</option>").join("");
   sel.addEventListener("change", () => onChange(stage, sel.value));
   wrap.appendChild(sel);
   if (note) {

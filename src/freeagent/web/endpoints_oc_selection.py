@@ -55,6 +55,46 @@ def _options_as_dict(options: list[sel.Option]) -> list[dict[str, str]]:
     return [{"value": o.value, "label": o.label, "hint": o.hint} for o in options]
 
 
+def _merged_agent_options(
+    exec_rows: list[dict[str, Any]], discovery_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """工作模式选项：**以执行世界为准**，界面多出来的标成不可用。
+
+    ## 为什么不能只用界面那份（discovery）
+
+    两个坑，都是实测踩出来的（2026-10-09）：
+
+    1. **同一个模式在两个世界里的 ``mode`` 都不一样。** ``build`` / ``plan``
+       在隔离实例里是 ``primary``，在带配置的非隔离实例里却是 ``subagent``
+       （那份配置把它们降级了）。而 :func:`~.oc_selection.list_agent_options`
+       只收 primary —— 于是**唯一能派发的那两个被过滤掉**。
+    2. 它们的 ``model`` 是 null，原来那条「model 非空」门槛又挡一道。
+
+    两条相加的结果是：下拉里**一个能跑的都没有**，只剩云端模式
+    （``Atlas - Plan Executor``、``Sisyphus - ultraworker`` 之类），而那些
+    在隔离世界里不存在 —— 用户选哪个派发都报「工作模式已失效」。
+
+    ## 所以这里怎么拼
+
+    先用**执行世界**的清单出可选项（这些一定能跑），再把界面清单里多出来
+    的（云端/项目级）附在后面、标 ``executable=False`` —— 仍然列出来是为了
+    「它在界面里看得见」这件事对用户是真实信息，但**选了会失败**必须写明，
+    由前端标注并禁选。
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for o in sel.list_agent_options(exec_rows):
+        out.append({"value": o.value, "label": o.label, "hint": o.hint,
+                    "executable": True})
+        seen.add(o.value)
+    for o in sel.list_agent_options(discovery_rows):
+        if o.value not in seen:
+            out.append({"value": o.value, "label": o.label, "hint": o.hint,
+                        "executable": False})
+            seen.add(o.value)
+    return out
+
+
 def oc_options(app: App) -> dict[str, Any]:
     """``GET /api/oc/options`` —— 四段选项 + 当前选择 + 清单状态。
 
@@ -64,18 +104,42 @@ def oc_options(app: App) -> dict[str, Any]:
     """
     home = state_home_for(app)
 
-    def stage(name: str) -> dict[str, Any]:
-        options, note = discovery.stage_options(name, home=home)
-        return {"options": _options_as_dict(options), "note": note}
-
     current = sel.load_selection(home)
     snap = discovery.snapshot()
-    # 工作模式失效可见化（设计文档 11.13.8 / 11.14）：复用同一份 snapshot 里的
-    # agents，不额外起 opencode 进程。取不到列表时不误报（discovery_ok 已单独提示）。
     agent_rows = snap.agents or []
+    # 执行世界（隔离实例）的工作模式。**只查一次**，缓存 10 分钟。
+    #
+    # 它决定「选了之后派发跑不跑得起来」，所以工作模式那一段的选项必须
+    # 以**它**为准生成 —— 见 :func:`_merged_agent_options`。
+    exec_rows = discovery.exec_world_agents(current.project)
+
+    def stage(name: str) -> dict[str, Any]:
+        options, note = discovery.stage_options(name, home=home)
+        payload = {"options": _options_as_dict(options), "note": note}
+        if name == "agent":
+            payload["exec_world_ok"] = exec_rows is not None
+            if exec_rows is None:
+                # 查不到执行世界 → 降级：**不标**、不禁选。「查不到」不等于
+                # 「不可用」，误标会让一次环境抖动废掉全部选项。
+                for item in payload["options"]:
+                    item["executable"] = None
+            else:
+                payload["options"] = _merged_agent_options(exec_rows,
+                                                           agent_rows)
+        return payload
     agent_warning = None
-    if current.agent and agent_rows:
-        if not sel.current_agent_is_valid(agent_rows, current.agent):
+    if current.agent:
+        if exec_rows is not None and not sel.agent_is_executable(
+            exec_rows, current.agent
+        ):
+            # 这条才是「派发必失败」的那种：模式在界面里看得见（有登录态），
+            # 但派发用的隔离实例里没有它。
+            agent_warning = (
+                f"工作模式「{current.agent}」在隔离执行环境里不存在，"
+                "派发会失败 —— 云端/项目级模式只在带登录态的界面里可见，"
+                "而派发出去用的是隔离实例。请在上方改成 build 或 plan。"
+            )
+        elif agent_rows and not sel.current_agent_is_valid(agent_rows, current.agent):
             agent_warning = (
                 f"工作模式「{current.agent}」已失效（该项目可能没有它，"
                 "或 OpenCode 已更新）。请在上方重选。"

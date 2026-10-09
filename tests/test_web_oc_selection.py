@@ -59,6 +59,19 @@ AGENT_ROWS = [
     {"name": "summary", "mode": "primary", "model": None},
 ]
 
+#: **执行世界**（隔离实例）那份清单 —— 照实测的形状写死（2026-10-09）：
+#: 只有内置的几个，且 ``build`` / ``plan`` 在这里是 ``primary``（而在带配置的
+#: 非隔离实例里它们被降成了 subagent，这正是下拉里一度没有可用选项的原因）。
+EXEC_ROWS = [
+    {"name": "build", "mode": "primary", "model": None},
+    {"name": "plan", "mode": "primary", "model": None},
+    {"name": "compaction", "mode": "primary", "model": None},
+    {"name": "summary", "mode": "primary", "model": None},
+    {"name": "title", "mode": "primary", "model": None},
+    {"name": "explore", "mode": "subagent",
+     "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+]
+
 PROVIDERS = {
     "connected": ["opencode"],
     "all": [{"id": "opencode", "name": "OpenCode Zen", "models": {
@@ -92,6 +105,10 @@ def wired(tmp_path, monkeypatch):
     """端点 + 假 OpenCode + 隔离的 home。"""
     monkeypatch.setattr(discovery, "_SNAPSHOT", None)
     monkeypatch.setattr(discovery, "_discovery_client", lambda: _FakeClient())
+    # 「执行世界」那份**固定**：测试不该真起一个隔离 opencode（慢，且结果
+    # 取决于本机装没装）。要测真实例另有 tests/manual 里的冒烟脚本。
+    monkeypatch.setattr(discovery, "exec_world_agents",
+                        lambda project="": list(EXEC_ROWS))
     #三个模块各自 import 了一份 ``state_home_for``，所以要逐个打 ——
     # 漏掉哪一个，那个模块就会去读真实的 home。
     for name in _EP_MODULES:
@@ -116,9 +133,16 @@ def test_options_returns_all_four_stages(wired):
 
 
 def test_options_filters_internal_agents(wired):
-    """``summary`` 是 OpenCode 内部件 —— 与飞书那份必须一致。"""
+    """``summary`` 这类内部件不出现在下拉里 —— 与飞书那份必须一致。
+
+    下拉现在以**执行世界**为准出选项（见 ``_merged_agent_options``）：
+    先是真跑得起来的 ``build`` / ``plan``，再附上界面清单里多出来的云端
+    模式（标为不可用）。所以是这三段，而不是只剩 Sisyphus。
+    """
     values = [o["value"] for o in ep.oc_options(_App())["agent"]["options"]]
-    assert values == ["Sisyphus - ultraworker"]
+    assert "summary" not in values, "内部件不该出现在下拉里"
+    assert "compaction" not in values and "title" not in values
+    assert values == ["build", "plan", "Sisyphus - ultraworker"]
 
 
 def test_options_reports_selection_and_curation(wired):
@@ -408,3 +432,103 @@ class TestDispatchStartIsClickable:
         src = _ep_source("endpoints_oc_dispatch")
         assert "发 `/start" not in src
         assert "开始做" in src
+
+
+class TestAgentOptionsAreJudgedInTheExecutionWorld:
+    """工作模式那一段必须按**执行世界**判，不能按界面那份清单判。
+
+    实测踩的坑（2026-10-09）：界面读的是非隔离实例（有登录态，看得见云端
+    模式），派发出去用的是隔离实例（只有内置的 ``build`` / ``plan``）。
+    用界面那份判「有没有这个模式」，结论永远是「选什么都行」—— 用户照着
+    下拉选了 ``Atlas - Plan Executor`` / ``Sisyphus - ultraworker``，派发
+    必然报「工作模式已失效」，连踩两次。
+
+    配套的一个错误：下拉原来要求 ``model`` 非空，而内置模式的 model 就是
+    null，于是**唯一能跑的那几个根本不在下拉里**。所以这里同时钉住
+    「内置模式要出现」。
+    """
+
+    @staticmethod
+    def _client(agents):
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def list_projects(self):
+                return list(PROJECT_ROWS)
+
+            def list_agents(self):
+                return agents
+
+            def list_models(self):
+                return json.loads(json.dumps(PROVIDERS))
+
+        return _Client()
+
+    def test_builtin_appears_and_cloud_is_marked_unusable(self, wired, monkeypatch):
+        monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+        monkeypatch.setattr(discovery, "_discovery_client", lambda: self._client([
+            {"name": "build", "mode": "primary", "model": None},
+            {"name": "Sisyphus - ultraworker", "mode": "primary",
+             "model": {"providerID": "opencode", "modelID": "big-pickle"}},
+        ]))
+        monkeypatch.setattr(
+            discovery, "exec_world_agents",
+            lambda project="": [{"name": "build", "mode": "primary",
+                                 "model": None}])
+
+        stage = ep.oc_options(_App())["agent"]
+        opts = {o["value"]: o for o in stage["options"]}
+
+        assert "build" in opts, "内置模式必须在下拉里（不能因 model 为空被挡）"
+        assert opts["build"]["executable"] is True
+        assert opts["Sisyphus - ultraworker"]["executable"] is False
+        assert stage["exec_world_ok"] is True
+
+    def test_unreachable_exec_world_degrades_instead_of_killing_options(
+            self, wired, monkeypatch):
+        """查不到执行世界就**不标**、不禁选 —— 一次抖动不能废掉全部选项。"""
+        monkeypatch.setattr(discovery, "exec_world_agents",
+                            lambda project="": None)
+
+        stage = ep.oc_options(_App())["agent"]
+        assert stage["exec_world_ok"] is False
+        assert stage["options"], "降级时选项仍在"
+        assert all(o["executable"] is None for o in stage["options"])
+
+    def test_builtin_is_offered_even_when_discovery_calls_it_subagent(
+            self, wired, monkeypatch):
+        """**最要紧的一条**：同一个模式在两个世界里 ``mode`` 可以不一样。
+
+        实测（2026-10-09）：``build`` / ``plan`` 在隔离实例里是 ``primary``，
+        在带配置的非隔离实例里却是 ``subagent`` —— 那份配置把它们降级了。
+        而 :func:`list_agent_options` 只收 primary，于是**只看界面那份的话，
+        唯一能派发的两个会被过滤掉**，下拉里一个能跑的都没有，只剩云端模式。
+        """
+        monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+        monkeypatch.setattr(discovery, "_discovery_client",
+                            lambda: self._client([
+                                {"name": "build", "mode": "subagent",
+                                 "model": None},
+                                {"name": "plan", "mode": "subagent",
+                                 "model": None},
+                                {"name": "Sisyphus - ultraworker",
+                                 "mode": "primary",
+                                 "model": {"providerID": "opencode",
+                                           "modelID": "big-pickle"}},
+                            ]))
+        monkeypatch.setattr(discovery, "exec_world_agents",
+                            lambda project="": [
+                                {"name": "build", "mode": "primary",
+                                 "model": None},
+                                {"name": "plan", "mode": "primary",
+                                 "model": None}])
+
+        opts = {o["value"]: o
+                for o in ep.oc_options(_App())["agent"]["options"]}
+        assert opts["build"]["executable"] is True
+        assert opts["plan"]["executable"] is True
+        assert opts["Sisyphus - ultraworker"]["executable"] is False

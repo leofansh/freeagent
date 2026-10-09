@@ -75,10 +75,19 @@ def test_internal_agents_are_filtered():
     assert [o.value for o in got] == ["Sisyphus - ultraworker"]
 
 
-def test_agent_without_model_is_filtered_even_if_named_normally():
-    """``model is None`` 是真判据 —— 不只挡那三个已知名字。"""
+def test_agent_without_model_is_selectable_but_has_no_hint():
+    """``model is None`` **不再**是排除理由 —— 只是没有 hint 可显示。
+
+    原来拿「model 非空」当门槛，副作用是致命的：内置模式（``build`` /
+    ``plan``）的 model 就是 null（执行世界的模型由派发时**显式**传，不靠
+    agent 自带），于是**唯一真跑得起来的那几个被挡在下拉外面**，下拉里
+    只剩云端模式 —— 而云端模式在隔离执行世界里压根不存在，用户选哪个
+    派发都报「工作模式已失效」（2026-10-09 实测连踩两次）。
+    """
     rows = [{"name": "mystery", "mode": "primary", "model": None}]
-    assert sel.list_agent_options(rows) == []
+    got = sel.list_agent_options(rows)
+    assert [o.value for o in got] == ["mystery"]
+    assert got[0].hint == "", "没有默认模型就不该编一个 hint 出来"
 
 
 def test_internal_agent_rejected_even_if_it_gains_a_model():
@@ -132,7 +141,9 @@ def test_agent_filtered_out_by_the_list_is_not_valid():
     若校验另写一套过滤，这里就会通过 —— 于是界面下拉里看不到它，
     派发时却又认它，两边漂移。
     """
-    for name in ("explore", "summary", "mystery"):
+    # mystery（primary + model=None）现在是**合法**的 —— 见
+    # test_agent_without_model_is_selectable_but_has_no_hint。
+    for name in ("explore", "summary"):
         assert not sel.current_agent_is_valid(_AGENT_ROWS, name), name
 
 
@@ -183,14 +194,25 @@ def test_unspecified_agent_is_always_executable():
     assert sel.agent_is_executable(_ISOLATED_ROWS, "")
 
 
-def test_two_rules_diverge_on_the_same_rows():
-    """同一份隔离世界清单：展示校验拒 build（model=None），执行校验放行。
+def test_the_two_worlds_are_told_apart_by_rows_not_by_rules():
+    """两个世界靠**各自那份清单**区分，不靠两套过滤规则。
 
-    这条分叉是**有意的**：展示答「目录里有没有」，执行答「跑不跑得起来」。
-    钉住它，防止将来有人好心把它们「统一」回去。
+    曾经的分叉是「展示要求 model 非空、执行不要求」。那条分叉已取消，
+    因为它制造了一个死局：内置模式 model 全是 null → 展示侧把它们全挡掉
+    → 下拉里只剩云端模式 → 而云端模式在隔离世界里不存在 → 选什么派发
+    都失败。分叉的代价是「两个世界的选项集合不相交」。
+
+    现在两个函数规则一致（primary + 非内部件），**输入**才是区别：
+    - :func:`current_agent_is_valid` 喂 discovery 那份（看得见云端）；
+    - :func:`agent_is_executable` 喂隔离实例那份（只有内置）。
+
+    钉住这个形状：清单相同时两边结论一致（不再互相打架），而云端模式
+    只在 discovery 那份里「存在」、在隔离那份里「跑不了」。
     """
-    assert not sel.current_agent_is_valid(_ISOLATED_ROWS, "build")
+    assert sel.current_agent_is_valid(_ISOLATED_ROWS, "build")
     assert sel.agent_is_executable(_ISOLATED_ROWS, "build")
+    assert sel.current_agent_is_valid(_AGENT_ROWS, "Sisyphus - ultraworker")
+    assert not sel.agent_is_executable(_ISOLATED_ROWS, "Sisyphus - ultraworker")
 
 
 # ── 模型 ──────────────────────────────────────────────────────────────── #
