@@ -183,10 +183,10 @@ def exec_world_agents(project: str = "") -> list[dict[str, Any]] | None:
         from .opencode_server import OpenCodeServer
 
         cwd = Path(key) if key else Path(tempfile.gettempdir())
-        # isolate=True 是**安全属性**，不给开关：只有与派发时同样的隔离
-        # 条件，查到的列表才对得上派发时的校验。
+        # 与派发**同一套条件**（系统 opencode + 项目级闸门覆盖层）：查到的
+        # 列表才对得上派发时的校验，下拉才不会指向不存在的工作模式。
         with OpenCodeServer(project=cwd, executable="opencode",
-                            isolate=True) as oc:
+                            isolate=False, apply_gate=True) as oc:
             rows = oc.list_agents()
     except Exception:  # noqa: BLE001 - 起不来就降级，不误杀选项
         log.exception("【执行世界】隔离实例查工作模式失败")

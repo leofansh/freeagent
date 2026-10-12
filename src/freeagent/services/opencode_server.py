@@ -31,6 +31,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -143,6 +144,51 @@ def build_isolated_config(config: dict[str, Any] | None = None) -> str:
     )
 
 
+def oc_cache_dir() -> pathlib.Path:
+    """插件包的常驻缓存目录（隔离回退路径用，不随 jail 删）。
+
+    隔离实例（``isolate=True``）的家目录是一次性 jail，关掉就删；把缓存指到
+    本项目常驻目录，插件只装一次。非隔离的派发不再需要它 —— 系统 opencode
+    用自己的真实缓存（离线、零重装）。
+    """
+    from ..paths import state_file
+
+    return pathlib.Path(state_file(None, "oc-cache"))
+
+
+log = logging.getLogger(__name__)
+
+#: 探针给实例多长的**等待窗口**（秒）。为什么不是「问一次就知道」：
+#: 插件是**首次启动时装**的，多个插件实测要几分钟。装包期间 ``/agent``
+#: 就是不可用 —— 若一次判定就降级，会把**正在装包的进程杀掉**，于是下一
+#: 次又从头装、又被杀，**永远装不完**。所以必须轮询等，等到装完。
+_PROBE_WINDOW = 180.0
+
+#: 探针两次尝试之间的间隔（秒）。
+_PROBE_INTERVAL = 3.0
+
+
+def _child_log_dir() -> pathlib.Path:
+    """子进程日志目录。跟插件缓存同居（都不该随 jail 删）。"""
+    return oc_cache_dir() / "logs"
+
+
+def _prune_child_logs(log_dir: pathlib.Path, *, keep: int = 20) -> None:
+    """只留最近 ``keep`` 个日志。日志会一直攒，不清理会占满磁盘。"""
+    try:
+        # ``list()`` 当场耗尽 glob 生成器：留着不关会在 GC 时抛
+        # ResourceWarning（ScandirIterator），pytest 把 unraisable 当错误。
+        files = sorted(list(log_dir.glob("oc-*.log")),
+                       key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for old in files[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 # ── 子进程环境白名单（规范性）───────────────────────────────────────────── #
 #
 # 原来这里是 ``env = dict(os.environ)`` —— **全量继承**。改的理由不是「更干净」，
@@ -220,12 +266,18 @@ def build_child_env(
     exe: str | None = None,
     extra: Mapping[str, str] | None = None,
     credential_names: Iterable[str] | None = None,
+    cache_dir: pathlib.Path | None = None,
 ) -> dict[str, str]:
     """构造子进程环境。**白名单式：不继承 :data:`os.environ`。**
 
     纯函数（无 IO、无 spawn）所以能直接测「子进程能看到什么」。
 
     :param jail: 一次性家目录。``HOME`` 与各类 XDG/缓存/临时目录**全部**指向它。
+    :param cache_dir: 例外：**缓存与数据目录**指向这里而不是 jail。默认
+        ``None``（= 关进 jail，旧行为）。给插件用 —— jail 随服务关闭一起
+        删，插件每次重装（实测 107.7s）；指到常驻目录就是装一次、装完复用
+        装配结果。它不是用户的真实目录，所以「不写回真实家目录」这条仍然
+        成立；例外带来的代价见下面的注释（``opencode.db`` 跨委派留存）。
     :param exe: opencode 可执行文件路径。把它所在目录放进 ``PATH`` ——
         替身方案里常用自造脚本，得能找得到。
     :param extra: 显式追加（``OPENCODE_SERVER_USERNAME`` / ``_PASSWORD`` 等）。
@@ -251,6 +303,35 @@ def build_child_env(
     env["TMPDIR"] = str(jail)
     env["TEMP"] = str(jail)
     env["TMP"] = str(jail)
+
+    # 3b) 缓存例外：插件包装在常驻目录里，不然每次委派都重装一遍。
+    #
+    # **光把包放常驻目录还不够**（实测踩过）：包确实没重装（packages 的
+    # mtime 没变），但启动仍要 60s。查 jail 里剩下什么，发现
+    # ``npm-cache/_cacache`` 与 ``opencode/node_modules`` —— **安装器的缓存**
+    # 跟着 ``HOME``/``TEMP`` 落进了 jail，于是包虽在，npm 每次仍要从零建缓存：
+    # 重新解析依赖、重新取元数据。Windows 上 npm 拿 ``TEMP`` 当缓存根，
+    # 而 TEMP 是我们关进 jail 的那几个之一。
+    #
+    # 所以缓存例外必须是「包 + 安装器」两处，少一处就白搭。
+    if cache_dir is not None:
+        env["XDG_CACHE_HOME"] = str(cache_dir)
+        env["npm_config_cache"] = str(cache_dir / "npm-cache")
+        #: bun 是 opencode 实际用来装包的那个；它的缓存同样默认跟 HOME 走。
+        env["BUN_INSTALL_CACHE_DIR"] = str(cache_dir / "bun-cache")
+        #
+        # **数据目录也在例外里**（用户 2026-10-09 拍板）。只例外缓存时，包
+        # 与安装器缓存都常驻了，opencode 却仍要**每次把插件重新装配进运行时
+        # 目录**（jail 里可见 ``opencode/node_modules``、``repos``、
+        # ``locks``）：1 个插件 24.7s，7 个插件 >290s 仍未就绪。装配结果落在
+        # ``XDG_DATA_HOME`` 下，所以它不常驻就躲不掉。
+        #
+        # 代价（已知且接受）：``opencode.db``（项目注册表与会话）会**跨委派
+        # 留存**，实例之间不再「每次全新」。安全边界不变 —— 目录仍是我们
+        # 自己的 ``~/.freeagent`` 常驻目录，不是用户真实家目录；
+        # ``XDG_CONFIG_HOME``（配置）与 ``HOME``/``TEMP`` **仍关在 jail**，
+        # 云凭据与 ``~/.ssh`` 的隔离没有被削弱。
+        env["XDG_DATA_HOME"] = str(cache_dir / "data")
 
     # 4) 模型凭据：功能必需，但**只放行这一类**
     names = (frozenset(credential_names) if credential_names is not None
@@ -388,6 +469,7 @@ class OpenCodeServer:
         extra_env: dict[str, str] | None = None,
         isolate: bool = True,
         permission_config: dict[str, Any] | None = None,
+        apply_gate: bool = False,
     ) -> None:
         self._project = pathlib.Path(project)
         self._exe = executable
@@ -402,6 +484,24 @@ class OpenCodeServer:
         # （比如「只读 + 允许出网」），加一个参数比加一个 if 分支更容易看清
         # 「有几种权限形状、分别是谁在用」。
         self._permission_config = permission_config
+        #: 是否把本项目审批闸门写成**项目级覆盖层**压进 opencode 的真实配置。
+        #: 只给**派发 / /ask**（要强制闸门，且要借用用户原生的全局插件/MCP）；
+        #: 发现（``discovery()``）不开 —— 它只读，也不该动项目目录。
+        self._apply_gate = apply_gate
+        #: 覆盖层落盘状态（见 :meth:`_write_overlay` 与 :meth:`close`）。
+        self._overlay_path: pathlib.Path | None = None
+        self._overlay_backup: bytes | None = None
+        #: 是否写过覆盖层。**必须在 __init__ 初始化**：``close()`` 无条件调
+        #: :meth:`_restore_overlay`，而它第一句就读这个属性。不写闸门（``apply_gate
+        #: = False``，如 ``discovery()``）时 :meth:`_write_overlay` 不会被调用，
+        #: 若这里不兜底初始化，``close()`` 会 ``AttributeError`` 崩溃。
+        self._overlay_written = False
+        #: 子进程日志落盘位置（诊断用，见 :meth:`child_log`）。
+        self._log_path: pathlib.Path | None = None
+        #: 日志文件句柄。自己拿着、自己关（见 :meth:`_popen`）。
+        self._log_file: Any = None
+        #: 探针最后一次失败的原因（含子进程日志尾部，见 :meth:`_probe_ok`）。
+        self._last_probe_error: str = ""
         self._proc: Any = None
         self._home: pathlib.Path | None = None
         self._password = uuid.uuid4().hex
@@ -412,21 +512,89 @@ class OpenCodeServer:
         ).decode()
 
     # -- 生命周期 -------------------------------------------------------- #
+    def effective_config(self) -> dict[str, Any]:
+        """本项目要强制的**审批闸门**（``permission`` 配置）。
+
+        只返回 ``permission`` 这一项。插件 / MCP / 技能等**能力**一律不在这里
+        给 —— 它们由 opencode 原生从用户的全局 / 项目配置加载（这正是终端里
+        跑 opencode 的行为）。我们不去复制那份配置，否则会：① 触发 opencode
+        的 ``null`` 作废整份配置（实测 502），② 每次重装插件，③ 离了网就坏。
+
+        闸门通过**项目级覆盖层**压进真实配置（见 :meth:`_write_overlay`），
+        而不是另起一个隔离世界。
+        """
+        # 本项目审批闸门。能力（插件/MCP/技能）一律不在这里给 —— 它们由
+        # opencode 原生从用户的全局/项目配置加载，我们不去复制（那样会重装、
+        # 且离了网就坏）。覆盖层机制见 :meth:`_write_overlay`。
+        return dict(self._permission_config) if self._permission_config is not None \
+            else dict(delegation_permission_config())
+
     def start(self) -> "OpenCodeServer":
+        # 非隔离 = 直接跑系统 opencode（真实全局配置 → 用户原生的全局插件 /
+        # MCP / 技能，**离线、零重装**）。若开了闸门，把本项目 permission 写成
+        # 项目级覆盖层压进去（见 :meth:`_write_overlay`），随 close 还原。
         if not self._isolate:
+            if self._apply_gate:
+                self._write_overlay()
             return self._start_unisolated()
+        self._spawn_isolated()
+        if not self._wait_ready():
+            self.close()
+            raise ServerError(
+                f"opencode 服务没在 {self._startup_timeout:g}s 内就绪"
+                f"（端口 {self._port}）"
+            )
+        return self
+
+    def _probe_ok(self, *, window: float = _PROBE_WINDOW) -> bool:
+        """实例是否**真的能用**，不只是「起来了」。
+
+        用 ``/agent`` 当探针：它是最先被继承内容搞坏的端点（实测 502），
+        而派发第一步就要查它 —— 拿它试，坏在试的时候就暴露，而不是等
+        真正派发时才炸。
+
+        失败原因（含子进程日志尾部）存进 :attr:`_last_probe_error` —— 502
+        本身不含任何信息，原因只写在子进程的 stderr 里。
+
+        轮询等而不是问一次：插件首次启动要装几分钟（窗口见
+        :data:`_PROBE_WINDOW`）。进程自己退了就别再等。
+        """
+        deadline = time.monotonic() + window
+        while True:
+            if self._proc is not None and self._proc.poll() is not None:
+                self._last_probe_error = "子进程已退出"
+                return False
+            try:
+                code, _ = self.call("/agent", timeout=10.0)
+            except Exception as exc:  # noqa: BLE001 - 探针自己不该抛出去
+                self._last_probe_error = f"{type(exc).__name__}: {exc}"
+            else:
+                if code == 200:
+                    self._last_probe_error = ""
+                    return True
+                self._last_probe_error = f"GET /agent → HTTP {code}"
+            if time.monotonic() >= deadline:
+                tail = self.child_log(max_chars=1200)
+                if tail:
+                    self._last_probe_error += f"\n子进程日志尾部:\n{tail}"
+                return False
+            time.sleep(_PROBE_INTERVAL)
+
+    def _spawn_isolated(self) -> None:
+        """起一个隔离实例（写配置 → 起进程）。**不**等就绪。"""
         self._home = pathlib.Path(tempfile.mkdtemp(prefix="freeagent-oc-"))
         cfg_dir = self._home / "opencode"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         # 配置**在启动前**写好，不走 PATCH —— 少一次往返，也少踩
         # 「PATCH 返回 200 但没落盘」那个坑（实测踩过）。
         (cfg_dir / "opencode.json").write_text(
-            build_isolated_config(self._permission_config), encoding="utf-8"
+            build_isolated_config(self.effective_config()), encoding="utf-8"
         )
 
         env = build_child_env(
             jail=self._home,
             exe=shutil.which(self._exe) or self._exe,
+            cache_dir=oc_cache_dir(),
             extra={
                 "OPENCODE_SERVER_USERNAME": "opencode",
                 "OPENCODE_SERVER_PASSWORD": self._password,
@@ -438,13 +606,61 @@ class OpenCodeServer:
         # 免得「回环 + 独立进程组」这两条安全属性在一个入口里漏掉）。
         self._proc = self._popen(env)
 
-        if not self._wait_ready():
-            self.close()
-            raise ServerError(
-                f"opencode 服务没在 {self._startup_timeout:g}s 内就绪"
-                f"（端口 {self._port}）"
-            )
-        return self
+    def _write_overlay(self) -> None:
+        """把本项目审批闸门写成**项目级覆盖层**压进 opencode 的真实配置。
+
+        机制（实测确认）：opencode 加载「全局配置 + 项目级 ``opencode.jsonc``」
+        并**项目层优先**。所以只写一份**只有 ``permission``** 的项目配置，
+        就能在不碰用户全局配置的前提下强制闸门，同时保留用户原生的全部插件 /
+        MCP / 技能（合并而非替换）。这比「另起隔离世界 + 复制用户配置」简单得多，
+        且离线、零重装。
+
+        覆盖层是临时文件：退出时由 :meth:`_restore_overlay` 还原，不污染项目。
+        """
+        # 尊重已有配置文件名（``.jsonc`` 或 ``.json``），写同名的覆盖层；
+        # 关闭时原样还原。若原本没有，则我们创建的那份删掉。
+        cfg_path: pathlib.Path | None = None
+        for cand in ("opencode.jsonc", "opencode.json"):
+            p = self._project / cand
+            if p.exists():
+                cfg_path = p
+                break
+        if cfg_path is None:
+            cfg_path = self._project / "opencode.jsonc"
+        self._overlay_backup = cfg_path.read_bytes() if cfg_path.exists() else None
+        self._overlay_path = cfg_path
+        # ``effective_config()`` 返回的是**完整配置**对象（含 ``$schema`` 与
+        # ``permission`` 两个键，见 :meth:`effective_config` 的文档）—— 它给
+        # 隔离实例当整份配置用。但项目级覆盖层只想压 ``permission`` 一项，
+        # **不能把整份对象再套一层 ``permission``**，否则会变成
+        # ``{"permission": {"$schema": …, "permission": {…}}}`` —— 双层
+        # ``permission`` 让 opencode 把这份项目配置当成非法、整份丢弃，回退到
+        # 内置默认值（插件 / MCP 全空、权限 ``{}``）。这正是冒烟里「7 插件
+        # 变 0、permission 变 {}」的根因。所以这里只取内层规则。
+        full = self.effective_config()
+        rules = full.get("permission", full) if isinstance(full, dict) else full
+        cfg_path.write_text(
+            json.dumps({"permission": rules}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._overlay_written = True
+
+    def _restore_overlay(self) -> None:
+        """还原项目级覆盖层（见 :meth:`_write_overlay`）。"""
+        if not self._overlay_written:
+            return
+        path = self._overlay_path
+        self._overlay_written = False
+        self._overlay_path = None
+        if path is not None:
+            try:
+                if self._overlay_backup is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(self._overlay_backup)
+            except OSError:
+                pass
+        self._overlay_backup = None
 
     def _start_unisolated(self) -> "OpenCodeServer":
         """起一个**看得见真实配置**的服务。只给「发现」用（见 :meth:`discovery`）。
@@ -466,12 +682,14 @@ class OpenCodeServer:
 
         ## 边界：只读，且不写任何配置
 
-        这一条**只用于 GET**。绝不能拿它发 prompt —— 那样委派就会读到你的
-        真实配置（插件、模型、权限），而 :mod:`services.delegate` 的全部
-        安全声明都建立在「委派跑在隔离实例上」之上。
+        这一条**只用于 GET（发现）**。绝不能拿它发 prompt —— 那样委派就会
+        读到你的真实配置（插件、模型、权限），而 :mod:`services.delegate` 的
+        全部安全声明都建立在「闸门已被强制」之上。
 
-        不写 ``opencode.json``、不 ``PATCH /config``：唯一新增的是随机密码，
-        它只存在于这个对象里，随对象一起消失。
+        派生用法（派发 / ``/ask``）也复用本方法，但会在调用前用
+        :meth:`_write_overlay` 把审批闸门写成项目级覆盖层 —— 那是唯一的
+        新增文件，且 :meth:`close` 会原样还原。除此之外本方法不写任何配置、
+        不 ``PATCH /config``：唯一新增的是随机密码，只存在于这个对象里。
         """
         env = dict(os.environ)
         env.update({
@@ -495,12 +713,42 @@ class OpenCodeServer:
         后者两个分支的**值类型不同**，类型检查器会把整个 dict 推成
         ``int | bool``，于是 Popen 的每个参数都报「int 不能赋给 bool」——
         12 条假错误淹掉真错误。踩过，故留此注记。
+
+        子进程的两个流**落盘而不是丢掉**：插件加载失败时 opencode 只往
+        stderr 写一句，``GET /agent`` 就变成 502，而我们这边只能看见 502。
+        丢流等于把唯一的线索扔了（实测为此二分了半天也没定位到是哪个插件）。
         """
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            # CREATE_NO_WINDOW 隐藏子进程控制台窗口：Windows 上 opencode 是控制台
+            # 程序，不加这个，每次拉起都会弹一个黑框、随进程退出自动关闭（用户点
+            # 「编程」时一连串黑框闪过的真因）。与 CREATE_NEW_PROCESS_GROUP 位或：
+            # 后者用于向进程组广播 Ctrl+C 杀进程，二者位不冲突。
+            popen_kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
         else:
             popen_kwargs["start_new_session"] = True
+
+        # 一个实例一个文件：并发实例不会互相抢写锁（Windows 上共享写会失败）。
+        # 句柄**自己拿着并在 close() 里关**：交给 GC 会抛 ResourceWarning，
+        # 而 pytest 把 unraisable 当错误 —— 一批无关测试因此变红（踩过）。
+        stream: Any = subprocess.DEVNULL
+        handle: Any = None
+        try:
+            log_dir = _child_log_dir()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._log_path = log_dir / f"oc-{self._port}-{int(time.time())}.log"
+            handle = self._log_path.open("w", encoding="utf-8", errors="replace")
+            stream = handle
+            _prune_child_logs(log_dir)
+        except OSError:
+            if handle is not None:
+                handle.close()
+                handle = None
+            stream = subprocess.DEVNULL  # 日志是增益，写不了照样得起服务
+            self._log_path = None
+        self._log_file = handle
         try:
             return subprocess.Popen(
                 # ``--hostname`` **显式给回环**，不靠默认值。随机密码已经在了，
@@ -509,13 +757,37 @@ class OpenCodeServer:
                 [shutil.which(self._exe) or self._exe,
                  "serve", "--hostname", "127.0.0.1",
                  "--port", str(self._port)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=stream, stderr=stream,
                 cwd=str(self._project), env=env, shell=False,
                 **popen_kwargs,
             )
         except OSError as exc:
+            self._close_log()
             self._cleanup_home()
             raise ServerError(f"起不了 opencode 服务：{exc}") from exc
+
+    def _close_log(self) -> None:
+        """关掉子进程日志句柄。见 :meth:`_popen`：交给 GC 会污染别人的测试。"""
+        handle = getattr(self, "_log_file", None)
+        self._log_file = None
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.close()
+
+    def child_log(self, *, max_chars: int = 4000) -> str:
+        """最近一次子进程的 stdout+stderr 尾巴。**诊断用**。
+
+        排查「派发 502 / 插件没生效」时先读这个：opencode 把插件加载失败
+        的原因只写在这里，HTTP 层只能看到一个 502。
+        """
+        path = getattr(self, "_log_path", None)
+        if path is None or not pathlib.Path(path).exists():
+            return ""
+        try:
+            text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return text[-max_chars:]
 
     def _wait_ready(self) -> bool:
         deadline = time.monotonic() + self._startup_timeout
@@ -530,12 +802,15 @@ class OpenCodeServer:
 
     def close(self) -> None:
         """收口。**必须整组杀**，否则原生子进程会留着占端口和内存。"""
+        self._restore_overlay()  # 先还原项目级覆盖层，别污染项目目录
         proc, self._proc = self._proc, None
         if proc is not None and proc.poll() is None:
             if os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                     capture_output=True, timeout=60, check=False,
+                    # taskkill 也是控制台程序，不加这个每次收口都弹黑框
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -545,6 +820,7 @@ class OpenCodeServer:
             if proc.poll() is None:  # pragma: no cover - 兜底
                 with contextlib.suppress(OSError):
                     proc.kill()
+        self._close_log()
         self._cleanup_home()
 
     def _cleanup_home(self) -> None:
