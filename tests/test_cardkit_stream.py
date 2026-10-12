@@ -142,23 +142,30 @@ def test_progress_card_initial_content_names_the_project():
 # --------------------------------------------------------------------------- #
 def test_send_progress_card_returns_card_id():
     """创建成功要返回 card_id —— 后续更新靠它定位。"""
-    tr = _Transport('{"code":0,"data":{"card_id":"7355439197428236291"}}')
+    tr = _Transport(
+        '{"code":0,"data":{"card_id":"7355439197428236291"}}',
+        '{"code":0,"data":{"message_id":"om_1"}}',
+    )
     sender = _make_sender(tr)
     card_id = sender.send_progress_card(
         open_id=WHO, title="标题", project="D:/proj", chat_id=CHAT,
     )
     assert card_id == "7355439197428236291"
-    call = tr.business_calls[-1]
-    assert call["url"].endswith("/open-apis/cardkit/v1/cards")
+    # 建实体是**第一步**，发进会话是第二步（见下面的回归测试）
+    assert tr.business_calls[0]["url"].endswith("/open-apis/cardkit/v1/cards")
 
 
 def test_send_progress_card_rejects_empty_open_id():
-    """没有收件人必须当场拒 —— 不发一张不知道去哪的卡。"""
+    """既没会话也没收件人必须当场拒 —— 不建一张不知道去哪的卡。
+
+    判据是「两者都空」，不再单看 open_id：有 chat_id 时 open_id 可以是空的
+    （那是合法的一对），而 open_id 与 chat_id 都空就真的没有落点。
+    """
     tr = _Transport()
     sender = _make_sender(tr)
     with pytest.raises(ValueError):
         sender.send_progress_card(
-            open_id="", title="t", project="p", chat_id=CHAT,
+            open_id="", title="t", project="p", chat_id="",
         )
     assert not tr.calls, "被拒了却发了请求"
 
@@ -269,6 +276,79 @@ class TestHttpErrorKeepsFeishuReason:
     会整段绕过它 —— 那样测出来的绿毫无意义（第一版就是这么写的，红了才发现）。
     所以这里 mock 的是它**下面**那一层 ``urlopen``。
     """
+
+    def test_card_entity_is_actually_sent_to_a_chat(self) -> None:
+        """**建实体 ≠ 发出去。** 少发这一步，卡片永远不在聊天里。
+
+        真机踩过（2026-10-12）：只调了 ``POST /cardkit/v1/cards`` 拿到 card_id
+        就当「已发进度卡片」，而那张卡**从未出现在任何会话** ——
+        现象是「飞书只有权限审批、没有进展」，日志却干净得看不出问题。
+        官方原文：「后续可通过**发送消息接口**传入卡片实体 ID 发送卡片」。
+
+        这条钉住「建完实体必须紧跟一次 im/v1/messages」，且 content 里装的是
+        card_id 引用（不是卡片内容）—— 只有引用才能让后续流式更新作用在
+        同一条消息上。
+        """
+        tr = _Transport(
+            '{"code":0,"data":{"card_id":"7355439197428236291"}}',
+            '{"code":0,"data":{"message_id":"om_1"}}',
+        )
+        sender = _make_sender(tr)
+        sender.send_progress_card(
+            open_id=WHO, title="t", project="p", chat_id=CHAT,
+        )
+        send = tr.business_calls[-1]
+        assert "/open-apis/im/v1/messages" in send["url"], (
+            "建完卡片实体必须调 im/v1/messages 把它发出去"
+        )
+        assert "receive_id_type=chat_id" in send["url"]
+        assert send["payload"]["receive_id"] == CHAT
+        assert send["payload"]["msg_type"] == "interactive"
+        content = json.loads(send["payload"]["content"])
+        assert content == {"type": "card",
+                           "data": {"card_id": "7355439197428236291"}}, (
+            f"content 必须是卡片引用，实际 {content}"
+        )
+
+    def test_card_without_chat_falls_back_to_dm(self) -> None:
+        """没有会话（Web 建的委派）时退化成私聊，不能就此不发。
+
+        这正是「Web 派的活永远没有进度卡」的修法：权限卡一直走私聊能发出去，
+        进度卡却要求会话，于是只有 Web 派的那条没有进展。
+        """
+        tr = _Transport(
+            '{"code":0,"data":{"card_id":"c9"}}',
+            '{"code":0,"data":{"message_id":"om_2"}}',
+        )
+        sender = _make_sender(tr)
+        sender.send_progress_card(
+            open_id=WHO, title="t", project="p", chat_id="",
+        )
+        send = tr.business_calls[-1]
+        assert "receive_id_type=open_id" in send["url"]
+        assert send["payload"]["receive_id"] == WHO
+
+    def test_no_recipient_at_all_is_refused(self) -> None:
+        """既没会话也没收件人必须当场拒 —— 不建一张不知道去哪的卡。"""
+        tr = _Transport()
+        sender = _make_sender(tr)
+        with pytest.raises(ValueError):
+            sender.send_progress_card(
+                open_id="", title="t", project="p", chat_id="",
+            )
+        assert not tr.calls, "被拒了却发了请求"
+
+    def test_send_failure_is_raised(self) -> None:
+        """发送失败要抛 —— 调用方据此降级成「无卡片」，而不是以为发出去了。"""
+        tr = _Transport(
+            '{"code":0,"data":{"card_id":"c9"}}',
+            '{"code":230001,"msg":"bot not in chat","data":{}}',
+        )
+        sender = _make_sender(tr)
+        with pytest.raises(FeishuError):
+            sender.send_progress_card(
+                open_id=WHO, title="t", project="p", chat_id=CHAT,
+            )
 
     def _boom(self, monkeypatch, code: int, body: str, *,
               read_raises: bool = False) -> str:

@@ -426,16 +426,27 @@ class FeishuSender:
     ) -> str:
         """发一张 CardKit 2.0 流式进度卡片，返回 ``card_id``。
 
-        卡片初始内容包含一个 ``markdown`` 组件（``element_id =
-        "progress_text"``），后续通过 :meth:`update_progress_text`
-        流式更新它的内容。
+        ## 两步，缺一不可（真机踩过，2026-10-12）
 
-        ``streaming_mode: true`` 必须在创建时设置，否则后续流式更新
-        会报 ``300309 Card streaming closed``。
+        1. ``POST /cardkit/v1/cards`` 建**卡片实体** —— 注意这一步
+           **不带任何收件人**，它只在飞书侧造出一个 card_id。
+        2. ``POST /im/v1/messages`` 以 ``{"type":"card","data":{"card_id":…}}``
+           把这张卡**发进会话**。
+
+        我原先只做了第 1 步就返回 card_id，而调用方把它记成
+        「已发进度卡片」—— 卡片却从未出现在任何会话里。真机表现为
+        「权限卡正常、进度卡一条也没有」，而日志干净得看不出问题：
+        没报错，只是那张卡根本不存在于聊天中。
+
+        官方原文：「后续可通过**发送消息接口**传入卡片实体 ID 发送卡片」，
+        且「**一个卡片实体，仅支持发送一次**」—— 所以实体只建一次、
+        只发一次，之后全程靠 card_id 做流式更新。
+
+        :param chat_id: 有值就发进会话；为空则退化为私聊发给 ``open_id``
+            （Web 建的委派没有飞书会话，进度卡得有个落点）。
         """
-        if not open_id:
-            raise ValueError("发进度卡片必须给收件人标识")
-        id_type = self._receive_id_type(open_id)
+        if not open_id and not chat_id:
+            raise ValueError("发进度卡片必须给收件人（chat_id 或 open_id）")
         card = _progress_card(title, project)
         raw = self._transport(
             f"{self.config.base_url}/open-apis/cardkit/v1/cards",
@@ -457,7 +468,51 @@ class FeishuSender:
         card_id = str(data.get("card_id") or "") if isinstance(data, dict) else ""
         if not card_id:
             raise FeishuError("创建进度卡片响应里没有 card_id")
+
+        # 第 2 步：真正把它送出去。
+        if chat_id:
+            self._send_card_to_chat(chat_id, card_id)
+        else:
+            self._send_card_to_user(self._receive_id_type(open_id), open_id, card_id)
         return card_id
+
+    def _send_card_to_chat(self, chat_id: str, card_id: str) -> str:
+        """把卡片实体发进会话，返回 ``message_id``。
+
+        ``content`` 是 **JSON 字符串**（和本模块其它发消息一致），里面装的是
+        卡片引用而不是卡片内容 —— 卡片内容由 card_id 指回 CardKit，
+        这样后续的流式更新才会作用在**同一条消息**上。
+        """
+        return self._post_card_message(chat_id, "chat_id", card_id)
+
+    def _send_card_to_user(self, id_type: str, open_id: str, card_id: str) -> str:
+        """发私聊。Web 建的委派没有会话，退化走这里。"""
+        return self._post_card_message(open_id, id_type, card_id)
+
+    def _post_card_message(
+        self, receive_id: str, id_type: str, card_id: str,
+    ) -> str:
+        raw = self._transport(
+            f"{self.config.base_url}/open-apis/im/v1/messages"
+            f"?receive_id_type={id_type}",
+            {
+                "receive_id": receive_id,
+                "msg_type": "interactive",
+                "content": json.dumps(
+                    {"type": "card", "data": {"card_id": card_id}},
+                    ensure_ascii=False,
+                ),
+            },
+            {"Authorization": f"Bearer {self.token()}"},
+            self.timeout,
+        )
+        body = _decode_twice(raw)
+        if body.get("code") != 0:
+            raise FeishuError(
+                f"发送进度卡片失败：code={body.get('code')} "
+                f"msg={body.get('msg')}（收件人={receive_id!r} 形态={id_type}）"
+            )
+        return str(((body.get("data") or {}).get("message_id")) or "")
 
     def update_progress_text(
         self,

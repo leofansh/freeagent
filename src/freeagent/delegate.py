@@ -1107,13 +1107,29 @@ def run_with_tool_gate(
             #
             # 无 progress_sender 时不发卡 —— 向后兼容，不配进度卡片的部署
             # 不受影响。
-            if progress_sender is not None and task.delegate_chat_id:
+            # **有 approver 就发**，不再要求 delegate_chat_id。
+            #
+            # 原先的条件是 ``and task.delegate_chat_id``，理由是「没有飞书
+            # 会话就别发卡」。真机暴露了这条是错的：Web 端派的委派
+            # delegate_chat_id **本来就是 None**（那张截图里的
+            # 「了解项目进展」就是这样），于是 Web 派的活**永远没有进度卡**，
+            # 而「飞书只有权限审批、没有进展」正是这么来的 ——
+            # 权限卡走 open_id 私聊，进度卡却要求会话，两者条件不一致。
+            #
+            # 现在：有会话发会话（群/话题里能看到），没会话就私聊发给
+            # approver。**发卡的落点由「谁在等这条结果」决定**，
+            # 而不是由「这条委派从哪个入口建」决定 —— 后者与收卡人无关。
+            if progress_sender is not None:
                 try:
                     progress_msg_id = progress_sender.send_progress_card(
                         open_id=approver,
                         title=task.title,
                         project=str(project),
-                        chat_id=task.delegate_chat_id,
+                        # 有会话发会话，没有就退化成私聊（见上面的判据）。
+                        # **传 ``or ""`` 而不是 None** —— ``Task.delegate_chat_id``
+                        # 的类型就是 ``str | None``，而协议里收的是 ``str``；
+                        # 原样传 None 会让类型收窄在 sender 里失配。
+                        chat_id=task.delegate_chat_id or "",
                     )
                 except Exception:  # noqa: BLE001
                     # **发卡失败不许变成委派失败。** 展示层挂了就降级成

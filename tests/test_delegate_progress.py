@@ -286,13 +286,26 @@ class TestCardCreation:
         assert prog.sent[0]["chat_id"] == "oc_chat"
         assert prog.sent[0]["open_id"] == "ou_owner"
 
-    def test_no_card_without_chat_id(self, store) -> None:
-        """Web 建的委派没有飞书会话 —— **不发卡**，而不是发一张没地方去的卡。"""
+    def test_card_falls_back_to_dm_without_chat_id(self, store) -> None:
+        """Web 建的委派没有飞书会话 —— **仍然要发**，退化成私聊。
+
+        真机踩过（2026-10-12）：原先的条件是
+        ``progress_sender is not None and task.delegate_chat_id``，
+        而 Web 端派的委派 ``delegate_chat_id`` **本来就是 None**，
+        于是 Web 派的活**永远没有进度卡** —— 现象是「飞书只有权限审批、
+        没有进展」。而权限卡一直走私聊发得出去，两者条件不一致，
+        差的就是这一条。
+
+        发卡的落点该由「谁在等这条结果」决定，不是由「从哪个入口建」决定。
+        """
         prog = _FakeProgressSender()
-        _run(store, _FakeServer([("session.idle", {})]), progress=prog,
-             task=_StubTaskNoChat())
-        assert prog.sent == []
-        assert prog.closed == []
+        out = _run(store, _FakeServer([("session.idle", {})]), progress=prog,
+                   task=_StubTaskNoChat())
+        assert out.ok
+        assert len(prog.sent) == 1, "没有会话也该发一张（走私聊）"
+        assert prog.sent[0]["chat_id"] == ""
+        assert prog.sent[0]["open_id"] == "ou_owner", "落点是等结果那个人"
+        assert len(prog.closed) == 1, "照样要收尾关卡"
 
     def test_no_card_without_progress_sender(self, store) -> None:
         """``progress_sender=None`` 必须完全无声 —— 不配进度卡片的部署
