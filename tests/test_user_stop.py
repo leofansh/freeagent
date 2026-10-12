@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from freeagent.app import build_app  # noqa: E402
 from freeagent.delegate import run_with_tool_gate  # noqa: E402
-from freeagent.feishu.sender import _tool_card  # noqa: E402
+from freeagent.feishu.sender import ProgressCard, _tool_card  # noqa: E402
 from freeagent.services.approval import (  # noqa: E402
     ApprovalContext,
     ApprovalPolicy,
@@ -248,6 +248,9 @@ class _StopOnSendSender:
     def __init__(self, store: ApprovalStore) -> None:
         self.store = store
         self.cards: list[str] = []
+        #: 每次发卡用的锚点。**必须记下来** —— 否则「聚拢接线坏掉、
+        #: reply_to 恒为空串」这条测试照样绿，只是又测了一遍旧路径。
+        self.reply_tos: list[str] = []
 
     def bind(self, store: ApprovalStore) -> None:
         self.store = store
@@ -255,6 +258,7 @@ class _StopOnSendSender:
     def send_tool_card(self, *, open_id, subject, detail,
                        credential, ttl_seconds, reply_to="") -> str:
         self.cards.append(credential)
+        self.reply_tos.append(reply_to)
         self.store.request_stop(credential, by=open_id)
         self.store.resolve(credential, "deny", decided_by=open_id)
         return "om_test"
@@ -263,14 +267,32 @@ class _StopOnSendSender:
 class _StubTask:
     id = "task_fake"
     project_path = "C:/p"
+    delegate_chat_id = "oc_chat"
+    title = "做点事"
 
 
-def _run(server, sender, store):
+class _FakeProgressSender:
+    """只桩出「锚点」—— 聚拢测试需要它，停止路径不需要它的更新能力。"""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send_progress_card(self, *, open_id, title, project, chat_id):
+        self.sent.append(chat_id)
+        return ProgressCard(card_id="card-1", message_id="om_anchor")
+
+    def update_progress_text(self, *, card_id, text, sequence) -> None: ...
+
+    def close_progress_stream(self, *, card_id, final_text, sequence) -> None: ...
+
+
+def _run(server, sender, store, *, progress=None):
     sender.bind(store)
     return run_with_tool_gate(
         _StubTask(), Path("C:/p"), "做点事",
         policy=DelegationPolicy(projects=("C:/p",), model="opencode/big-pickle"),
-        store=store, sender=sender, approver="ou_owner",
+        store=store, sender=sender, progress_sender=progress,
+        approver="ou_owner",
         server_factory=lambda project, command: server,
     )
 
@@ -312,6 +334,42 @@ class TestLoopStops:
         oc = _FakeServer([_asked("per_1"), ("session.idle", {})])
         got = _run(oc, _StopOnSendSender(s), s)
         assert got.tool_calls, "已完成的部分要留在记录里"
+
+    def test_stop_still_works_when_card_is_threaded(self, store):
+        """**授权卡挂在进度卡下面时，「停止」依然要能停。**
+
+        ## 为什么这条必须单独测
+
+        上面几条用例都没传 ``progress_sender``，所以 ``reply_to`` 恒为空串，
+        走的是**旧的独立发送路径**。而聚拢之后线上走的是 ``reply`` 路径 ——
+        也就是说，那几条用例**一行都没覆盖新路径**。
+
+        而「停止」是全项目最要紧的一个按钮。如果它只在旧路径上被测过、
+        在新路径上悄悄失效，表现是「点了停止，委派还在跑」——
+        那正是这个按钮最不能有的表现。
+
+        判据是 ``abort`` 有没有被调用（不只是结论文案）。
+
+        还要**断言锚点确实传下去了** —— 否则这条测试有个自我欺骗的漏洞：
+        哪天聚拢接线坏了（``reply_to`` 恒为空串），它照样绿，只是又测了
+        一遍旧路径，看着像「新路径已覆盖」实则没有。
+        """
+        s, _app = store
+        oc = _FakeServer([_asked("per_1"), _asked("per_2"), ("session.idle", {})])
+        sender = _StopOnSendSender(s)
+
+        got = _run(oc, sender, s, progress=_FakeProgressSender())
+
+        assert sender.reply_tos == ["om_anchor"], (
+            f"授权卡没挂到进度卡下，这条测试等于白测：{sender.reply_tos}"
+        )
+        assert oc.aborted == ["ses_fake"], (
+            f"聚拢路径下点了停止却没有 abort：{oc.aborted}"
+        )
+        assert got.ok is False
+        assert "叫停" in (got.summary or "") or "停止" in (got.summary or ""), (
+            f"结论文案要说「叫停」：{got.summary!r}"
+        )
 
     def test_deny_alone_does_not_abort(self, store):
         """**关键对照**：只「拒绝」不许 abort —— 那是两件事。"""
