@@ -11,6 +11,7 @@ from datetime import date, datetime
 from typing import TypeVar, cast
 
 from ..domain import (
+    FreeAgentError,
     InvariantViolation,
     RecordType,
     Task,
@@ -24,7 +25,12 @@ from ..storage.repos import RecordRepo, TaskRepo
 from .clock import Clock
 from .recurrence import RecurrenceError, RecurrenceRule, parse_rule
 
-__all__ = ["TaskService", "ALLOWED_TRANSITIONS", "validate_task"]
+__all__ = [
+    "TaskService",
+    "ALLOWED_TRANSITIONS",
+    "BatchDropItem",
+    "validate_task",
+]
 
 _T = TypeVar("_T")
 
@@ -69,6 +75,25 @@ _NOTE_WORTHY: frozenset[RecordType] = frozenset(
 )
 
 _PROGRESS_TAIL = 5
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class BatchDropItem:
+    """批量「算了」里**一条**的结果。
+
+    为什么是逐条结果而不是「要么全成要么全不成」：批量操作的典型场景是
+    清理一批测试遗留，里头混着已经结束的很常见 —— 因为一条终态事务
+    （legal 迁移其实允许 dropped）或一条不存在的 id 就整批拒绝，
+    用户就得反复分批试，而那正是「批量」要消除的摩擦。
+
+    ``reason`` 只在失败时有值，且必须是**能看懂的原因**（「找不到事务」
+    「已是终态」），不是空泛的「失败」—— 界面要把原因显示给人看。
+    """
+
+    id: str
+    ok: bool
+    title: str
+    reason: str = ""
 
 
 def validate_task(task: Task) -> None:
@@ -240,6 +265,56 @@ class TaskService:
 
     def drop(self, task_id: str, reason: str | None = None) -> Task:
         return self.set_state(task_id, TaskState.DROPPED, reason=reason)
+
+    def drop_many(
+        self, task_ids: Sequence[str], reason: str | None = None
+    ) -> list[BatchDropItem]:
+        """批量「算了」。**逐条走 :meth:`drop`**，单条失败不中断其余条。
+
+        ## 为什么不在这里重写校验
+
+        迁移合法性（:data:`ALLOWED_TRANSITIONS`）、不变式校验、记录落账
+        全在 :meth:`set_state` 里。这里只做「批量」这一件事：把异常收敛成
+        **逐条结果**。复制一份校验就等于把闸门抄成两份，而抄的那份必然
+        先漂移（本仓在 delegate 那边已经为「抄规则」付过学费）。
+
+        ## 为什么部分失败不是错误
+
+        见 :class:`BatchDropItem`：终态/不存在的 id 混在批量里是常态。
+        返回结果清单而不是抛异常，调用方（Web 端点）才能把
+        「成了 3 条、这 2 条不行因为……」如实显示给人。
+
+        ## 为什么不做成一条事务包起来（全成或全败）
+
+        原子批量会逼出「重试一半」这种更复杂的状态；而 drop 是幂等的
+        终态迁移，逐条落账本来就可审计。为原子性牺牲可部分完成，
+        在这里是亏的。
+        """
+        results: list[BatchDropItem] = []
+        seen: set[str] = set()
+        for raw in task_ids:
+            task_id = str(raw)
+            if task_id in seen:
+                continue  # 同一条传两遍：第二次必然是 failed/终态，跳过
+            seen.add(task_id)
+            try:
+                task = self.drop(task_id, reason=reason)
+            except FreeAgentError as exc:
+                # NotFoundError / ValidationError 都从这里出。标题尽量带上：
+                # 界面上要显示「哪一条不行、为什么」，光有 id 对不上人眼。
+                title = ""
+                found = self._tasks.find(task_id)
+                if found is not None:
+                    title = found.title
+                results.append(
+                    BatchDropItem(id=task_id, ok=False, title=title,
+                                  reason=str(exc))
+                )
+            else:
+                results.append(
+                    BatchDropItem(id=task_id, ok=True, title=task.title)
+                )
+        return results
 
     def reopen(self, task_id: str) -> Task:
         return self.set_state(task_id, TaskState.INBOX, reason="重新打开")

@@ -46,10 +46,12 @@ from .events import (
     from_sdk_event,
 )
 from .identity import resolve_identity
+from . import brief_pending
 from .sender import (  # noqa: E402
     _approval_card,
     _card_action_response,
     _decided_card,
+    BRIEF_CONFIRM_ACTION,
     COMMAND_ACTION,
     VIEW_CHOICE_ACTION,
     MENU_ACTION,
@@ -472,6 +474,115 @@ class FeishuBridge:
         self._send_entry_menu(msg)
         return ""                            # 卡已说明一切，不必再回文字
 
+    def _route_brief(self, msg) -> str | None:
+        """这句话是不是「待填简报」的正文（第 5 步）。``None`` = 不拦。
+
+        返回值口径与 :meth:`_route_menu` 一致：``None`` = 不拦，
+        空串 = 已处理且不用再回话，非空 = 已处理且要把这段话回过去。
+
+        ## 为什么插在 ``channel.handle`` 之前
+
+        四段选完后用户说的那句话**必然**是简报，而 ``channel.handle``
+        第一件事就是意图分类 —— 于是「了解最新开发进度」会被判成
+        「查某条事务的进展」，而用户当天没排事务，回了「没找到你说的是
+        哪一条」。把「这句话是简报还是提问」从**意图分类**降级为
+        **流程状态**，正是第 5 步的全部意义。
+
+        ## 白名单与去重：插在前面，所以这两道闸门要自己补
+
+        与 :meth:`_route_menu` 完全同因（见那段注释）：两道闸门原本都在
+        ``handle`` 里，插在它前面就一起绕过了。两个后果：
+
+        1. **白名单外的人发简报也会被消费。** 回一句就等于向陌生人确认
+           「这里有个 bot」，而那正是白名单要挡的泄露面。
+        2. **飞书重连重投同一条消息时，会再发一张确认卡。** 去重表是在
+           ``handle`` 里写的，简报路径压根没走到那里 —— 而第一次已经
+           ``fill_brief`` 并发卡，第二次 ``peek`` 仍在，于是**再发一张**。
+           这是本段最容易漏的坑，所以下面**必须**把 ``dedup_key`` 记进去重表。
+        """
+        if msg.unsupported_type:
+            return None
+        text = (msg.text or "").strip()
+        if not text:
+            return None
+
+        who = msg.sender_open_id or ""
+
+        # 命令优先：以 ``/`` 开头的不当简报，**顺手清掉待填态** ——
+        # 用户改主意去打命令了，那份快照就该作废（否则下一条普通文字
+        # 会被当成简报，而用户其实已经不在第 5 步了）。
+        if text.startswith("/"):
+            brief_pending.discard(who)
+            return None                      # 继续往下走 channel.handle
+
+        if brief_pending.peek(who) is None:
+            return None                      # 不在待填态：一个字都不记
+
+        # ── 到这里已确定要消费简报，以下两道闸门必须在**发任何东西之前** ──
+        if not self.channel.is_allowed(msg.sender_ids):
+            log.info(
+                "发送者不在白名单，简报不消费也不回话：%s",
+                self.channel.allowlist_mismatch(msg.sender_ids),
+            )
+            # 刻意返回空串（已处理、不回话）而**不是** None：None 会交回
+            # ``channel.handle``，而它对白名单外的人会回一句「没有权限。」
+            # —— 那正是「向陌生人确认这里有个 bot」。这里要的是**真静默**。
+            return ""
+
+        key = msg.dedup_key
+        if key and self.channel.dedup.is_duplicate(key):
+            log.info("重复事件（%r），不重复消费简报", key)
+            return ""                        # 已处理过，静默
+        if not key:
+            log.warning(
+                "这条简报消息既无 event_id 也无 message_id，**无法去重**；"
+                "若被飞书重投，会重复发确认卡（event_id=%r message_id=%r）",
+                msg.event_id, msg.message_id,
+            )
+
+        entry = brief_pending.fill_brief(who, text)
+        if entry is None:
+            # 竞态：peek 之后、fill 之前被清掉了（例如同一会话另一条命令）。
+            # 不猜，静默交回 handle。
+            return None
+
+        self._send_brief_confirm(msg, entry)
+        return ""                            # 卡已说明一切，不必再回文字
+
+    def _send_brief_confirm(self, msg, entry) -> None:
+        """收到简报后发确认卡。**发卡失败只记日志，不抛** —— 简报已填进
+        快照，用户重发一次即可；抛出去会连带吃掉这条消息的处理。
+
+        ``role`` 按**现有规则预览**：读第一条角色（纯读，不复制
+        ``_create_delegation`` 的判定逻辑）。没有角色就如实写在卡上 ——
+        建委派时会被拒，提前说清比事后丢回一个失败有用。
+        """
+        from .sender import BriefPreview, send_brief_confirm_card
+
+        role = ""
+        if _card_channel is not None:
+            try:
+                roles = _card_channel.app.roles.list_roles()
+                role = roles[0].name if roles else ""
+            except Exception:  # noqa: BLE001 - 读角色失败不该让简报发不出去
+                log.warning("【简报】读角色失败，确认卡按「没有脉络」渲染",
+                            exc_info=True)
+        if not role:
+            role = "（没有脉络，建委派时会被拒）"
+
+        preview = BriefPreview(
+            project=entry.project, agent=entry.agent, model=entry.model,
+            variant=entry.variant, role=role, brief=entry.brief,
+        )
+        try:
+            send_brief_confirm_card(
+                self.sender, open_id=msg.sender_open_id,
+                subject="确认建这条委派？", preview=preview, chat_id=msg.chat_id,
+            )
+        except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
+            log.warning("【简报】确认卡发不出去（chat=%s）", msg.chat_id,
+                        exc_info=True)
+
     def _send_role_card(self, msg, *, open_id=None, chat_id=None) -> str:
         """打字路径的入口。**转手** :func:`_send_role_card_via`，不自己实现。
 
@@ -553,6 +664,25 @@ class FeishuBridge:
                     self.sender.send_text(msg.chat_id, menu)
                 except Exception:  # noqa: BLE001 - 回复失败不得拖垮处理
                     log.exception("回菜单提示失败（chat=%s）", msg.chat_id)
+            return
+
+        # 再问：这句话是不是「待填简报」的正文（第 5 步）。
+        #
+        # **必须插在 channel.handle 之前**：四段选完后用户说的那句话
+        # **必然**是简报，而 channel.handle 第一件事就是意图分类 ——
+        # 于是「了解最新开发进度」会被判成「查某条事务的进展」，而用户
+        # 当天没排事务，回了「没找到你说的是哪一条」。把「这句话是简报
+        # 还是提问」从**意图分类**降级为**流程状态**，正是第 5 步的意义。
+        #
+        # 代价是这里绕过了 handle 里的白名单与去重两道闸门，所以
+        # :meth:`_route_brief` 自己补（与 :meth:`_route_menu` 同一把尺子）。
+        brief = self._route_brief(msg)
+        if brief is not None:
+            if brief:
+                try:
+                    self.sender.send_text(msg.chat_id, brief)
+                except Exception:  # noqa: BLE001 - 回复失败不得拖垮处理
+                    log.exception("回简报提示失败（chat=%s）", msg.chat_id)
             return
 
         reply = self.channel.handle(
@@ -1174,6 +1304,12 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         if value.get("action") == SELECT_ACTION:
             return _run_oc_select(value, who=who)
 
+        # **简报确认卡**：与 SELECT_ACTION 同族（无状态、不查库），但它
+        # **消费**桥接进程内存里的一条待填简报 —— 点完这条简报就没了。
+        # 放在凭据流程之前：它的载荷里**没有** ``id``，不是凭据型卡片。
+        if value.get("action") == BRIEF_CONFIRM_ACTION:
+            return _run_delegate_confirm(value, who=who)
+
         # **卡片按钮 → 合成命令**（设计文档 11.9.8）。放在凭据流程之前：
         # 它无状态、不查库，与 menu / select 同族。
         #
@@ -1368,9 +1504,8 @@ def _menu_entries() -> list[tuple[str, str]]:
     「真的会有人点它吗」。
     """
     return [
-("委派给 opencode", "delegate"),
-            ("选项目/模型", "oc_select"),
-            ("我有哪些角色", "roles"),
+        ("让 opencode 改代码", "oc_select"),
+        ("我有哪些角色", "roles"),
         ("今天该做什么", "today"),
         ("我能做什么", "help"),
     ]
@@ -1506,7 +1641,7 @@ def _menu_help_text() -> str:
         "· 今天该做什么 → 发 `/today`\n"
         "· 记一件事 → 发 `/new <角色> | <描述>`\n"
         "· 有哪些角色 → 点上面「我有哪些角色」那张卡里的角色名\n"
-        "· 交给 opencode 改代码 → 点「委派给 opencode」，会给你要改的东西\n"
+        "· 交给 opencode 改代码 → 点「让 opencode 改代码」，选项目/模型后说清要做的事\n"
         "\n完整命令表发 `/help`。"
     )
 
@@ -1520,10 +1655,6 @@ def _menu_today_text() -> str:
     分叉的表现极隐蔽（设计文档 12.1.1 记录过一次真实分叉）。
     """
     return "__VIEW__/today"
-
-
-def _menu_role_names() -> list[str]:
-    return _role_names()
 
 
 def _send_role_card_via(*, open_id: str, chat_id: str, sender=None) -> str | None:
@@ -1610,30 +1741,9 @@ def _menu_dispatch(choice: str) -> dict[str, Any]:
         # 12.1.3 明确不做「角色少就发文本」的自适应——那会让「点角色」这个
         # 能力随数据量时有时无，而那次突变不会被任何测试撞到。
         return {"roles": True}
-    if choice == "delegate":
-        return {"text": _menu_delegate_text()}
-    # 四段选择：``oc`` 键是新形态，``_run_menu`` 里单独处理并**立刻返回** ——
-    # 它要发的是「一串卡」，不是「一段文本」，所以不能落进下面那两个分支。
     if choice == "oc_select":
         return {"oc": True}
     return {}
-
-
-def _menu_delegate_text() -> str:
-    """「委派给 opencode」。
-
-    给的是**一条填好真实角色名、只留两处尖括号待填**的可复制命令，不是
-    命令语法说明。仍然要说清「白名单」和「单行」这两件踩过坑的事 ——
-    那是会直接导致失败的事实，不是可以省的客套。
-    """
-    names = _menu_role_names()
-    role = names[0] if names else "<角色>"
-    return (
-        "把下面这条发给我（`<>` 里的换成你要的）：\n\n"
-        f"`/delegate <项目绝对路径> | {role} | <要做的事，一句话>`\n\n"
-        "两处要换：项目路径得在 `config.json` 的 `delegate.projects` 白名单里；"
-        "需求写成**单行**（换行会被 opencode 判成复杂任务而失败）。"
-    )
 
 
 # ── OpenCode 四段选择（项目 / 工作模式 / 模型 / 推理档）───────────────── #
@@ -1822,18 +1932,30 @@ def _run_oc_select(value: dict[str, Any], *, who: str) -> dict[str, Any]:
 
     _oc_store(selection)
 
-    # 下一步：variant 之后**没有下一段** —— 直接给摘要，让用户确认。
+    # 下一步：variant 之后**没有下一段** —— 进入第 5 步「等你交简报」。
+    #
+    # 为什么不再让用户直接说「要做的事」：那句话会被意图分类误判 ——
+    # 例如含「进度」二字会被当成「查询某条事务的进展」，而用户当天没排
+    # 事务，于是回了「没找到你说的是哪一条」。改成 arm 一份选型快照 +
+    # 发提示卡，用户下一句纯文字**必然**是简报，不再过意图分类。
     idx = SELECT_STAGES.index(stage)
     if idx + 1 >= len(SELECT_STAGES):
-        summary = "\n".join(f"· {line}" for line in selection.describe())
+        from .sender import send_brief_prompt_card
+
+        # 先 arm 再发卡：arm 失败（open_id 为空）不该发一张点了没用的卡。
+        # ``who`` 是点击者 open_id，正是确认卡要按人取态的键 —— 按人键控
+        # 才能防「群里另一个人点一下就用别人的简报建事务」。
+        brief_pending.arm(
+            who, project=selection.project, model=selection.model,
+            agent=selection.agent, variant=selection.variant, chat_id=chat_id,
+        )
         try:
-            _card_sender.send_text(
-                chat_id,
-                "选好了：\n" + summary +
-                "\n\n要做的事直接发给我就行（例：把 README 的用法那节补上）。",
+            send_brief_prompt_card(
+                _card_sender, open_id=who, subject="要做的事？", chat_id=chat_id,
             )
         except Exception:
-            log.warning("【选择】摘要发不出去（chat=%s）", chat_id, exc_info=True)
+            log.warning("【选择】简报提示卡发不出去（chat=%s）", chat_id,
+                        exc_info=True)
         return _card_action_response(
             _decided_card("已选好", "**四段都选完了。**", granted=True),
             "success", "已选好",
@@ -1915,6 +2037,247 @@ def _run_plan_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     return _card_action_response(
         _decided_card(heading, body, granted=(choice == "ok")),
         "success", heading,
+    )
+
+
+def _say_and_card(
+    chat_id: str,
+    heading: str,
+    body: str,
+    *,
+    granted: bool,
+    toast: str,
+    toast_type: str,
+    text: str | None = None,
+) -> dict[str, Any]:
+    """**发聊天气泡 + 回写卡片**，两件事一起做完。
+
+    本仓纪律（见 :func:`_run_plan_confirm` 里那段注释）：聊天气泡是用户在
+    窗口里**等的**那个；只靠卡片回写的话，他得自己发现「刚才那张卡变了」。
+    所以凡是给出一个用户可见的结论（已建 / 没建 / 已过期 / 被拒），都要在
+    窗口里说一句。
+
+    ## 为什么把两件事收进一个 helper
+
+    这些分支各写一遍 ``try/except send_text`` 就是好几份会各自漂移的实现 ——
+    漏一处不会报错，只会在那一刻**静默少一句**。收进来之后，「发气泡」的
+    失败策略只有一份：**发不出去不该让结论变成假的**，记日志后照常回写卡片。
+
+    ## 为什么 ``text`` 可以单独给
+
+    卡片正文与气泡文案并不总是同一句：建委派成功时气泡里是命令的完整回话
+    （含 ``/start`` 提示），卡片正文是短摘要。不给就退回用 ``body``。
+    """
+    if text is None:
+        text = body
+    try:
+        _card_sender.send_text(chat_id, text)
+    except Exception:  # noqa: BLE001 - 发不出去不该让结论变成假的
+        log.warning("【简报确认】回话失败（chat=%s）", chat_id, exc_info=True)
+    return _card_action_response(
+        _decided_card(heading, body, granted=granted),
+        toast_type, toast,
+    )
+
+
+def _run_delegate_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
+    """点了简报确认卡 → 按点击者取态，路由成 ``/delegate`` 命令。
+
+    ## 为什么按**点击者**取态（``claim(who)``）
+
+    确认卡发在**群**里，全员可见 —— 谁都能点。若按 ``chat_id`` 或全局单槽
+    取态，群里的另一个白名单成员点一下「建这条委派」，取到的就是**上一个人
+    的**简报。而 ``tasks.delegate_requested_by`` 取的是**点击者**，于是这条
+    委派记成了他的名、内容却是别人的 —— 一次张冠李戴的建事务。
+    按 ``open_id`` 键控让每个人**只可能**取到自己的那一份。
+
+    ## 为什么路由回命令，而不是在这里直接建事务
+
+    12.1.1「一份能力一份实现」。这里若自己调 ``tasks.create``，就成了
+    **第二份**委派实现，而分叉的表现极隐蔽（飞书正常、终端对，而两边各自
+    都测过）。路由成 ``/delegate`` 让白名单闸门、脉络归属、
+    ``delegate_chat_id`` / ``delegate_requested_by`` 的来源全都白送。
+
+    ## 清态**按分支做**
+
+    :func:`_run_oc_select` 的第四段点击负责**设**态、这里负责**读**态。若在
+    ``_card_action`` 开头一律 ``discard``，会在设的同一帧把它擦掉。所以
+    这里逐分支处理：``create`` 用 ``claim``（取即删），``retry`` / ``cancel``
+    用 ``discard``。
+    """
+    from .sender import send_brief_prompt_card
+
+    choice = str(value.get("choice") or "").strip().lower()
+    chat_id = str(value.get("chat") or "").strip()
+    if choice not in ("create", "retry", "cancel"):
+        # 不猜。认不出的 choice **只把卡收掉**，不发话 ——
+        # 说「已确认」而实际没做，比什么都不说糟得多（照 _run_plan_confirm）。
+        log.info("【简报确认】认不出的 choice=%r（who=%s）—— 只收卡", choice, who)
+        return _no_card_change("不认识这个操作")
+
+    if _card_channel is None or _card_sender is None:
+        log.warning("【简报确认】没连上通道，不处理（choice=%r）", choice)
+        return _card_action_response(
+            _decided_card("没法处理", "**没连上，处理不了。**", granted=False),
+            "error", "没连上",
+        )
+
+    # 白名单：同一把尺子。确认卡在群里全员可见，不判就会向白名单外确认
+    # 这里有个 bot，而且会消费别人的简报。
+    if not _card_channel.is_allowed(who):
+        log.info("【简报确认】点击者不在白名单，不回话也不执行（who=%r）", who)
+        return _no_card_change("没权限，未处理")
+
+    if choice == "cancel":
+        had = brief_pending.discard(who)
+        log.info("【简报确认】用户取消（who=%s，原有=%s）", who, had)
+        return _say_and_card(
+            chat_id, "好，先不做了", "**好，先不做了。**",
+            granted=False, toast="已取消", toast_type="success",
+        )
+
+    if choice == "retry":
+        brief_pending.discard(who)
+        try:
+            send_brief_prompt_card(
+                _card_sender, open_id=who, subject="要做的事？", chat_id=chat_id,
+            )
+        except Exception:  # noqa: BLE001 - 发卡失败不该掀翻点击
+            log.warning("【简报确认】重发提示卡失败（who=%s）", who, exc_info=True)
+            return _say_and_card(
+                chat_id, "没发出去", "**没能重发提示卡**，请直接发消息。",
+                granted=False, toast="没发出去", toast_type="error",
+            )
+        return _say_and_card(
+            chat_id, "改一下", "**好，重新说一遍要做的事。**",
+            granted=True, toast="改一下", toast_type="success",
+        )
+
+    # choice == "create"
+    entry = brief_pending.claim(who)
+    if entry is None:
+        # 取不到 = 已过期 / 重启后点老卡 / 别人点的。**绝不执行**。
+        log.info("【简报确认】取不到待填简报（who=%s）—— 已过期", who)
+        return _say_and_card(
+            chat_id, "已过期",
+            "**这条简报已过期**（或不是你的）。请重新选一遍项目 / 模型。",
+            granted=False, toast="已过期，重做一遍", toast_type="warning",
+        )
+
+    # 核对快照：重新读 oc_selection.json，若与快照不一致（例如用户在 Web
+    # 编程页改了），就提示重选、**不建委派**。这是「回显与实际派发同源」
+    # 的另一半 —— 回显用快照，派发前再核对一次，防止快照与当前选择漂移。
+    current = _oc_load_selection()
+    if (current.project, current.model, current.agent, current.variant) != (
+        entry.project, entry.model, entry.agent, entry.variant,
+    ):
+        log.info("【简报确认】快照与当前选择不一致（who=%s）—— 提示重选", who)
+        return _say_and_card(
+            chat_id, "选择已变", "**选择已在别处被改动**，请重选一遍。",
+            granted=False, toast="选择已变，请重选", toast_type="warning",
+        )
+
+    # 脉络：读第一条角色名，与自然语言那条路的 ``_default_role_name`` 同一
+    # 做法 —— 不在这里复制角色判定，只是把预览过的名字原样交给
+    # ``_create_delegation`` 这个唯一入口。
+    #
+    # ⚠️ 设计稿写的是「role 传空串，让 _create_delegation 决定归属」，但
+    # 那条路走不通：``parse_delegate_args`` 会**丢掉空段**，于是
+    # ``/delegate P |  | brief`` 解析成 ``(P, "brief", "")`` —— 角色变成
+    # 简报、需求变空，``_cmd_delegate`` 的 ``not requirement`` 直接回用法。
+    # 所以这里传**第一条角色名**（= ``_default_role_name`` 的结果），
+    # 效果与「让它决定」等价，且命令真能建出委派。
+    role = ""
+    try:
+        roles = _card_channel.app.roles.list_roles()
+        role = roles[0].name if roles else ""
+    except Exception:  # noqa: BLE001 - 读角色失败不该让点击崩掉
+        log.warning("【简报确认】读角色失败，按空脉络路由", exc_info=True)
+    if not role:
+        # 没有脉络：命令会因角色为空而回用法，那对用户毫无意义。如实说清。
+        log.info("【简报确认】没有任何脉络，不建委派（who=%s）", who)
+        return _say_and_card(
+            chat_id, "没有脉络", "**还没有任何脉络**，先 /role-add 建一个。",
+            granted=False, toast="没有脉络，先建一个", toast_type="warning",
+        )
+
+    # 路由成命令。⚠️ 已知边界：``parse_delegate_args`` 会把裸 ``|`` 当分段符，
+    # 所以简报里若含带空格的 ``|``（如表格），它会被吞掉、两侧拼成一个空格。
+    # 这是**优雅降级**：不崩、不注入，``/delegate`` 照常被调用。
+    cmd = f"/delegate {entry.project} | {role} | {entry.brief}"
+    try:
+        with _card_channel.app.lock:
+            reply = _card_channel.handle(chat_id, who, cmd)
+    except Exception:  # noqa: BLE001 - 点卡不该把桥接带崩
+        log.exception("【简报确认】执行失败（who=%s）", who)
+        return _say_and_card(
+            chat_id, "没能执行", "**没能执行。** 稍后再试。",
+            granted=False, toast="没能执行", toast_type="error",
+        )
+
+    if reply.denied:
+        # 沉默即拒绝的同一条纪律：被拒就**如实说没建**。
+        log.info("【简报确认】被拒（who=%s）：%s", who, reply.text[:40])
+        return _say_and_card(
+            chat_id, "没有建", f"**没有建**：{reply.text}",
+            granted=False, toast="没建", toast_type="error",
+            text=reply.text,
+        )
+
+    # ✱ 命令**没被拒，却也没建出委派**：`_cmd_delegate` 只对白名单外的项目
+    # ``_say("[拒绝] …")`` 就 return，**没有**把它标成 ``denied``
+    # （cli/app.py:1535-1537）。所以「denied 为假」不是成功的充分条件 ——
+    # 一路落到下面会**无条件**报绿头「已建委派」，而库里 0 条事务。用户瞥一眼
+    # 卡片就以为成了，这比什么都不说糟得多。
+    #
+    # 判据用 ``reply.task_action``：它是 ``_create_delegation`` 成功时**唯一**
+    # 置位的信号（cli/app.py:1549），每轮 ``_run`` 开头清空
+    # （channel.py:441）、跑完读回（channel.py:474）。为 None ⇒ 没建出来。
+    #
+    # ⚠️ 刻意**不**去匹配回话里有没有「已建委派事务」字样 —— 见
+    # ``sender._decided_card`` 的 docstring：从渲染好的文案里反推语义，
+    # 格式一改就悄悄错，且测试只查文案查不出来。
+    if reply.task_action is None:
+        log.info("【简报确认】命令没被拒却没建出委派（who=%s）：%s",
+                 who, reply.text[:40])
+        return _say_and_card(
+            chat_id, "没有建", f"**没有建**：{reply.text}",
+            granted=False, toast="没建", toast_type="error",
+            text=reply.text,
+        )
+
+    # ✱ 建成功了 → 补发「事务动作卡」（带 /start /done /pause 按钮）。
+    #
+    # 这张卡在终端 REPL 路径上一直有（bridge.py:795-818），但飞书第 5 步
+    # 建委派走的是 _card_channel.handle(...) → ChannelService.handle → Repl，
+    # reply.task_action 同样会被 _cmd_delegate 设置（app.py:1549）。
+    #
+    # 漏发的后果：用户在飞书里只能看到文字「确认要派的话：/start <id>」，
+    # 必须手打这条命令。Web 页签有「开始」按钮，飞书没有 —— 两处不对称。
+    #
+    # 按钮走 _run_card_command，它有自己的窄白名单（只放 /start /done /pause），
+    # 所以补发是安全的：即使 reply.task_action 被伪造，也只能触发这三个状态迁移。
+    if reply.task_action:
+        task_id, title = reply.task_action
+        try:
+            send_task_action_card(
+                _card_sender,
+                open_id=who,
+                title=title,
+                task_id=task_id,
+                chat_id=chat_id,
+                state="待办（执行器不会碰它）",
+            )
+            log.info("【简报确认】已补发事务动作卡：chat=%s，task=%s",
+                     chat_id, task_id[:8])
+        except Exception:  # noqa: BLE001 - 发卡失败不该让「已建」变成假的
+            log.warning("【简报确认】动作卡发不出去，正文已说过 /start",
+                        exc_info=True)
+
+    return _say_and_card(
+        chat_id, "已建委派", f"**{reply.text}**",
+        granted=True, toast="已建委派", toast_type="success",
+        text=reply.text,
     )
 
 

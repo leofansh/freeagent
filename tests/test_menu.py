@@ -311,17 +311,6 @@ def test_role_button_reuses_the_view_path(wired, monkeypatch):
     assert sender.sent, "点了角色要真的看到那个角色的内容"
 
 
-def test_delegate_button_fills_in_a_real_role_name(wired):
-    bridge, sender, cards, app = wired
-    app.roles.create("默认脉络")
-    bridge_mod._run_menu(
-        {"action": MENU_ACTION, "choice": "delegate", "chat": "oc_chat"},
-        who=ALICE,
-    )
-    body = sender.sent[0][1]
-    assert "/delegate" in body and "默认脉络" in body
-
-
 def test_unknown_choice_is_refused_visibly(wired):
     bridge, sender, cards, _ = wired
     out = bridge_mod._run_menu(

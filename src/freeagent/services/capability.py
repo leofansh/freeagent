@@ -352,7 +352,7 @@ class CapabilityRouter:
             lines.append(f"    现在授权的是：{'、'.join(view.labels())}")
         else:
             lines.append("    （还没授权项目，暂时不能改代码）")
-        lines.append("改代码的说法：「让 opencode 改 <项目> <要做的事>」。")
+        lines.append("改代码的说法：「让 opencode 改 <项目> “要做的事”」。")
         return ChatReply(ChatReplyKind.ANSWER, "\n".join(lines))
 
     def _how_to(self, view: CapabilityView) -> ChatReply:
@@ -369,7 +369,7 @@ class CapabilityRouter:
         return ChatReply(
             ChatReplyKind.ANSWER,
             "三步：\n"
-            "  1. 说「让 opencode 改 <项目> <要做的事>」（一整行，别换行）\n"
+            "  1. 说「让 opencode 改 <项目> “要做的事”」（一整行，别换行）\n"
             "  2. 我复述一遍，你确认\n"
             "  3. 执行器动手前，每一步都发卡问你批不批"
             "\n现在授权的是：" + "、".join(view.labels()),

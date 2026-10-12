@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ..domain import RestoreView, Role, ScoredTask, Task
+from ..domain import RecordType, RestoreView, Role, ScoredTask, Task
 from ..services.llm import SignalRef, TaskRef
 from ..services.reminders import ReminderDigest
 from ..services.sorting import DISCLAIMER_MARKER
@@ -103,6 +103,19 @@ def render_all(
     return "\n".join(lines)
 
 
+def _strip_html_comments(text: str) -> str:
+    """剥掉 HTML 注释行。
+
+    产物正文里的 ``<!-- ... -->`` 在浏览器里看不见，在飞书纯文本里却
+    清清楚楚——用户看到的是 ``<!-- opencode session: ses_... -->`` 这种
+    内部标记，只会困惑。库里保留原文（程序可追溯），渲染时剥掉。
+    """
+    return "\n".join(
+        line for line in text.splitlines()
+        if not (line.strip().startswith("<!--") and line.strip().endswith("-->"))
+    )
+
+
 def render_artifact(artifact) -> str:
     """单个草稿版本。"""
     label = _ARTIFACT_LABELS.get(artifact.status.value, artifact.status.value)
@@ -110,7 +123,7 @@ def render_artifact(artifact) -> str:
     if artifact.supersedes:
         lines.append(f"  上一版：{artifact.supersedes[:8]}")
     lines.append("")
-    lines += [f"  {line}" for line in artifact.content.splitlines()]
+    lines += [f"  {line}" for line in _strip_html_comments(artifact.content).splitlines()]
     return "\n".join(lines)
 
 
@@ -180,14 +193,18 @@ def render_task(view: RestoreView, names: dict[str, str]) -> str:
         art = view.current_artifact
         label = _ARTIFACT_LABELS.get(art.status.value, art.status.value)
         lines.append(f"当前稿：version {art.version}（{label}）")
-        for line in art.content.splitlines()[:12]:
+        for line in _strip_html_comments(art.content).splitlines()[:12]:
             lines.append(f"    {line}")
     if view.progress_note:
         lines.append(f"进度：{view.progress_note}")
     if view.recent_records:
-        lines.append("最近记录：")
-        for record in view.recent_records[-8:]:
-            lines.append(f"  · {record.ts:%m-%d %H:%M} {record.content}")
+        # 「恢复上下文」是每轮例行动作，不是进展——6 条记录里 4 条是它，
+        # 把真正的产出（草稿、失败原因）淹没了。过滤掉，只留有信息量的。
+        meaningful = [r for r in view.recent_records if r.type is not RecordType.RESUME]
+        if meaningful:
+            lines.append("最近记录：")
+            for record in meaningful[-8:]:
+                lines.append(f"  · {record.ts:%m-%d %H:%M} {record.content}")
     lines.append("下一步：")
     for action in view.next_actions:
         lines.append(f"  · {action}")

@@ -172,18 +172,6 @@ def test_role_click_goes_through_the_view_path(wired):
     assert sender.sent, "点了角色却什么都没发"
 
 
-def test_delegate_click_fills_a_real_role(wired):
-    sender, _, _ = wired
-    bridge_mod._card_action(
-        _click({"action": MENU_ACTION, "choice": "delegate", "chat": CHAT})
-    )
-    assert "/delegate" in sender.sent[0][1]
-    assert "默认脉络" in sender.sent[0][1], "没填上真实角色名，用户还得自己查"
-
-
-# --------------------------------------------------------------------------- #
-# Refusals must not silently "succeed"
-# --------------------------------------------------------------------------- #
 def test_unknown_choice_is_refused_visibly(wired):
     sender, _, _ = wired
     out = bridge_mod._card_action(
@@ -292,14 +280,14 @@ def test_menu_never_ends_by_asking_you_to_type(wired):
     菜单的意义是「识别优于回忆」。回一句命令让用户自己去打，等于把菜单
     刚省掉的那一步又塞回去。
 
-    `help` 与 `delegate` 允许出现命令，但必须是**可直接照着发的那一条**
+    `help` 允许出现命令，但必须是**可直接照着发的那一条**
     （带反引号的完整命令），而不是「你去发 /xxx」这种指路。
 
     判据刻意只用「正文里有没有一条可直接照发的命令」。原先还想断言
     「不许以句号收尾」，那是坏判据 —— `完整命令表发 /help。` 收尾完全正当，
     而它确实让那条测试红了。**测试自己写错，比代码有 bug 更需要记下来。**
     """
-    for choice in ("help", "delegate", "today", "roles"):
+    for choice in ("help", "today", "roles"):
         plan = bridge_mod._menu_dispatch(choice)
         if plan.get("view") or plan.get("roles"):
             # 走视图或发卡：根本没有正文，不构成死胡同

@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 
 from freeagent.feishu import bridge
+from freeagent.feishu import brief_pending
 from freeagent.feishu.sender import (
     MENU_ACTION,
     PLAN_CONFIRM_ACTION,
@@ -64,6 +65,18 @@ def opts():
         sel.Option(value="opencode/fledge-alpha-free", label="Fledge Alpha Free",
                    hint="OpenCode Zen · 3 档"),
     ]
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending():
+    """待填简报是**模块级内存**，测试之间必须清干净。
+
+    不清的话，上一条测试 arm 的 ``ou_me`` 会漏到下一条 —— 而症状是
+    「单独跑绿、一起跑红」，最难查的一类。
+    """
+    brief_pending._PENDING.clear()
+    yield
+    brief_pending._PENDING.clear()
 
 
 # ── 卡结构 ────────────────────────────────────────────────────────────── #
@@ -238,7 +251,13 @@ def test_first_click_stores_and_advances(wired):
     assert len(sender.cards) == 1, "只发下一段，不发摘要"
 
 
-def test_four_stages_then_summary(wired):
+def test_four_stages_then_brief_prompt(wired):
+    """第四段之后**不再**给文字摘要，而是 arm 待填简报 + 发提示卡。
+
+    为什么改：摘要那句「要做的事直接发给我就行」把用户推进了意图分类 ——
+    下一句「了解最新开发进度」会被判成「查某条事务的进展」。改成 arm 一份
+    选型快照，用户下一句纯文字**必然**是简报（见 brief_pending 模块）。
+    """
     sender, read = wired
     _click(stage="project", value="D:/p/freeagent", page=0)
     _click(stage="agent", value="Sisyphus - ultraworker", page=0)
@@ -246,7 +265,16 @@ def test_four_stages_then_summary(wired):
     _click(stage="variant", value="high", page=0)
     got = read()
     assert (got.agent, got.variant) == ("Sisyphus - ultraworker", "high")
-    assert sender.texts and "选好了" in sender.texts[-1][1], "第四段后要给摘要"
+
+    pending = brief_pending.peek("ou_me")
+    assert pending is not None, "第四段后必须 arm 一份待填简报"
+    assert (pending.project, pending.model, pending.agent, pending.variant) == (
+        "D:/p/freeagent", "opencode/fledge-alpha-free",
+        "Sisyphus - ultraworker", "high",
+    )
+    assert pending.brief == "", "arm 时简报还是空的"
+    assert sender.cards, "第四段后要发简报提示卡"
+    assert sender.cards[-1][1]["header"]["title"]["content"] == "要做的事？"
 
 
 def test_forged_value_is_rejected(wired):

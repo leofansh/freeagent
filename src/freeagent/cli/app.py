@@ -92,6 +92,10 @@ _USAGE: dict[str, str] = {
     "/revise": "/revise <id> <新内容>",
     "/artifact": "/artifact <id> [版本号]",
     "/accept": "/accept <id> [版本号]",
+    # 恢复出厂：整仓唯一真正删数据的功能，口令必须逐字对上。
+    # 与 /drop 分开成两条，而且**刻意不提供无口令快捷方式** ——
+    # 「慢一点」是这个功能该有的摩擦。
+    "/reset-data": "/reset-data <确认口令>",
     "/steps": "/steps <id>",
     "/plan": "/plan <id>",
     # 交互模式（设计文档 12.7.2）。**不叫 /plan** —— 那个名字已经是
@@ -175,6 +179,10 @@ _HELP = """\
   /agents             执行器探针：装了没、什么版本、能不能派（**只看不派**）
   /ask <问题>         问执行器一句就回来（**只读**：不改文件、不建事务、不问审批）
   /pair <配对码>      把飞书某个人加进白名单（码来自 bot 私聊发的那张卡）
+  /reset-data <确认口令>
+                      **恢复出厂**：清空全部事务数据（角色脉络/配置/Key 保留），
+                      执行前强制自动备份。口令不带时只打印说明、不执行。
+                      执行器或桥接在跑时会拒绝。慎用。
   /help               这份帮助
   /quit               退出
 
@@ -889,7 +897,7 @@ class Repl:
             "要用 opencode 改哪个项目？现在授权的是："
             + "、".join(caps.labels())
         )
-        self._say("说一句「改 <项目名> <要做的事>」就行。")
+        self._say("说一句「改 <项目名> “要做的事”」就行。")
         return True
 
     def _resume_delegation(self, line: str) -> bool:
@@ -932,7 +940,7 @@ class Repl:
         project, brief = self._pending_delegate or (None, "")
         self._pending_delegate = None
         if not project or not brief:
-            self._say("要确认的东西不完整，重新说一句「改 <项目> <要做的事>」。")
+            self._say("要确认的东西不完整，重新说一句「改 <项目> “要做的事”」。")
             return True
 
         role_name = self._default_role_name()
@@ -1116,6 +1124,9 @@ class Repl:
             # 症状是 ``/plan <id>`` 报「用法：/plan <id>」之外什么也不做，
             # 而``/plan`` 自己也不进模式。已挪到 ``/mode-plan``（上方）。
             "/plan": self._cmd_plan,
+            # 恢复出厂。**不带口令就跑 = 打印将要删什么**，不执行 ——
+            # 一次无口令调用应当得到「说明」而不是「事故」。
+            "/reset-data": self._cmd_reset_data,
             "/tick": self._cmd_tick,
             "/llm": self._cmd_llm,
             # 能力探针（设计文档 11.10.2）。只看不派 —— 见 _cmd_agents。
@@ -1235,7 +1246,7 @@ class Repl:
             question,
             project=project,
             make_server=lambda p, c, **kw: OpenCodeServer(
-                project=p, executable=c, **kw
+                project=p, executable=c, apply_gate=True, **kw
             ),
             model=(self.app.config.model if self.app.config else None),
         )
@@ -1256,12 +1267,48 @@ class Repl:
         digest = self.app.reminders.due()
         text = render.render_digest(digest)
         if not text:
-            self._say("没有到点的提醒。")
+            self._say("没有到点的提醒")
             return
         self._say(text)
-        # 确认放在 _say 之后：写不出去就别记账，否则这条提醒会被永久
-        # 标记成已送达而用户从没看到（设计文档 9.2）。
+        # 确认放在 _say 之后 —— 先说再认领。反过来会先改状态后播报，
+        # 播报失败就「状态改了但用户什么都没看到」（8.2 的同一条纪律）。
         self.app.reminders.acknowledge(digest)
+
+    # ---- 恢复出厂 ---------------------------------------------------- #
+    def _cmd_reset_data(self, args: list[str]) -> None:
+        """清空全部事务数据。角色脉络与配置保留；强制先备份。
+
+        口令是**位置参数**而不是第二问 input()：一行命令自己带着凭据，
+        比「先问一句再问一句」更不容易被顺手敲过；而口令不对时打印
+        将要删什么（说明）而不是执行 —— 无口令调用的正确结果是说明书。
+        """
+        from .services.reset import (
+            RESET_PHRASE,
+            ResetRefused,
+            db_path_of,
+            reset_factory,
+        )
+
+        if not args or "".join(args) != RESET_PHRASE:
+            n = len(self.app.task_repo.list_all())
+            self._say(
+                f"这将清空全部 {n} 条事务及其记录/产物（角色脉络、配置、"
+                f"Key 全部保留），并**先自动备份**。\n"
+                f"确认请输入：/reset-data {RESET_PHRASE}"
+            )
+            return
+        try:
+            result = reset_factory(
+                db_path_of(self.app.conn), confirmed=True
+            )
+        except ResetRefused as exc:
+            self._say(f"没有执行：{exc}")
+            return
+        self._say(
+            "已清空。删除：" +
+            "，".join(f"{k} {v} 条" for k, v in result.deleted.items() if v) +
+            f"\n备份在：{result.backup}\n{result.restore_hint}"
+        )
 
     # ---- 角色管理 ---- #
     def _cmd_role_add(self, args: list[str]) -> None:
