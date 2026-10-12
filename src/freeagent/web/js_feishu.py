@@ -173,13 +173,9 @@ function renderFeishu(s, log, cfg, ctl) {
   });
 
   // --- 启停 ---
-  if (ctl) {
-    root.appendChild(feishuControlCard(
-      ctl, (next) => renderFeishu(s, log, cfg, next)));
-  } else {
-    root.appendChild(el("div", "note",
-      "启停状态读不出来，所以不能从这里启动或停止桥接。"));
-  }
+  root.appendChild(el("div", "note",
+    "桥接的启动 / 停止 / 重启已移到「后台服务」页签 —— 那里统一管" +
+    "飞书桥接与委派执行器两个进程。本页只留配置与日志。"));
 
   // --- 排查路径：出问题先看哪儿 ---
   root.appendChild(el("div", "hint",

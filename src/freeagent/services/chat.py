@@ -107,6 +107,12 @@ class ChatReply:
     #: 「问了个别的、我猜成今天」。这两种必须能被区分，否则用户会把
     #: 猜测当成答案 —— 那比明说「我不知道」危险得多。
     inferred: bool = False
+    #: 这条答复里若含「今天」这个绝对日期，记下它生成于哪天（YYYY-MM-DD）。
+    #:
+    #: 客户端回放历史时据此把过期日期刷新成当天 —— 服务端不落地任何历史。
+    #: 只有 today 这条路会填（文本里的 ``{view.day}`` 是生成时冻进去的），
+    #: 其余答复保持空串。
+    generated_at: str = ""
 
 
 #: 开头就告诉用户能问什么 —— 猜谜语式的助手没人会用第二次。
@@ -703,6 +709,7 @@ class ChatService:
                 ChatReplyKind.ANSWER,
                 f"{view.day} 今天没有排进来的事务。{extra}",
                 suggestions=("我上周完成了什么", "有什么提醒"),
+                generated_at=view.day.isoformat(),
             )
         items = tuple(self._item(s) for s in view.items)
         lines = [
@@ -716,6 +723,7 @@ class ChatService:
             + "\n（启发式提示，不是评分）",
             items=items,
             suggestions=("我在等什么", "为什么这条排第一", "有什么提醒"),
+            generated_at=view.day.isoformat(),
         )
 
     def _answer_waiting(self) -> ChatReply:

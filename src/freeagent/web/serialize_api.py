@@ -44,6 +44,10 @@ def chat_payload(reply) -> dict:
             for item in reply.items
         ],
         "suggestions": list(reply.suggestions),
+        # 观测字段（route）+ 回放用的生成日期。命令回复也走这里，
+        # 两者默认都是空串 —— 客户端的 meta 判空守卫因此永远安全。
+        "generated_at": reply.generated_at,
+        "route": reply.route,
     }
 
 

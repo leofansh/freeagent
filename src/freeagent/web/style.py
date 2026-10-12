@@ -19,6 +19,7 @@ STYLE_CSS = r"""  :root {
     --warn: #8a5a12;
     --warn-soft: #fdf3e2;
     --info-soft: #eef2f7;
+    --card-2: var(--info-soft);
     --radius: 10px;
   }
   @media (prefers-color-scheme: dark) {
@@ -27,6 +28,7 @@ STYLE_CSS = r"""  :root {
       --ink-3: #7b8695; --line: #2b313a; --accent: #6fbf95;
       --accent-soft: #1e2f27; --warn: #e0b070; --warn-soft: #2e2718;
       --info-soft: #222831;
+      --card-2: var(--info-soft);
     }
   }
   * { box-sizing: border-box; }
@@ -68,6 +70,26 @@ STYLE_CSS = r"""  :root {
   }
   .card.clickable { cursor: pointer; }
   .card.clickable:hover { border-color: var(--accent); }
+  /* 选择态（批量「算了」/ 对话多选删除）共用。选择模式下卡片去掉 hover
+     高亮：那不是「可点开」而是「可勾选」，错的 affordance 比不给更糟。 */
+  .pickbar, .chatpickbar {
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    background: var(--card-2); border: 1px solid var(--line); font-size: 13.5px;
+    border-radius: var(--radius); padding: 9px 13px; margin-bottom: 10px;
+  }
+  .pickcount, .chatpickcount { color: var(--ink-2); margin-right: auto; }
+  .pick { display: inline-flex; align-items: center; margin-right: 9px; }
+  .card.clickable:has(.pickbox):hover { border-color: var(--line); }
+  .pickbox, .chatpickbox {
+    width: 15px; height: 15px; margin-right: 9px; flex: none;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  .msg > .chatpickbox, .chips > .chatpickbox { align-self: flex-start; margin-top: 6px; }
+  /* 高级设置折叠区：summary 一行高 —— 破坏性操作默认不可见、入口不须滚。 */
+  details.advanced { margin-bottom: 12px; }
+  details.advanced > summary { cursor: pointer; font-size: 13.5px; color: var(--ink-2); padding: 9px 13px; background: var(--card-2); border: 1px solid var(--line); border-radius: var(--radius); }
+  details.advanced[open] > summary { margin-bottom: 10px; }
+
   .row1 { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
   .idx { color: var(--ink-3); font-variant-numeric: tabular-nums; min-width: 1.4em; }
   .title { font-weight: 600; }
@@ -156,11 +178,22 @@ STYLE_CSS = r"""  :root {
 
   /* 对话：首屏就是输入框。气泡分我/它两侧，理由跟在气泡里不另开面板。 */
   .chat { display: flex; flex-direction: column; height: calc(100vh - 150px); min-height: 420px; }
-  .chatlog { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding: 4px 2px 12px; }
-  .msg { max-width: 82%; }
-  .msg.me { align-self: flex-end; background: var(--accent); color: #fff; border-color: transparent; }
+  .chatlog { flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 12px; padding: 4px 2px 12px; }
+  .msg { max-width: 82%; min-width: 0; }
+  .msg.me { align-self: flex-end; }
   .msg.me .meta { color: rgba(255,255,255,.75); }
-  .msg .bubble { white-space: pre-wrap; }
+  /* 气泡本体：`pre-wrap` 保留换行但不断长串；长串 + CJK/ASCII 混排需要
+     overflow-wrap + word-break 一起才折行，min-width:0 才允许 `.msg` 收缩到
+     内容之下。border/padding/背景必须在 base —— 原先 `.bubble` 只有
+     `white-space`，于是 kind-answer 的 border-color 与 cannot/help 的
+     background 都是空操作。 */
+  .msg .bubble {
+    white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
+    min-width: 0; max-width: 100%;
+    padding: 9px 12px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  }
+  .msg.me .bubble { background: var(--accent); color: #fff; border-color: transparent; }
   .msg .items { margin-top: 9px; display: flex; flex-direction: column; gap: 6px; }
   .msg .items .tcard {
     border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;

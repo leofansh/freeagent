@@ -28,7 +28,8 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
     <button data-view="roles">角色</button>
     <button data-view="oc">编程</button>
     <span class="spacer"></span>
-    <button data-view="feishu">飞书通道</button>
+    <button data-view="services">后台服务</button>
+<button data-view="feishu">飞书通道</button>
     <button data-view="settings">设置</button>
     <button id="refresh" title="重新读取">刷新</button>
   </nav>

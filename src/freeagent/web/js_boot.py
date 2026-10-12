@@ -56,6 +56,11 @@ async function load(next) {
       loadOcSelection(root);
       return;
     }
+    if (view === "services") {
+      // 后台服务页：进程状态与启停。控制与配置分离的「控制」那一半。
+      loadServices();
+      return;
+    }
     if (view === "feishu") {
       // 两个端点顺序取：状态拿不到也要把日志显示出来，否则「页面空了」
       // 会被理解成「什么都没开」，而真相可能是「日志能看但状态接口挂了」。
@@ -117,7 +122,14 @@ async function load(next) {
 }
 
 document.querySelectorAll("#nav button").forEach((b) => {
-  if (b.dataset.view) b.onclick = () => load(b.dataset.view);
+  if (b.dataset.view) b.onclick = () => {
+    // 离开对话就退掉多选删除模式（它只属于对话）。不 reload ——
+    // 紧接着的 load 会重绘一切。typeof 守卫：模块没进页面时不能炸。
+    if (b.dataset.view !== "chat" && typeof chatPickExit === "function") {
+      chatPickExit(false);
+    }
+    load(b.dataset.view);
+  };
 });
 $("#refresh").onclick = () => {
   if (detail) openTask(detail.task.id);

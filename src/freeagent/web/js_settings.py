@@ -171,6 +171,8 @@ function renderSettings(d) {
       msg.innerHTML = '<span class="err">' + esc(err.message) + "</span>";
     }
   };
+  root.appendChild(advancedSection());
+
   root.appendChild(f);
 
   root.appendChild(el("div", "hint",
@@ -181,4 +183,63 @@ function renderSettings(d) {
   $("#foot").textContent =
     "Key 可以在这里填，会写进 llm.env（不写进 config.json）。" +
     "环境变量仍然优先于文件 —— 两边都配了的话，界面会明确提示你。";
+}
+
+// 高级设置：默认折叠，里面只放**恢复出厂**。为什么不摆明处也不埋底：
+// 摆顶部 = 一屏内伸手可及，误触成本最高；埋底部 = 没人找得到（实测第一
+// 位使用者就没看到）。折叠是两不牺牲：一行入口在页顶不用滚，展开是显式
+// 动作，破坏性按钮从不出现在「不小心看到」的状态里。
+function advancedSection() {
+  const box = el("details", "advanced");
+  const sum = el("summary", "", "高级设置（恢复出厂）");
+  box.appendChild(sum);
+  box.appendChild(resetSection());
+  return box;
+}
+
+// 恢复出厂。口令**印在卡片上**：它的作用是让人慢一秒，不是保密 ——
+// 藏起来只会逼用户输错一次从报错里才知道输什么，白惹一声「功能坏了」。
+//（端点仍受会话令牌 + 只监听回环保护，不靠口令保密。）
+function resetSection() {
+  const box = el("div", "card");
+  box.innerHTML =
+    '<div class="row1"><span class="title">恢复出厂</span>' +
+    '<span class="tag warn">危险</span></div>';
+  box.appendChild(el("div", "note",
+    "清空全部事务数据（事务、记录、产物、审批卡）。" +
+    "角色脉络、配置、Key 全部保留。执行前会自动备份，可还原。"));
+  const row = el("div", "field");
+  const ta = el("input");
+  ta.type = "text";
+  ta.id = "resetphrase";
+  ta.placeholder = "确认口令";
+  ta.autocomplete = "off";
+  ta.style.width = "100%";
+  const go = el("button", "btn", "清空并备份");
+  go.onclick = async () => {
+    if (!ta.value.trim()) { toast("先输入确认口令"); return; }
+    // 二次确认（宁可丑也要多一道「你确定」）
+    if (!confirm("将清空全部事务数据（先自动备份）。确定？")) return;
+    go.disabled = true;
+    try {
+      const r = await api("/api/system/reset-data", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phrase: ta.value.trim() }),
+      });
+      const total = Object.values(r.deleted || {})
+        .reduce((a, b) => a + b, 0);
+      toast("已清空 " + total + " 条；备份在 " + r.backup);
+      renderSettings(await api("/api/settings"));
+    } catch (e) {
+      toast("没有执行：" + e.message);
+      go.disabled = false;
+    }
+  };
+  row.appendChild(ta);
+  row.appendChild(go);
+  box.appendChild(row);
+  box.appendChild(el("div", "hint",
+    "口令（逐字输入）：<b>我确定清空所有事务数据</b>。执行器或桥接在跑时会拒绝（正在写同一个库）—— 先停再试；备份文件名带时间戳。"));
+  return box;
 }"""

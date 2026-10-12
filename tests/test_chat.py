@@ -383,3 +383,43 @@ class TestNoMarkdownLeaksToUser:
 
         for question in CAN_DO:
             assert "**" not in question, f"示例问题带星号：{question}"
+
+
+class TestGeneratedAt:
+    """C2：今天视图的答复要带上「生成于哪天」，供客户端回放时刷新日期。
+
+    背景：``{view.day}`` 在生成时冻进了文本，而浏览器把历史**原样**回放
+    （服务端从不重渲染已存文本）—— 10-06 生成的答复在 10-09 还写着
+    「10-06 今天…」。``generated_at`` 是客户端把过期前缀改写成当天的依据。
+    """
+
+    def test_today_reply_carries_generated_at(self, chat):
+        reply = chat.chat.respond("今天该做什么")
+        assert reply.generated_at == "2026-09-26"
+        # 前缀必须能对上：文本以同一日期开头，回放才敢按前缀改写
+        assert reply.text.startswith("2026-09-26")
+
+    def test_non_today_reply_has_no_generated_at(self, chat):
+        """只有 today 这条路嵌了绝对日期 —— 其余答复必须是空串（默认值）。"""
+        assert chat.chat.respond("我在等什么").generated_at == ""
+        assert chat.chat.respond("有什么提醒").generated_at == ""
+
+    def test_inferred_today_reply_also_carries_generated_at(self, chat):
+        """兵底（inferred=True）也走 ``_answer_today``，同样带日期。
+
+        「手上有什么活」是 ``test_routing_eval`` 里钉过的兵底用例
+        （keyword 表全不命中 → 兜底 today + inferred）。
+        """
+        reply = chat.chat.respond("手上有什么活")
+        assert reply.inferred is True
+        assert reply.route == "today"
+        assert reply.generated_at == "2026-09-26"
+
+    def test_generated_at_follows_the_clock(self, chat):
+        """跟着注入的时钟走 —— 不是 import 时冻死的常量。"""
+        from datetime import datetime
+
+        chat.clock.set(datetime(2026, 9, 27, 8, 0))
+        reply = chat.chat.respond("今天该做什么")
+        assert reply.generated_at == "2026-09-27"
+        assert reply.text.startswith("2026-09-27")

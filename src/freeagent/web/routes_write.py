@@ -26,10 +26,11 @@ from ..app import App
 from . import (
     endpoints_delegate_projects,
     endpoints_feishu_config,
-    endpoints_feishu_control,
     endpoints_oc_dispatch,
     endpoints_oc_selection_write,
     endpoints_read,
+    endpoints_services,
+    endpoints_system,
     endpoints_write,
     llm_probe,
 )
@@ -84,12 +85,11 @@ def dispatch_post(
             app, read_body()
         )
 
-    if parts == ["api", "feishu", "bridge"]:
-        # 能起/杀带凭据的进程，所以**只能**走 POST（也只受令牌保护）。
-        # 不额外注册 GET 侧的别名：一个能杀进程的操作不该有「顺手 GET 一下
-        # 就能触发」的路径。
-        return HTTPStatus.OK, endpoints_feishu_control.feishu_bridge_action(
-            app, read_body()
+    if len(parts) == 4 and parts[:2] == ["api", "services"]:
+        # 后台服务统一控制（启停重启）。POST-only 的理由同旧飞书控制：
+        # 能杀进程的操作不能挂在 GET 上。动作白名单在端点里。
+        return HTTPStatus.OK, endpoints_services.service_action(
+            app, parts[2], parts[3]
         )
 
     if parts == ["api", "oc", "selection"]:
@@ -113,6 +113,19 @@ def dispatch_post(
         return HTTPStatus.CREATED, endpoints_oc_dispatch.oc_dispatch(
             app, read_body()
         )
+
+    if parts == ["api", "system", "reset-data"]:
+        # **恢复出厂**：整个 web 层唯一真正删数据的端点。口令在端点里
+        # 校验（services/reset 只认 confirmed 布尔）。刻意放在
+        # /api/system/ 命名空间下，不和事务写操作混在一起。
+        return HTTPStatus.OK, endpoints_system.reset_data(app, read_body())
+
+    if parts == ["api", "tasks", "drop"]:
+        # **批量「算了」**。三段路径，与下面的四段单条路由
+        # （/api/task/<id>/<action>）天然不会相撞。单独成端点而不是让
+        # 前端连发 N 次单条：批量要有整体上限与逐条汇总
+        # （见 endpoints_write.drop_tasks 的说明）。
+        return HTTPStatus.OK, endpoints_write.drop_tasks(app, read_body())
 
     if len(parts) == 4 and parts[:2] == ["api", "task"]:
         action = parts[3]

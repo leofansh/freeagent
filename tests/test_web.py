@@ -23,6 +23,7 @@ from freeagent.services.clock import FrozenClock
 from freeagent.services.sorting import DISCLAIMER_MARKER
 from freeagent.web.server import create_server
 from freeagent.web.session import SESSION_HEADER, SESSION_TOKEN
+from freeagent.web.style import STYLE_CSS
 
 NOW = datetime(2026, 9, 26, 9, 0)
 
@@ -436,6 +437,175 @@ class TestCreate:
 # =============================================================================
 # 安全边界
 # =============================================================================
+class TestBatchDrop:
+    """批量「算了」端点：全成、部分失败、参数非法、上限。
+
+    规则全部在服务层（已在 test_tasks.py 覆盖），这里钉的是**端点语义**：
+    形状校验、汇总字段、HTTP 语义。
+    """
+
+    def test_all_success(self, served, seeded):
+        work = seeded.roles.get_by_name("工作项目A")
+        a = seeded.tasks.create("批量甲", [work.id])
+        b = seeded.tasks.create("批量乙", [work.id])
+        status, data = post(served[0], "/api/tasks/drop",
+                            {"ids": [a.id, b.id]})
+        assert status == 200
+        assert data["dropped"] == 2
+        assert data["failed"] == []
+        for t in (a, b):
+            assert seeded.task_repo.get(t.id).state.value == "dropped"
+
+    def test_partial_failure_reports_reason(self, served, seeded):
+        work = seeded.roles.get_by_name("工作项目A")
+        good = seeded.tasks.create("好的", [work.id])
+        status, data = post(
+            served[0], "/api/tasks/drop",
+            {"ids": [good.id, "ghost-id"], "reason": "清理"},
+        )
+        assert status == 200, "部分失败不是 HTTP 错误 —— 那是逐条结果"
+        assert data["dropped"] == 1
+        assert len(data["failed"]) == 1
+        assert data["failed"][0]["reason"]
+        assert seeded.task_repo.get(good.id).state.value == "dropped"
+
+    def test_empty_ids_rejected(self, served, seeded):
+        status, data = post(served[0], "/api/tasks/drop", {"ids": []})
+        assert status == 400 and "ids" in data["error"]
+
+    def test_non_list_rejected(self, served, seeded):
+        status, data = post(served[0], "/api/tasks/drop", {"ids": "abc"})
+        assert status == 400
+
+    def test_over_limit_rejected(self, served, seeded):
+        from freeagent.web.endpoints_write import MAX_BATCH_DROP
+        work = seeded.roles.get_by_name("工作项目A")
+        t = seeded.tasks.create("占位", [work.id])
+        ids = [t.id] * (MAX_BATCH_DROP + 1)
+        status, data = post(served[0], "/api/tasks/drop", {"ids": ids})
+        assert status == 400 and "最多" in data["error"]
+
+    def test_each_drop_still_auditable(self, served, seeded):
+        """批量也必须逐条落记录 —— 审计链不能因批量断掉。"""
+        work = seeded.roles.get_by_name("工作项目A")
+        t = seeded.tasks.create("留痕", [work.id])
+        post(served[0], "/api/tasks/drop", {"ids": [t.id]})
+        types = [r.type.value for r in seeded.record_repo.list_for_task(t.id)]
+        assert "status_change" in types
+
+
+class TestFactoryResetEndpoint:
+    """恢复出厂端点：口令闸、服务闸、成功路径全删、脉络保留。
+
+    服务检测一律 monkeypatch 掉（真机那两条由 test_reset.py 守）——
+    这里要造的是「服务没在跑」的成功路径与「服务在跑」的拒绝路径，
+    两者都不该依赖开发机上恰好有什么进程。
+    """
+
+    def _patch_services(self, monkeypatch, running):
+        monkeypatch.setattr(
+            "freeagent.services.reset.running_services", lambda: list(running)
+        )
+
+    def test_wrong_phrase_is_400_and_shows_the_phrase(
+            self, served, seeded, monkeypatch) -> None:
+        self._patch_services(monkeypatch, [])
+        status, data = post(served[0], "/api/system/reset-data",
+                            {"phrase": "不对的口令"})
+        assert status == 400
+        # 拒绝消息必须带上正确口令 —— 界面要靠它提示用户输什么
+        assert "我确定清空所有事务数据" in data["error"]
+
+    def test_refuses_when_services_running(
+            self, served, seeded, monkeypatch) -> None:
+        self._patch_services(monkeypatch, ["委派执行器（freeagent.delegate）"])
+        status, data = post(
+            served[0], "/api/system/reset-data",
+            {"phrase": "我确定清空所有事务数据"},
+        )
+        assert status == 400
+        assert "执行器" in data["error"]
+        # 什么都没删
+        assert len(seeded.task_repo.list_all()) > 0
+
+    def test_success_wipes_tasks_keeps_roles_and_backs_up(
+            self, served, seeded, monkeypatch, tmp_path) -> None:
+        self._patch_services(monkeypatch, [])
+        before_roles = {r.id for r in seeded.role_repo.list_all()}
+        before_tasks = len(seeded.task_repo.list_all())
+        assert before_tasks > 0
+        status, data = post(
+            served[0], "/api/system/reset-data",
+            {"phrase": "我确定清空所有事务数据"},
+        )
+        assert status == 200, data
+        assert data["deleted"]["tasks"] == before_tasks
+        # 备份存在且在库目录里
+        from pathlib import Path as _P
+        backup = _P(data["backup"])
+        assert backup.is_file() and ".bak-factory-" in backup.name
+        assert data["restore_hint"]
+        # 事务没了、角色还在
+        assert seeded.task_repo.list_all() == []
+        assert {r.id for r in seeded.role_repo.list_all()} == before_roles
+
+
+class TestServicesEndpoint:
+    """后台服务端点：状态查询 + 启停（进程一律 mock，不碰真服务）。"""
+
+    def _patch(self, monkeypatch, table):
+        monkeypatch.setattr("freeagent.services.svcs._scan", lambda: table)
+
+    def test_get_returns_both_services(self, served, monkeypatch) -> None:
+        self._patch(monkeypatch, {"bridge": [], "executor": []})
+        status, data, _h = get(served[0], "/api/services")
+        assert status == 200
+        assert data["kind"] == "services"
+        keys = [i["key"] for i in data["items"]]
+        assert keys == ["bridge", "executor"]
+        assert all(i["running"] is False for i in data["items"])
+
+    def test_get_shows_running_pid(self, served, monkeypatch) -> None:
+        self._patch(monkeypatch, {
+            "bridge": [(555, "python -m freeagent.feishu.bridge")],
+            "executor": [],
+        })
+        _status, data, _h = get(served[0], "/api/services")
+        bridge = data["items"][0]
+        assert bridge["running"] is True and bridge["pid"] == 555
+        assert "bridge" in bridge["cmdline"]
+
+    def test_stop_when_stopped_is_400(self, served, monkeypatch) -> None:
+        self._patch(monkeypatch, {"bridge": [], "executor": []})
+        status, data = post(served[0], "/api/services/bridge/stop", {})
+        assert status == 400
+        assert "本来就没在跑" in data["error"]
+
+    def test_stop_kills_and_returns_state(self, served, monkeypatch) -> None:
+        killed: list[int] = []
+        self._patch(monkeypatch, {
+            "bridge": [(777, "python -m freeagent.feishu.bridge")],
+            "executor": [],
+        })
+        monkeypatch.setattr("freeagent.services.svcs._kill",
+                            lambda pid: killed.append(pid))
+        status, data = post(served[0], "/api/services/bridge/stop", {})
+        assert status == 200
+        assert killed == [777]
+        assert "已停止" in data["message"]
+
+    def test_unknown_action_is_400(self, served, monkeypatch) -> None:
+        self._patch(monkeypatch, {"bridge": [], "executor": []})
+        status, data = post(served[0], "/api/services/bridge/dance", {})
+        assert status == 400 and "不认识的动作" in data["error"]
+
+    def test_hermes_not_manageable(self, served, monkeypatch) -> None:
+        """未接线的执行器不给按钮 —— 端点同样拒绝。"""
+        self._patch(monkeypatch, {"bridge": [], "executor": []})
+        status, data = post(served[0], "/api/services/hermes/start", {})
+        assert status == 400
+
+
 class TestSecurity:
     def test_refuses_non_loopback_bind(self, app: App):
         for host in ("0.0.0.0", "192.168.1.10", "::"):
@@ -717,6 +887,69 @@ class TestSettings:
             monkeypatch.delenv(name, raising=False)
         _status, data, _h = get(served[0], "/api/settings")
         assert data["overridden_by_env"] == []
+
+
+class TestChatBubbleStyle:
+    """气泡的三条静态守卫（C1）。
+
+    背景：``.bubble`` 原先只有一条 ``white-space``，于是长串不折行、
+    ``kind-answer`` 的 border-color 是空操作、``kind-cannot`` 的
+    ``background: var(--card-2)`` 引用了一个**从未定义**的变量 ——
+    三处全是「CSS 写了但浏览器静默丢弃」，DOM/结构测试永远抓不到。
+    这里直接钉样式表源码。
+    """
+
+    @staticmethod
+    def _rule(selector: str) -> str:
+        """从拍平后的样式表里取出一个规则体（含选择器）。"""
+        flat = " ".join(STYLE_CSS.split())
+        start = flat.find(selector + " {")
+        assert start >= 0, f"样式表里没有 {selector} 规则"
+        end = flat.find("}", start)
+        assert end >= 0, f"{selector} 规则没闭合"
+        return flat[start:end + 1]
+
+    def test_every_css_var_is_defined(self):
+        """每个 ``var(--x)`` 都必须有定义 —— 引用未定义变量是静默失败。
+
+        这正是 ``--card-2`` 踩过的坑：``kind-cannot`` 的背景色引用了它，
+        而它在两个主题里都没定义，于是背景**从来没有渲染过**，
+        测试全绿、浏览器也不报错。
+        """
+        defined = set(re.findall(r"(--[A-Za-z0-9-]+)\s*:", STYLE_CSS))
+        used = set(re.findall(r"var\(\s*(--[A-Za-z0-9-]+)", STYLE_CSS))
+        missing = used - defined
+        assert not missing, f"这些变量被引用但从未定义：{sorted(missing)}"
+
+    def test_bubble_wraps_long_tokens(self):
+        """长的不可断串必须折行：``overflow-wrap`` + ``word-break`` 一起。
+
+        只给 ``pre-wrap`` 不断长串；CJK/ASCII 混排的无空格长句
+        （如「如何安排OpenCode完成任务?」）会横向撑破气泡。"""
+        rule = self._rule(".msg .bubble")
+        assert "overflow-wrap: break-word" in rule, "气泡缺 overflow-wrap"
+        assert "word-break: break-word" in rule, "气泡缺 word-break"
+        assert "min-width: 0" in rule, "气泡缺 min-width:0（收缩不了就会溢出）"
+
+    def test_bubble_has_visible_background_and_border(self):
+        """气泡 base 必须自带 border/padding/背景 —— 否则各 kind 的覆盖全是空操作。
+
+        ``kind-answer`` 只写 ``border-color``、``kind-cannot`` 只写
+        ``background``，两者都依赖 base 提供 border-width / 背景。
+        """
+        rule = self._rule(".msg .bubble")
+        assert "border: 1px solid var(--line)" in rule, "气泡缺 base 边框"
+        assert "background: var(--card)" in rule, "气泡缺 base 背景"
+        assert "padding:" in rule, "气泡缺内边距（贴边文字没法看）"
+        # 覆盖用的变量必须已定义
+        assert "--card-2:" in " ".join(STYLE_CSS.split()), (
+            "kind-cannot/kind-help 引用的 --card-2 没定义"
+        )
+
+    def test_chatlog_hides_horizontal_overflow(self):
+        """``.chatlog`` 是滚动容器：``overflow-x: hidden`` 挡住横向裁切/溢出。"""
+        rule = self._rule(".chatlog")
+        assert "overflow-x: hidden" in rule, ".chatlog 缺 overflow-x: hidden"
 
 
 class TestCreateRejectsQuestions:

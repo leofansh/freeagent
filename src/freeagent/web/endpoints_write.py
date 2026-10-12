@@ -19,7 +19,12 @@ from ..services.llm import InputIntent, read_intent
 from . import serialize_api
 from .endpoints_read import resolve_task, role_names, task_state
 
-__all__ = ["create_task", "mutate"]
+__all__ = ["create_task", "mutate", "drop_tasks"]
+
+#: 单次批量「算了」的上限。不是性能考量（服务层逐条很快），而是**界面
+#: 语义**：一次勾几十条然后一把全算了，手滑的成本太高；真有大扫除需求
+#: 的人可以分几次点。上限数字本身没有技术含义。
+MAX_BATCH_DROP = 100
 
 
 def create_task(app: App, payload: dict) -> dict:
@@ -77,6 +82,62 @@ def create_task(app: App, payload: dict) -> dict:
         "task": serialize_api.task_payload(
             app.restore.build_view(created), role_names(app)
         )["task"],
+    }
+
+
+def drop_tasks(app: App, payload: dict) -> dict:
+    """批量「算了」。**规则全部在服务层**，这里只做参数与汇总。
+
+    为什么单独一个端点而不是复用 ``mutate`` 循环调：批量要有整体上限、
+    逐条结果汇总和一句话总结，这些是批量语义的一部分。而状态迁移的
+    合法性仍然只有服务层一处（``app.tasks.drop_many`` → ``drop`` →
+    ``set_state``）—— 这里不查表、不判定迁移，只转发与汇总。
+    """
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise FreeAgentError("ids 必须是非空列表")
+    cleaned: list[str] = []
+    for raw in raw_ids:
+        rid = str(raw).strip()
+        if rid:
+            cleaned.append(rid)
+    if not cleaned:
+        raise FreeAgentError("ids 里没有有效的事务 id")
+    if len(cleaned) > MAX_BATCH_DROP:
+        raise FreeAgentError(
+            f"一次最多 {MAX_BATCH_DROP} 条，收到 {len(cleaned)} 条"
+        )
+    reason = payload.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise FreeAgentError("reason 只能是字符串")
+
+    # 整批一把锁：批量是「一次操作」，不该和别的写请求交错成
+    # 「A 线程落了 3 条、B 线程落了 2 条」的中间态。
+    with app.lock:
+        items = app.tasks.drop_many(
+            cleaned, reason=(reason or None) if reason else None
+        )
+    done = [it for it in items if it.ok]
+    failed = [it for it in items if not it.ok]
+    return {
+        "kind": "batch_drop",
+        "dropped": len(done),
+        "failed": [
+            {"id": it.id, "title": it.title, "reason": it.reason}
+            for it in failed
+        ],
+        "summary": (
+            f"已算了 {len(done)} 条"
+            + (f"，{len(failed)} 条没成" if failed else "")
+            + (
+                "：" + "；".join(
+                    f"{(it.title or it.id[:8])}（{it.reason}）"
+                    for it in failed[:3]
+                )
+                if failed
+                else ""
+            )
+        ),
     }
 
 

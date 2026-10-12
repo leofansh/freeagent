@@ -1,31 +1,15 @@
 """对话界面。
 
-
+存取相关的 ``chatDay`` / ``chatLoad`` / ``chatSave`` / ``clearHistory``
+与两个状态变量在 **:mod:`js_chat_store`** —— 那是另一个职责（刷新后还在不在），
+拆开是为了守住 250 行的体积守卫。
 """
 
 from __future__ import annotations
 
 __all__ = ["JS_CHAT"]
 
-JS_CHAT = r"""const CHAT_KEY = "freeagent.chat.v1";
-let lastItemIds = [];      // 上一轮答复里的事务 id，用来接「第二个」这类指代
-
-function chatLoad() {
-  try {
-    const raw = localStorage.getItem(CHAT_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    return Array.isArray(data) ? data : null;
-  } catch (e) { return null; }
-}
-
-function chatSave(messages) {
-  try {
-    localStorage.setItem(CHAT_KEY, JSON.stringify(messages.slice(-60)));
-  } catch (e) { /* 隐私模式下写不了就算了，不影响主功能 */ }
-}
-
-function chatScroll() {
+JS_CHAT = r"""function chatScroll() {
   const log = $("#chatlog");
   if (log) log.scrollTop = log.scrollHeight;
 }
@@ -62,8 +46,15 @@ function chatItems(items) {
 }
 
 // history 存「文字 + 种类 + 条目摘要」，够恢复上下文与渲染，不必存 HTML
-function addMsg(who, text, cls, items, store) {
+function addMsg(who, text, cls, items, store, meta) {
   const log = $("#chatlog");
+  // 回放历史时把生成日期刷新成当天：日期是生成时冻进文本的，
+  // 服务端不会重渲染已存文本。generated_at 只有「今天」类答复才有；
+  // 老存档没有 meta，判空守卫直接跳过（不改写、不报错）。
+  if (who === "bot" && meta && meta.generated_at &&
+      meta.generated_at !== chatDay() && text.indexOf(meta.generated_at) === 0) {
+    text = chatDay() + text.slice(meta.generated_at.length);
+  }
   const m = el("div", "msg " + (who === "me" ? "me" : "bot " + (cls || "")));
   m.appendChild(el("div", "bubble", esc(text)));
   const box = (who === "bot" && items && items.length) ? chatItems(items) : null;
@@ -71,7 +62,7 @@ function addMsg(who, text, cls, items, store) {
   log.appendChild(m);
   if (store !== false) {
     history_.push({
-      who: who, text: text, cls: cls || "",
+      who: who, text: text, cls: cls || "", meta: meta || null,
       items: (items || []).map((i) => ({
         task_id: i.task_id, title: i.title, state_label: i.state_label,
         total_weight: i.total_weight, reasons: i.reasons || [],
@@ -139,7 +130,7 @@ function renderChatShell(menu) {
   } else {
     history_.forEach((m) => {
       if (m.who === "chips") addChips(m.text, false);
-      else addMsg(m.who, m.text, m.cls, m.items, false);
+      else addMsg(m.who, m.text, m.cls, m.items, false, m.meta);
     });
   }
   if (!history_.length && menu) {
@@ -170,6 +161,11 @@ function buildBar() {
     clear.title = "清掉这段对话（不影响已记的事务）";
     clear.onclick = clearHistory;
     bar.appendChild(clear);
+    // 「多选删除」入口；选择态与删除语义在 js_chat_select（行数守卫）。
+    const pick = el("button", null, "多选删除");
+    pick.title = "勾选要删的消息：删所选，或删到此为止（含这条）";
+    pick.onclick = chatEnterPick;
+    bar.appendChild(pick);
   }
   ta.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -183,13 +179,6 @@ function buildBar() {
     ta.style.height = Math.min(ta.scrollHeight, 140) + "px";
   };
   return bar;
-}
-
-function clearHistory() {
-  history_ = [];
-  lastItemIds = [];
-  try { localStorage.removeItem(CHAT_KEY); } catch (e) {}
-  load("chat");
 }
 
 async function sendChat(preset) {
@@ -210,7 +199,8 @@ async function sendChat(preset) {
     });
     thinking.remove();
     lastItemIds = (reply.items || []).map((i) => i.task_id);
-    addMsg("bot", reply.text, "kind-" + reply.kind, reply.items || []);
+    addMsg("bot", reply.text, "kind-" + reply.kind, reply.items || [], true,
+           { generated_at: reply.generated_at || "", route: reply.route || "" });
     addChips(reply.suggestions);
     if (reply.task_id) {
       try {
@@ -234,5 +224,6 @@ async function loadChat() {
     addMsg("bot", "载入开场白失败：" + e.message, "kind-cannot", null, false);
   }
   loadVisionBar();
+  chatPickPaint();  // 多选删除模式挂复选框；非选择模式时 no-op
 }
 """

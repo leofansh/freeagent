@@ -20,12 +20,14 @@ from __future__ import annotations
 
 from .js_boot import JS_BOOT
 from .js_chat import JS_CHAT
+from .js_chat_select import JS_CHAT_SELECT
+from .js_chat_store import JS_CHAT_STORE
 from .js_core import JS_CORE
 from .js_detail import JS_DETAIL
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
 from .js_delegate_projects import JS_DELEGATE_PROJECTS
-from .js_feishu_control import JS_FEISHU_CONTROL
+from .js_services import JS_SERVICES
 from .js_oc_cards import JS_OC_CARDS
 from .js_oc_selection import JS_OC_SELECTION
 from .js_settings import JS_SETTINGS
@@ -45,7 +47,15 @@ INDEX_HTML = (
         (
             JS_CORE,
             JS_VISION,
+            # chat_store 提供 chatDay/chatLoad/chatSave/clearHistory 与
+            # lastItemIds —— JS_CHAT 与 JS_CHAT_SELECT 都直接用它们，
+            # 所以排在 chat 之前。
+            JS_CHAT_STORE,
             JS_CHAT,
+            # chat_select 只依赖 JS_CHAT 的 history_/chatSave 与 JS_CORE 的
+            # el/toast/load；loadChat 末尾会调它的 chatPickPaint，所以必须
+            # 在 JS_BOOT 之前进页面。
+            JS_CHAT_SELECT,
             # settings_llm 在 settings 之前：后者要调前者的 renderLlmSection。
             # （函数声明会提升，所以其实反了也能跑，但顺序按依赖写，别让人猜。）
             JS_SETTINGS_LLM,
@@ -53,7 +63,6 @@ INDEX_HTML = (
             JS_DETAIL,
             JS_FEISHU,
             JS_FEISHU_CONFIG,
-            JS_FEISHU_CONTROL,
             # delegate_projects 只用 JS_FEISHU_* 里已有的 el/esc/api/toast，
             # 但它自己提供 delegateProjectsView / delegateRestartBanner，
             # 必须在 JS_BOOT 之前进页面 —— boot 里会调用它们。
@@ -63,6 +72,9 @@ INDEX_HTML = (
             # 两块之间顺序按依赖写（声明会提升，反了也能跑，别让人猜）。
             JS_OC_CARDS,
             JS_OC_SELECTION,
+            # services 提供 loadServices（boot 分发 data-view=services 用），
+            # 必须在 JS_BOOT 之前进页面。
+            JS_SERVICES,
             JS_BOOT,
         )
     )

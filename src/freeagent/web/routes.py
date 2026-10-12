@@ -19,11 +19,11 @@ from . import (
     endpoints_delegate_projects,
     endpoints_feishu,
     endpoints_feishu_config,
-    endpoints_feishu_control,
     endpoints_oc_selection,
     endpoints_read,
     serialize,
     serialize_api,
+    endpoints_services,
 )
 
 __all__ = ["READ_ROUTES", "feishu_routes"]
@@ -42,11 +42,11 @@ def feishu_routes() -> dict[str, Callable[..., Any]]:
         "/api/feishu/status": endpoints_feishu.feishu_status,
         "/api/feishu/log": endpoints_feishu.feishu_log,
         "/api/feishu/config": endpoints_feishu_config.feishu_config,
-        # 启停现状（只读）。动作在 POST 侧，见 routes_write。
-        "/api/feishu/bridge": endpoints_feishu_control.feishu_bridge,
         # 委派白名单候选（只读）。**授权动作另走 POST** —— 查是纯观测、
         # 可以随手做；授权是安全边界，得单独一步。见设计文档 12.7.1。
         "/api/delegate/projects": endpoints_delegate_projects.delegate_projects,
+        # 后台服务统一状态（只读）。启停动作在 POST 侧，见 routes_write。
+        "/api/services": endpoints_services.services,
         # OpenCode 四段选项（只读）。选择与清单的**修改**在 POST 侧 ——
         # 理由同委派白名单：查是纯观测，改是配置变更。
         "/api/oc/options": endpoints_oc_selection.oc_options,
