@@ -60,11 +60,17 @@ def store(conn):
 
 class TestMigration:
     def test_version(self):
-        # 13 = 配对码表（11.9.8）。改 SCHEMA_VERSION 时**必须**同步改这里，
-        # 而这条断言存在的意义就是让「加了迁移忘了改版本号」当场暴露 ——
-        # 那个 bug 的症状是「新表不存在」，而迁移循环
-        # ``range(current, SCHEMA_VERSION)`` 会安静地跳过最后一条。
-        assert SCHEMA_VERSION == 13
+        # 14 = stop_requests（第六道闸门「停止这条委派」的落库表）。
+        #
+        # 改 SCHEMA_VERSION 时**必须**同步改这里。踩过的坑（2026-10-12）：
+        # 13 → 14 那一步迁移**加了**、版本号**也加了**，唯独这条断言忘了改，
+        # 于是它红着 —— 而它红的理由（"版本号不对"）与真正的病因
+        # （"该同步的地方漏了一处"）其实是同一件事。
+        #
+        # 这条断言存在的意义：迁移循环是 ``range(current, SCHEMA_VERSION)``，
+        # 版本号与迁移条目任何一边对不上，最后一格就**安静地**被跳过 ——
+        # 症状是「新表不存在」，而没有任何报错指向版本号。
+        assert SCHEMA_VERSION == 14
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}
