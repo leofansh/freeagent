@@ -21,7 +21,10 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .config import FeishuConfig
 
-__all__ = ["FeishuSender", "FeishuError", "urllib_transport", "Transport"]
+__all__ = [
+    "FeishuSender", "FeishuError", "urllib_transport", "Transport",
+    "ProgressCard",
+]
 
 #: ``(url, payload, headers, timeout, method="POST") -> 响应体文本``
 #: 与 ``DeepSeekProvider`` 同一个签名，方便同一套测试替身复用。
@@ -48,6 +51,30 @@ class Transport(Protocol):
         timeout: float,
         method: str = "POST",
     ) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressCard:
+    """一张已投递的进度卡。**两个 id 各管一件事，缺一不可。**
+
+    - ``card_id`` — CardKit **卡片实体** id。流式更新按它定位组件
+      （``PUT /cards/{card_id}/elements/{element_id}/content``）。
+    - ``message_id`` — 这张卡在**聊天里**那条消息的 id。授权卡要挂到它
+      下面靠它（``POST /messages/{message_id}/reply``）。
+
+    ## 为什么不能只留一个、只返回 ``card_id``
+
+    一开始 :meth:`FeishuSender.send_progress_card` 只返回 ``card_id``，
+    而「授权卡聚拢到进度卡下」需要的是 ``message_id``。两个都是 ``str``，
+    **类型上完全分不出来** —— 传错了不会报错，只会让授权卡挂错地方或者
+    挂不上，而那个症状（「授权卡没聚拢」）看起来像功能没做，不像 bug。
+
+    用 :class:`ProgressCard` 把两者绑在一起，让「拿错」变成「属性不存在」。
+    """
+
+    card_id: str
+    message_id: str
+
 
 #: 飞书 tenant_access_token 有效期 2 小时。留 10 分钟余量，
 #: 免得边界上发出一个「已过期」的请求再失败一次。
@@ -317,6 +344,7 @@ class FeishuSender:
         detail: str,
         credential: str,
         ttl_seconds: int,
+        reply_to: str = "",
     ) -> str:
         """发一张**执行期**确认卡，返回 ``message_id``。
 
@@ -331,27 +359,45 @@ class FeishuSender:
         **「只批准这一个动作，下一个动作还会再问」**。同一张卡说两套话
         会让人以为「我允许了这次，后面就都行了」—— 而那恰恰不是事实
         （V1 的 ``always`` 是会话级，我们刻意不映射过去）。
+
+        ## ``reply_to``：把授权卡挂到进度卡下面（设计文档 11.16）
+
+        给了 ``message_id`` 就走 ``POST /messages/{id}/reply``，于是
+        一次委派的全部授权卡聚成**一张进度卡下面的一条回复串**。
+
+        为什么值得这么做 —— 一次委派会产生 N+1 张卡（N 次授权 + 1 张进度），
+        而聊天流是**按发送时刻固定位置**的：进度卡必须最早发（否则没法流式
+        更新），于是它必然被 N 张后发的授权卡压在下面。翻上去才能看到
+        「这次委派到哪了」。
+
+        聚拢之后聊天流里只多 1 张卡，其余在它的回复里，**天然按顺序、
+        天然不被别的东西盖住**，而进度卡原地更新、位置不动。
+
+        **空串时保持原路径**（``send`` 到会话）—— 没有进度卡可挂的场景
+        （没配 ``progress_sender``、发卡失败）必须还能正常发授权卡。
+        闸门不许因为「想好看」而失效。
         """
         if not open_id:
             raise ValueError("发执行期确认卡必须给收件人标识")
-        id_type = self._receive_id_type(open_id)
         card = _tool_card(subject, detail, credential)
+        url, payload, id_type = self._card_delivery(
+            open_id=open_id, content=card, reply_to=reply_to,
+        )
         raw = self._transport(
-            f"{self.config.base_url}/open-apis/im/v1/messages"
-            f"?receive_id_type={id_type}",
-            {
-                "receive_id": open_id,
-                "msg_type": "interactive",
-                "content": json.dumps(card, ensure_ascii=False),
-            },
+            url, payload,
             {"Authorization": f"Bearer {self.token()}"},
             self.timeout,
         )
         body = _decode_twice(raw)
         if body.get("code") != 0:
+            # 说清是哪种发法失败了 —— 两者的排查方向不同：reply 路径
+            # 失败通常是锚点那条消息被撤回了。
+            how = "回复到进度卡" if reply_to else "发到会话"
             raise FeishuError(
-                f"发执行期确认卡失败：code={body.get('code')} msg={body.get('msg')}"
-                f"（收件人={open_id!r} 形态={id_type}）"
+                f"{how}执行期确认卡失败：code={body.get('code')} "
+                f"msg={body.get('msg')}"
+                + (f"（锚点={reply_to!r}）" if reply_to
+                   else f"（收件人={open_id!r} 形态={id_type}）")
             )
         return str(((body.get("data") or {}).get("message_id")) or "")
 
@@ -363,8 +409,17 @@ class FeishuSender:
         detail: str,
         credential: str,
         ttl_seconds: int,
+        reply_to: str = "",
     ) -> str:
         """发一张**提问卡**（agent 在问你），返回 ``message_id``。
+
+        ``reply_to`` 与 :meth:`send_tool_card` 同义：挂到进度卡下面聚拢。
+        这里是**同一段逻辑的第二处复制**，不是遗漏 —— 提问卡与授权卡形状
+        不同（这个没有按钮），但「回复还是新发」的判定完全一致。
+
+        判定抽成 :meth:`_card_delivery`，因为它必须**在两处完全一致**：
+        复制两份的话，改了一处就会出现「授权卡聚拢了、提问卡没有」，
+        而那看起来像功能半成品，不像 bug。
 
         与前两张卡的关键差别：**没有按钮**。
 
@@ -379,27 +434,24 @@ class FeishuSender:
         而不说「不回答也行」的卡，就是一条死路 —— agent 等着，TTL 走完，
         而人根本不知道自己可以拒绝。
         """
-        if not open_id:
+        if not open_id and not reply_to:
             raise ValueError("发提问卡必须给收件人标识")
-        id_type = self._receive_id_type(open_id)
         card = _question_card(subject, detail, ttl_seconds)
+        url, payload, id_type = self._card_delivery(
+            open_id=open_id, content=card, reply_to=reply_to,
+        )
         raw = self._transport(
-            f"{self.config.base_url}/open-apis/im/v1/messages"
-            f"?receive_id_type={id_type}",
-            {
-                "receive_id": open_id,
-                "msg_type": "interactive",
-                "content": json.dumps(card, ensure_ascii=False),
-            },
+            url, payload,
             {"Authorization": f"Bearer {self.token()}"},
             self.timeout,
         )
         body = _decode_twice(raw)
         if body.get("code") != 0:
+            tail = (f"（锚点={reply_to!r}）" if reply_to
+                    else f"（收件人={open_id!r} 形态={id_type}）")
             raise FeishuError(
                 f"发提问卡失败：code={body.get('code')} "
-                f"msg={body.get('msg')}（收件人={open_id!r} "
-                f"形态={id_type}）"
+                f"msg={body.get('msg')}{tail}"
             )
         return str(((body.get("data") or {}).get("message_id")) or "")
 
@@ -423,7 +475,7 @@ class FeishuSender:
         title: str,
         project: str,
         chat_id: str,
-    ) -> str:
+    ) -> "ProgressCard":
         """发一张 CardKit 2.0 流式进度卡片，返回 ``card_id``。
 
         ## 两步，缺一不可（真机踩过，2026-10-12）
@@ -471,10 +523,12 @@ class FeishuSender:
 
         # 第 2 步：真正把它送出去。
         if chat_id:
-            self._send_card_to_chat(chat_id, card_id)
+            message_id = self._send_card_to_chat(chat_id, card_id)
         else:
-            self._send_card_to_user(self._receive_id_type(open_id), open_id, card_id)
-        return card_id
+            message_id = self._send_card_to_user(
+                self._receive_id_type(open_id), open_id, card_id,
+            )
+        return ProgressCard(card_id=card_id, message_id=message_id)
 
     def _send_card_to_chat(self, chat_id: str, card_id: str) -> str:
         """把卡片实体发进会话，返回 ``message_id``。
@@ -488,6 +542,52 @@ class FeishuSender:
     def _send_card_to_user(self, id_type: str, open_id: str, card_id: str) -> str:
         """发私聊。Web 建的委派没有会话，退化走这里。"""
         return self._post_card_message(open_id, id_type, card_id)
+
+    def _card_delivery(
+        self, *, open_id: str, content: dict[str, Any], reply_to: str,
+    ) -> tuple[str, dict[str, object], str]:
+        """算出一张卡的**投递目标**：``(url, payload, id_type)``。
+
+        ## 为什么抽出来
+
+        授权卡与提问卡都要「挂到进度卡下」或「发到会话」这个二选一。
+        复制两份的话，改了一处就会出现「授权卡聚拢了、提问卡没有」——
+        而那看起来像功能半成品，不像 bug，所以很难被发现。
+
+        ## 端点差在哪
+
+        - **reply**：``POST /messages/{message_id}/reply``。**不带
+          ``receive_id_type``** —— 收件人由被回复的那条消息决定，
+          带着它飞书会拒。``reply_in_thread: False`` 是因为私聊没有话题，
+          true 会把被回复的那条也拖进话题串。
+        - **send**：``POST /messages?receive_id_type=…``，收件人在
+          ``receive_id`` 里。
+
+        ``id_type`` 只在 send 路径有意义；reply 路径返回空串 —— 它**只用于
+        报错文案**，而那一支根本不会走到（reply 失败报的是锚点）。
+        """
+        if reply_to:
+            return (
+                f"{self.config.base_url}/open-apis/im/v1/messages"
+                f"/{reply_to}/reply",
+                {
+                    "msg_type": "interactive",
+                    "content": json.dumps(content, ensure_ascii=False),
+                    "reply_in_thread": False,
+                },
+                "",
+            )
+        id_type = self._receive_id_type(open_id)
+        return (
+            f"{self.config.base_url}/open-apis/im/v1/messages"
+            f"?receive_id_type={id_type}",
+            {
+                "receive_id": open_id,
+                "msg_type": "interactive",
+                "content": json.dumps(content, ensure_ascii=False),
+            },
+            id_type,
+        )
 
     def _post_card_message(
         self, receive_id: str, id_type: str, card_id: str,
@@ -697,6 +797,26 @@ def _progress_card(title: str, project: str) -> dict[str, Any]:
     - ``print_strategy: "fast"`` — 快速策略
 
     这些值是飞书文档推荐的默认值，实测效果流畅。
+
+    ## ``update_multi: True`` 不能省（真机踩过，2026-10-12）
+
+    漏掉它时卡片**建得出来、也投递出去了**，但收卡人看不到内容 ——
+    现象是「飞书只有权限审批、没有进展」，而权限卡走普通消息路径不受影响。
+
+    官方对建卡接口的使用限制写得很直接：
+
+        「不支持将卡片设置为**独享卡片模式**。即不支持将卡片 JSON 数据中的
+         ``update_multi`` 属性设置为 ``false``。」
+
+    ``update_multi: false`` 就是独享卡片模式。**不写这个字段时飞书按
+    独享处理**，于是卡片进了只有签发方可见的状态。
+
+    三份独立的参考实现（HKUDS/nanobot、Vibe-Trading、CowAgent）在建卡时
+    都显式带 ``update_multi: True`` + ``wide_screen_mode: True`` ——
+    不是巧合，是这个字段必须显式给。官方文档没有把「省略等价于 false」
+    写在明面上，所以**省略是危险的默认值**，不能靠试。
+
+    ``wide_screen_mode`` 同理：进度卡是要给人盯着的，宽屏比窄屏可读。
     """
     return {
         "schema": "2.0",
@@ -704,8 +824,11 @@ def _progress_card(title: str, project: str) -> dict[str, Any]:
             "title": {"tag": "plain_text", "content": title},
         },
         "config": {
+            # **必须显式为 True**（独享卡片模式 = 只有签发方看得见）。
+            "update_multi": True,
+            "wide_screen_mode": True,
             "streaming_mode": True,
-            "summary": {"content": ""},
+            "summary": {"content": f"{title}（进行中）"},
             "streaming_config": {
                 "print_frequency_ms": {
                     "default": 70, "android": 70, "ios": 70, "pc": 70,

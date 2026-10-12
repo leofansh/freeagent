@@ -137,7 +137,7 @@ class _AutoApprovingSender:
         self._store = store
 
     def send_tool_card(self, *, open_id, subject, detail,
-                       credential, ttl_seconds) -> str:
+                       credential, ttl_seconds, reply_to="") -> str:
         self.cards.append({"open_id": open_id, "credential": credential})
         if self._store is not None and self.auto:
             self._store.resolve(credential, self.auto, decided_by=open_id)

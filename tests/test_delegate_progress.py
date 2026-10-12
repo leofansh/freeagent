@@ -33,6 +33,7 @@ import pytest  # noqa: E402
 from freeagent.app import build_app  # noqa: E402
 from freeagent.delegate import (  # noqa: E402
     MIN_PROGRESS_INTERVAL,
+    ProgressCard,
     run_with_tool_gate,
     tool_event_label,
 )
@@ -72,6 +73,8 @@ class _FakeServer:
         # （第一次就踩：时间上限测试红成一个不存在的 bug）。
         self._events = events
         self.replies: list[tuple[str, str]] = list(replies or [])
+        #: 提问答复送回 opencode 的记录。
+        self.question_replies: list[tuple[str, list[list[str]]]] = []
         self.prompts: list[tuple[str, str]] = []
         self.aborted = False
         self.closed = False
@@ -99,26 +102,52 @@ class _FakeServer:
     def reply_permission(self, request_id, decision, *, directory=None) -> None:
         self.replies.append((request_id, decision))
 
+    def reply_question(self, request_id, answers, *, directory=None) -> None:
+        self.question_replies.append((request_id, answers))
+
     def abort(self, session_id) -> None:
         self.aborted = True
 
 
 class _FakeToolSender:
-    """执行期授权卡的替身 —— 自问自答，假装人点了「允许」。"""
+    """执行期授权卡 **与** 提问卡的替身 —— 自问自答，假装人点了「允许」。
 
-    def __init__(self, store: ApprovalStore, *, auto: Decision = "allow") -> None:
+    两个方法在**同一个替身**里，因为 ``run_with_tool_gate`` 的 sender 参数
+    本来就同时当这两种 sender 用（看它的类型标注：``ToolCardSender |
+    QuestionCardSender``）。分开写两个替身会让测试看不出这件事。
+
+    :param answers: 提问的答复，逐题。空元组 = 不答（用来测未答路径）。
+    """
+
+    def __init__(self, store: ApprovalStore, *, auto: Decision = "allow",
+                 answers: tuple[str, ...] = ()) -> None:
         # 显式标成 ``Decision`` 而不是 ``str``：``ApprovalStore.resolve``
         # 收的是 Literal['allow','deny']，传 ``str`` 检查器会报
         # 「str 不能赋给 Literal」。写默认值的子类必须标类型。
         self.auto: Decision = auto
         self.cards: list[dict[str, Any]] = []
         self._store = store
+        self._reply_answer = answers
+        #: 提问卡单独记 —— 它没有按钮，答复走文本，语义与授权卡不同。
+        self.question_cards: list[dict[str, Any]] = []
 
     def send_tool_card(self, *, open_id, subject, detail, credential,
-                       ttl_seconds) -> str:
-        self.cards.append({"open_id": open_id, "credential": credential})
+                       ttl_seconds, reply_to="") -> str:
+        self.cards.append({"open_id": open_id, "credential": credential,
+                           "reply_to": reply_to})
         self._store.resolve(credential, self.auto, decided_by=open_id)
         return "om_test"
+
+    def send_question_card(self, *, open_id, subject, detail, credential,
+                           ttl_seconds, reply_to="") -> str:
+        self.question_cards.append({"open_id": open_id, "subject": subject,
+                                    "credential": credential,
+                                    "reply_to": reply_to})
+        # 答复走 :meth:`ApprovalStore.put_answer` —— 与真桥接同一条路。
+        # 刻意不去构造一个假文本通道：那会让测试测的是替身而不是代码。
+        for text in self._reply_answer:
+            self._store.put_answer(credential, text, answered_by=open_id)
+        return "om_q"
 
 
 class _FakeProgressSender:
@@ -136,12 +165,12 @@ class _FakeProgressSender:
         self.fail_send = fail_send
         self.fail_update = fail_update
 
-    def send_progress_card(self, *, open_id, title, project, chat_id) -> str:
+    def send_progress_card(self, *, open_id, title, project, chat_id):
         if self.fail_send:
             raise RuntimeError("飞书抖了")
         self.sent.append({"open_id": open_id, "title": title,
                           "project": project, "chat_id": chat_id})
-        return "card-1"
+        return ProgressCard(card_id="card-1", message_id="om_anchor")
 
     def update_progress_text(self, *, card_id, text, sequence) -> None:
         if self.fail_update:
@@ -204,8 +233,12 @@ def store():
 
 
 def _run(store, server, *, progress=None, task=None, clock=None, **kw):
-    """跑一次委派。``clock`` 默认给一个 0 秒起点的假时钟。"""
-    tool_sender = _FakeToolSender(store)
+    """跑一次委派。``clock`` 默认给一个 0 秒起点的假时钟。
+
+    ``tool_sender`` 可以传进来，以便断言发出去的授权卡长什么样
+    （聚拢测试要看 ``reply_to``）。不传就用一个自造的。
+    """
+    tool_sender = kw.pop("tool_sender", None) or _FakeToolSender(store)
     factory = lambda project, command: server  # noqa: E731
     policy = DelegationPolicy(projects=("C:/p",), model="opencode/x")
     return run_with_tool_gate(
@@ -220,6 +253,93 @@ def _run(store, server, *, progress=None, task=None, clock=None, **kw):
         now=(clock or FakeClock()),
         **kw,
     )
+
+
+class TestAuthorizationCardsThreadUnderProgressCard:
+    """授权卡必须挂到**进度卡下面**（设计文档 11.16，方向 A）。
+
+    ## 为什么这不是「好看问题」
+
+    一次委派产生 N+1 张卡（N 次授权 + 1 张进度），而聊天流里每条消息的
+    位置由**发送时刻**固定：进度卡必须最早发（否则没法流式更新），于是
+    它必然被 N 张后发的授权卡压在下面 —— 要看「这次委派到哪了」就得往上翻。
+
+    聚拢之后聊天流里只多 1 张卡，其余在它的回复串里，天然按顺序、天然
+    不被别的东西盖住。
+    """
+
+    def test_tool_cards_reply_to_the_progress_card(self, store) -> None:
+        clock = FakeClock()
+        prog = _FakeProgressSender()
+        sender = _FakeToolSender(store)
+
+        _run(store, _FakeServer([
+            _asked("p1"), _asked("p2"), ("session.idle", {}),
+        ]), progress=prog, clock=clock, tool_sender=sender)
+
+        assert len(sender.cards) == 2
+        for card in sender.cards:
+            assert card["reply_to"] == "om_anchor", (
+                "授权卡必须挂到进度卡那条消息下面"
+            )
+
+    def test_question_cards_also_thread(self, store) -> None:
+        """提问卡**同样**要聚拢 —— 否则长任务里提问会孤零零留在外面，
+        而那正是最需要上下文的一次提问。"""
+        clock = FakeClock()
+        prog = _FakeProgressSender()
+        sender = _FakeToolSender(store, answers=("只改 README",))
+
+        def _q():
+            # 载荷形状照 **V1 实测**：questions 是**字符串数组**，
+            # 不是带 header/options 的对象数组。解析器遇到不认识���形状
+            # 会整条放弃（宁可响亮失败，也不要残缺的答案），所以这里
+            # 写错形状的表现是「一条卡都没发」，而不是发错。
+            yield ("question.asked", {
+                "id": "que_1", "sessionID": "ses_fake",
+                "questions": ["改哪个？"],
+            })
+            yield ("session.idle", {})
+
+        _run(store, _FakeServer(_q()), progress=prog, clock=clock,
+             tool_sender=sender)
+        assert sender.question_cards, "提问卡应已发出"
+        assert sender.question_cards[0]["reply_to"] == "om_anchor"
+
+    def test_without_progress_card_falls_back_to_plain_send(
+            self, store) -> None:
+        """**没有进度卡时必须照常发授权卡** —— 闸门不许因为「想好看」而失效。
+
+        两条路都要能走：配了进度卡就聚拢，没配（或发卡失败）就退回原路径。
+        """
+        clock = FakeClock()
+        sender = _FakeToolSender(store)
+
+        out = _run(store, _FakeServer([_asked(), ("session.idle", {})]),
+                   progress=None, clock=clock, tool_sender=sender)
+
+        assert out.ok
+        assert len(sender.cards) == 1
+        assert sender.cards[0]["reply_to"] == "", (
+            "没有进度卡就不该有锚点，sender 会退回发到会话"
+        )
+
+    def test_when_progress_card_send_fails_no_anchor(self, store) -> None:
+        """进度卡**发失败**时（降级成无卡片），授权卡仍要正常发出去。
+
+        这条最容易漏：发卡失败被接住之后 ``progress_anchor_id`` 是 None，
+        而 ``or ""`` 那一步正好保证不会把 None 传下去。
+        """
+        clock = FakeClock()
+        prog = _FakeProgressSender(fail_send=True)
+        sender = _FakeToolSender(store)
+
+        out = _run(store, _FakeServer([_asked(), ("session.idle", {})]),
+                   progress=prog, clock=clock, tool_sender=sender)
+
+        assert out.ok, "发进度卡失败不许拖垮委派"
+        assert len(sender.cards) == 1
+        assert sender.cards[0]["reply_to"] == ""
 
 
 # --------------------------------------------------------------------------- #

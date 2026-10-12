@@ -34,6 +34,7 @@ from freeagent.feishu.sender import (  # noqa: E402
     FeishuSender,
     FeishuError,
     _progress_card,
+    _tool_card,
 )
 from freeagent.secrets import SecretStr, as_secret  # noqa: E402
 
@@ -105,6 +106,53 @@ def _make_sender(transport: _Transport) -> FeishuSender:
 # --------------------------------------------------------------------------- #
 # 卡片结构：必须是 2.0
 # --------------------------------------------------------------------------- #
+def test_progress_card_is_not_exclusive():
+    """``update_multi`` 必须显式为 True —— **省略是危险的默认值**。
+
+    ## 为什么这条测试钉死一个「本可以省略」的字段
+
+    真机踩过（2026-10-12）：卡片建得出来、也投递出去了（message_id 有），
+    但**收卡人看不到内容** —— 现象是「飞书只有权限审批、没有进展」。
+    而权限卡走 ``im/v1/messages`` 普通消息路径，不受影响。
+
+    官方对建卡接口的使用限制原文：
+
+        「不支持将卡片设置为**独享卡片模式**。即不支持将卡片 JSON 数据中的
+         ``update_multi`` 属性设置为 ``false``。」
+
+    ``update_multi: false`` 即独享卡片模式。**不写这个字段时飞书按独享处理**
+    —— 文档没写「省略等价于 true」，所以省略就是踩坑。三份独立参考实现
+    （HKUDS/nanobot、Vibe-Trading、CowAgent）建卡时都显式带
+    ``update_multi: True``，不是巧合。
+
+    这类 bug 的恶劣之处在于**每一层都显示成功**：建卡 code=0、投递 code=0、
+    流式更新 code=0、日志零 ERROR。只有人眼睛能看到卡片里有没有东西。
+    """
+    card = _progress_card("标题", "D:/proj")
+    assert card["config"].get("update_multi") is True, (
+        "update_multi 必须显式为 True，否则卡片进独享模式、收卡人看不到"
+    )
+
+
+def test_progress_card_is_wide_screen():
+    """进度卡是给人盯着的，宽屏比窄屏可读。同一处补的另一个字段。"""
+    card = _progress_card("标题", "D:/proj")
+    assert card["config"].get("wide_screen_mode") is True
+
+
+def test_progress_card_summary_is_not_empty():
+    """``summary`` 不能是空串。
+
+    空 summary 时聊天列表里那条消息**没有可读的预览行**，而进度卡的
+    全部价值就在于「不用点开就知道它在动」。
+    """
+    card = _progress_card("改个东西", "D:/proj")
+    assert card["config"]["summary"]["content"].strip(), (
+        "空 summary 会让聊天列表那条没有预览"
+    )
+    assert "改个东西" in card["config"]["summary"]["content"]
+
+
 def test_progress_card_is_json_2_0():
     """进度卡片必须是 JSON 2.0 —— 与本项目其它卡片（1.0）故意不同。"""
     card = _progress_card("标题", "D:/proj")
@@ -141,16 +189,22 @@ def test_progress_card_initial_content_names_the_project():
 # 发送：创建卡片实体
 # --------------------------------------------------------------------------- #
 def test_send_progress_card_returns_card_id():
-    """创建成功要返回 card_id —— 后续更新靠它定位。"""
+    """返回 :class:`ProgressCard` —— card_id 与 message_id **都要拿到**。
+
+    ``card_id`` 给流式更新用（按它定位组件），``message_id`` 给授权卡
+    挂回复用。两个都是 ``str``，混了不报错 —— 所以用 dataclass 绑成
+    一个，让「拿错」变成「属性不存在」。
+    """
     tr = _Transport(
         '{"code":0,"data":{"card_id":"7355439197428236291"}}',
         '{"code":0,"data":{"message_id":"om_1"}}',
     )
     sender = _make_sender(tr)
-    card_id = sender.send_progress_card(
+    card = sender.send_progress_card(
         open_id=WHO, title="标题", project="D:/proj", chat_id=CHAT,
     )
-    assert card_id == "7355439197428236291"
+    assert card.card_id == "7355439197428236291"
+    assert card.message_id == "om_1", "授权卡要靠它挂回复"
     # 建实体是**第一步**，发进会话是第二步（见下面的回归测试）
     assert tr.business_calls[0]["url"].endswith("/open-apis/cardkit/v1/cards")
 
@@ -257,6 +311,109 @@ def test_close_stream_sequence_continues():
 # --------------------------------------------------------------------------- #
 # 真机诊断：HTTP 错误必须带出飞书的 code/msg
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 授权卡聚拢到进度卡下（设计文档 11.16，方向 A）
+# --------------------------------------------------------------------------- #
+class TestToolCardThreadsUnderProgressCard:
+    """授权卡走 ``reply`` 而不是 ``send`` —— 一次委派只多一张卡。"""
+
+    def test_reply_to_uses_the_reply_endpoint(self) -> None:
+        """给了锚点就必须打 ``/messages/{id}/reply``。"""
+        tr = _Transport('{"code":0,"data":{"message_id":"om_r"}}')
+        sender = _make_sender(tr)
+        sender.send_tool_card(
+            open_id=WHO, subject="改 x.py", detail="+1",
+            credential="cred-1", ttl_seconds=600, reply_to="om_anchor",
+        )
+        call = tr.business_calls[-1]
+        assert "/open-apis/im/v1/messages/om_anchor/reply" in call["url"]
+
+    def test_reply_path_drops_receive_id_type(self) -> None:
+        """reply 路径**不能**带 ``receive_id_type``。
+
+        收件人由被回复的那条消息决定，带着这个 query 飞书会拒 —— 而拒的
+        表现是「授权卡发不出去」，那正是闸门失效的形态。
+        """
+        tr = _Transport('{"code":0,"data":{"message_id":"om_r"}}')
+        sender = _make_sender(tr)
+        sender.send_tool_card(
+            open_id=WHO, subject="s", detail="d", credential="c",
+            ttl_seconds=600, reply_to="om_anchor",
+        )
+        url = tr.business_calls[-1]["url"]
+        assert "receive_id_type" not in url
+        # 也**不该**有 receive_id —— 那一栏在 reply 路径没有意义。
+        assert "receive_id" not in tr.business_calls[-1]["payload"]
+
+    def test_reply_in_thread_is_false(self) -> None:
+        """``reply_in_thread`` 给 False。
+
+        true 会把**被回复的那条也拖进话题串**，而私聊没有话题 —— 于是
+        进度卡自己被卷进话题，用户要找它反而更麻烦。给 False 才是普通的
+        「回复」，卡片留在原位、位置不动。
+        """
+        tr = _Transport('{"code":0,"data":{"message_id":"om_r"}}')
+        sender = _make_sender(tr)
+        sender.send_tool_card(
+            open_id=WHO, subject="s", detail="d", credential="c",
+            ttl_seconds=600, reply_to="om_anchor",
+        )
+        assert tr.business_calls[-1]["payload"]["reply_in_thread"] is False
+
+    def test_empty_reply_to_falls_back_to_send(self) -> None:
+        """**空锚点必须退回原路径** —— 闸门不许因为想好看而失效。
+
+        没有进度卡可挂时（没配 progress_sender、或发卡失败降级），
+        授权卡照发到会话，那条路仍然是通的。
+        """
+        tr = _Transport('{"code":0,"data":{"message_id":"om_s"}}')
+        sender = _make_sender(tr)
+        sender.send_tool_card(
+            open_id=WHO, subject="s", detail="d", credential="c",
+            ttl_seconds=600, reply_to="",
+        )
+        call = tr.business_calls[-1]
+        assert "/reply" not in call["url"]
+        assert "receive_id_type=" in call["url"]
+        assert call["payload"]["receive_id"] == WHO
+
+    def test_question_card_also_threads(self) -> None:
+        """提问卡与授权卡**同一套判定** —— 复制两份的话，改一处就会出现
+        「授权卡聚拢了、提问卡没有」，而那看起来像功能半成品，不像 bug。"""
+        tr = _Transport('{"code":0,"data":{"message_id":"om_q"}}')
+        sender = _make_sender(tr)
+        sender.send_question_card(
+            open_id=WHO, subject="q", detail="d", credential="c",
+            ttl_seconds=600, reply_to="om_anchor",
+        )
+        assert "/open-apis/im/v1/messages/om_anchor/reply" in \
+            tr.business_calls[-1]["url"]
+
+    def test_question_card_falls_back_too(self) -> None:
+        tr = _Transport('{"code":0,"data":{"message_id":"om_q"}}')
+        sender = _make_sender(tr)
+        sender.send_question_card(
+            open_id=WHO, subject="q", detail="d", credential="c",
+            ttl_seconds=600, reply_to="",
+        )
+        assert "/reply" not in tr.business_calls[-1]["url"]
+
+    def test_reply_failure_names_the_anchor(self) -> None:
+        """reply 失败要在报错里说清**锚点**。
+
+        两种发法的排查方向不同：reply 失败通常是锚点那条消息被撤回了，
+        而 send 失败是收件人/权限问题。报错文案混起来会让人查错地方。
+        """
+        tr = _Transport('{"code":230002,"msg":"message not found"}')
+        sender = _make_sender(tr)
+        with pytest.raises(FeishuError) as ei:
+            sender.send_tool_card(
+                open_id=WHO, subject="s", detail="d", credential="c",
+                ttl_seconds=600, reply_to="om_gone",
+            )
+        assert "om_gone" in str(ei.value)
+
+
 class TestHttpErrorKeepsFeishuReason:
     """飞书的 HTTP 400 **必然**带 JSON 错误体说明原因。
 

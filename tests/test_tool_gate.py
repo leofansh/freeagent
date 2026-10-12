@@ -278,11 +278,14 @@ class _FakeSender:
 
     def send_tool_card(
         self, *, open_id: str, subject: str, detail: str,
-        credential: str, ttl_seconds: int,
+        credential: str, ttl_seconds: int, reply_to: str = "",
     ) -> str:
         self.cards.append({"open_id": open_id, "subject": subject,
                            "detail": detail, "credential": credential,
-                           "ttl": ttl_seconds})
+                           "ttl": ttl_seconds,
+                           # 记下锚点，好让测试断言「授权卡挂到进度卡下」
+                           #（设计文档 11.16）。默认空串 = 走原路径发到会话。
+                           "reply_to": reply_to})
         if self._store is not None and self.auto:
             self._store.resolve(credential, self.auto, decided_by=open_id)
         return "om_test"

@@ -253,7 +253,7 @@ class _StopOnSendSender:
         self.store = store
 
     def send_tool_card(self, *, open_id, subject, detail,
-                       credential, ttl_seconds) -> str:
+                       credential, ttl_seconds, reply_to="") -> str:
         self.cards.append(credential)
         self.store.request_stop(credential, by=open_id)
         self.store.resolve(credential, "deny", decided_by=open_id)
@@ -319,7 +319,7 @@ class TestLoopStops:
 
         class _DenyOnly(_StopOnSendSender):
             def send_tool_card(self, *, open_id, subject, detail,
-                               credential, ttl_seconds) -> str:
+                               credential, ttl_seconds, reply_to="") -> str:
                 self.cards.append(credential)
                 self.store.resolve(credential, "deny", decided_by=open_id)
                 return "om_test"
@@ -335,7 +335,7 @@ class TestLoopStops:
 
         class _Allow(_StopOnSendSender):
             def send_tool_card(self, *, open_id, subject, detail,
-                               credential, ttl_seconds) -> str:
+                               credential, ttl_seconds, reply_to="") -> str:
                 self.cards.append(credential)
                 self.store.resolve(credential, "allow", decided_by=open_id)
                 return "om_test"

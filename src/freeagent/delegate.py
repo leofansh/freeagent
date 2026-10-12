@@ -75,6 +75,7 @@ from .services.opencode_server import (
     permission_from_event,
     question_from_event,
 )
+from .feishu.sender import ProgressCard
 
 __all__ = ["Runner", "subprocess_runner", "run_once", "main",
            "ApprovalGate", "Gate", "run_with_tool_gate",
@@ -752,7 +753,7 @@ class ToolCardSender(Protocol):
 
     def send_tool_card(
         self, *, open_id: str, subject: str, detail: str,
-        credential: str, ttl_seconds: int,
+        credential: str, ttl_seconds: int, reply_to: str = "",
     ) -> str: ...
 
 
@@ -766,7 +767,7 @@ class QuestionCardSender(Protocol):
 
     def send_question_card(
         self, *, open_id: str, subject: str, detail: str,
-        credential: str, ttl_seconds: int,
+        credential: str, ttl_seconds: int, reply_to: str = "",
     ) -> str: ...
 
 
@@ -776,11 +777,15 @@ class ProgressCardSender(Protocol):
     与 ToolCardSender / QuestionCardSender 分开声明：进度卡片的语义是
     「持续更新同一个文本组件」，与前两者「发一张等回答的卡」不同。
     合并会让「调用方到底需不需要实现进度更新」这个问题变得要看实现才知道。
+
+    返回 :class:`~freeagent.feishu.sender.ProgressCard` 而不是裸
+    ``card_id``：授权卡要挂到进度卡下面需要的是 ``message_id``，而两个
+    都是 ``str``，传错不报错（详见该类文档）。
     """
 
     def send_progress_card(
         self, *, open_id: str, title: str, project: str, chat_id: str,
-    ) -> str: ...
+    ) -> ProgressCard: ...
 
     def update_progress_text(
         self, *, card_id: str, text: str, sequence: int,
@@ -970,6 +975,11 @@ def run_with_tool_gate(
     # 「关卡片」自己先抛 UnboundLocalError —— 把真正的错误盖掉，
     # 于是「飞书抖了一下」变成一条谁也看不懂的失败。
     progress_msg_id: str | None = None
+    #: 进度卡在**聊天里**那条消息的 id。授权卡挂到它下面靠这个
+    #: （设计文档 11.16）。与 ``progress_msg_id``（CardKit 实体 id）**不是
+    #: 同一个东西**，而两者都是 str —— 所以必须分成两个变量名，
+    #: 拿错不会报错，只会让授权卡挂不上（症状看起来像「功能没做」）。
+    progress_anchor_id: str | None = None
     progress_seq = 0
     last_progress_update: float | None = None
     progress_closed = False
@@ -1121,7 +1131,7 @@ def run_with_tool_gate(
             # 而不是由「这条委派从哪个入口建」决定 —— 后者与收卡人无关。
             if progress_sender is not None:
                 try:
-                    progress_msg_id = progress_sender.send_progress_card(
+                    progress_card = progress_sender.send_progress_card(
                         open_id=approver,
                         title=task.title,
                         project=str(project),
@@ -1142,14 +1152,20 @@ def run_with_tool_gate(
                         getattr(task, "id", "?"), exc_info=True,
                     )
                     progress_msg_id = None
+                    progress_anchor_id = None
                 else:
+                    progress_msg_id = progress_card.card_id
+                    progress_anchor_id = progress_card.message_id
                     # **发卡用掉了 sequence=1**（见 FeishuSender 的创建载荷），
                     # 所以第一次更新必须从 2 起。写成 1 的话第一次更新会被
                     # 飞书判成时序倒流，而表现是「内容静默不更新」——
                     # 卡停在那句「正在启动」上，没有任何报错。
                     progress_seq = 2
-                    log.info("【执行期】已发进度卡片：task=%s card_id=%s",
-                             getattr(task, "id", "?"), progress_msg_id[:12])
+                    log.info(
+                        "【执行期】已发进度卡片：task=%s card_id=%s anchor=%s",
+                        getattr(task, "id", "?"), progress_card.card_id[:12],
+                        progress_card.message_id[:12],
+                    )
             for kind, props in oc.events():
                 if deadline is not None and now() > deadline:
                     handled.append(
@@ -1179,7 +1195,8 @@ def run_with_tool_gate(
                         log.warning("【执行期】收到认不出的 question.asked：%r", props)
                         continue
                     note = _ask_one_question(oc, q, store=store, sender=sender,
-                                             approver=approver, context=context)
+                                         approver=approver, context=context,
+                                         reply_to=progress_anchor_id or "")
                     if note:
                         handled.append(note)
                     else:
@@ -1225,6 +1242,9 @@ def run_with_tool_gate(
                 decision, credential = _ask_one_tool(
                     oc, req, store=store, sender=sender,
                     approver=approver, context=context,
+                    # 授权卡挂到进度卡下面（设计文档 11.16）。空串时 sender
+                    # 走原路径，所以「没进度卡」不影响授权流程。
+                    reply_to=progress_anchor_id or "",
                 )
                 handled.append(f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}")
                 tool_calls += 1
@@ -1445,6 +1465,7 @@ def _ask_one_question(
     sender: "QuestionCardSender",
     approver: str,
     context: "ApprovalContext",
+    reply_to: str = "",
 ) -> str:
     """问一次（一次问一个），把答复送回 opencode。**返回一句话摘要**。
 
@@ -1484,6 +1505,8 @@ def _ask_one_question(
                     req, slot, ttl_seconds=policy.ttl_seconds),
                 credential=pending.credential,
                 ttl_seconds=policy.ttl_seconds,
+                # 同授权卡：挂到进度卡下面。空串时走原路径。
+                reply_to=reply_to,
             )
         except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成失败
             # 不自己回答：一个人没看见的问题若由程序代答，那是**伪装成人的
@@ -1549,6 +1572,7 @@ def _ask_one_tool(
     sender: "ToolCardSender",
     approver: str,
     context: "ApprovalContext",
+    reply_to: str = "",
 ) -> tuple[str, str]:
     """问一次，回 ``(结论, 凭据)``。**只回结论，不解释** —— 解释是卡片的事。
 
@@ -1580,6 +1604,9 @@ def _ask_one_tool(
             open_id=approver, subject=pending.subject,
             detail=pending.detail or "", credential=pending.credential,
             ttl_seconds=policy.ttl_seconds,
+            # 挂到进度卡下面（聚拢）。空串时 sender 走原路径发到会话，
+            # 所以「没进度卡」这个场景不受影响 —— **闸门不许因为想好看而失效**。
+            reply_to=reply_to,
         )
     except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成拒绝
         log.warning("【执行期】发卡失败（%s）—— 按拒绝处理", exc)

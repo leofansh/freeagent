@@ -119,7 +119,7 @@ class _AnsweringSender:
         self.cards: list[dict[str, Any]] = []
 
     def send_question_card(self, *, open_id, subject, detail, credential,
-                           ttl_seconds) -> str:
+                           ttl_seconds, reply_to="") -> str:
         self.cards.append({"open_id": open_id, "subject": subject,
                            "detail": detail, "credential": credential,
                            "ttl": ttl_seconds})
@@ -133,7 +133,7 @@ class _AnsweringSender:
 
     # permission cards -- must NOT be used by the question path
     def send_tool_card(self, *, open_id, subject, detail, credential,
-                       ttl_seconds) -> str:
+                       ttl_seconds, reply_to="") -> str:
         raise AssertionError("提问路径不该发授权卡")
 
 
