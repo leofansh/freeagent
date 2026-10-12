@@ -25,6 +25,13 @@ venv/
 # 运行时日志（_bridge.log、data/web.log）
 *.log
 
+# 本机运行产物。``data/`` 装的是日志与执行器分页日志，``config.json`` 是
+# opencode 的**本机权限配置**（含本机路径与个人偏好）—— 两者都是这台机器
+# 的状态，不是项目内容。提交它们会让 clone 出来的人莫名多一个空目录，
+# 而 config.json 还会覆盖他自己那份 opencode 配置。
+data/
+config.json
+
 # 批处理变量未展开时留下的字面量目录（FreeAgentProvider 的已知环境隐患）
 %FREEAGENT_HOME%/
 
