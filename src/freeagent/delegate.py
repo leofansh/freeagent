@@ -1498,14 +1498,15 @@ def _ask_one_question(
     collected: list[list[str]] = []
     for slot in range(len(req.questions)):
         try:
-            message_id = sender.send_question_card(
+            message_id = _send_card_threaded(
+                sender.send_question_card,
                 open_id=approver,
                 subject=req.questions[slot],
                 detail=_question_detail(
                     req, slot, ttl_seconds=policy.ttl_seconds),
                 credential=pending.credential,
                 ttl_seconds=policy.ttl_seconds,
-                # 同授权卡：挂到进度卡下面。空串时走原路径。
+                # 同授权卡：挂到进度卡下面，失败则退回（见 _send_card_threaded）
                 reply_to=reply_to,
             )
         except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成失败
@@ -1564,6 +1565,48 @@ def _question_detail(
     return "\n".join(lines)
 
 
+def _send_card_threaded(
+    send: Callable[..., str], *, reply_to: str, **kwargs: Any,
+) -> str:
+    """发一张卡，**优先挂到锚点下，失败则退回独立发送**。返回 ``message_id``。
+
+    ## 为什么必须有这次退回（真机踩过，2026-10-12）
+
+    「reply 到进度卡下」本身引入了一个**新的失效模式**：锚点那条消息一旦被
+    撤回或过期，之后每一次 reply 都会被飞书拒（实测 ``code=99992354
+    The request ... is not a valid open_message_id``）。
+
+    而上游 :func:`_ask_one_tool` 对「发卡失败」的处置是**降级成拒绝** ——
+    这是有意的（卡片送不到就没人能批准，等着必然超时）。两者叠起来的后果是：
+    **整条委派静默停在「已拒绝」，而实际上没有任何人拒绝过任何东西。**
+
+    一次没用的拒绝比一次难看的卡糟糕得多：用户会以为是自己点错了，
+    而真因（锚点没了）没有任何提示。
+
+    ## 为什么退回而不是直接拒绝
+
+    锚点失效只影响**挂哪儿**，不影响**能不能发**。退回独立发送后：
+    卡片照样到人手里、闸门照样工作，只是没聚拢 —— 而没聚拢是**外观损失**，
+    停掉整条委派是**功能损失**。两害相权取轻。
+
+    只在 ``reply_to`` 非空时才重试（那时才可能有锚点）；
+    两次都失败就照旧抛出去，由上游降级成拒绝。
+
+    :param send: 绑定好的发卡函数（``send_tool_card`` / ``send_question_card``）。
+        收成参数是为了让两张卡**共用同一条退回规则** —— 复制两份的话，
+        改了一处就会出现「授权卡会退回、提问卡不会」。
+    """
+    if not reply_to:
+        return send(reply_to="", **kwargs)
+    try:
+        return send(reply_to=reply_to, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - 退回路径要兜住一切
+        log.warning(
+            "【执行期】挂到进度卡下失败（%s）—— 退回独立发送（不再聚拢）", exc,
+        )
+        return send(reply_to="", **kwargs)
+
+
 def _ask_one_tool(
     oc,
     req,
@@ -1600,13 +1643,11 @@ def _ask_one_tool(
         suggested_always=req.suggested_always, context=context,
     )
     try:
-        message_id = sender.send_tool_card(
+        message_id = _send_card_threaded(
+            sender.send_tool_card,
             open_id=approver, subject=pending.subject,
             detail=pending.detail or "", credential=pending.credential,
-            ttl_seconds=policy.ttl_seconds,
-            # 挂到进度卡下面（聚拢）。空串时 sender 走原路径发到会话，
-            # 所以「没进度卡」这个场景不受影响 —— **闸门不许因为想好看而失效**。
-            reply_to=reply_to,
+            ttl_seconds=policy.ttl_seconds, reply_to=reply_to,
         )
     except Exception as exc:  # noqa: BLE001 - 发卡失败必须变成拒绝
         log.warning("【执行期】发卡失败（%s）—— 按拒绝处理", exc)

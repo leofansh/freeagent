@@ -341,6 +341,119 @@ class TestAuthorizationCardsThreadUnderProgressCard:
         assert len(sender.cards) == 1
         assert sender.cards[0]["reply_to"] == ""
 
+    def test_reply_failure_falls_back_to_plain_send(self, store) -> None:
+        """**锚点失效时必须退回独立发送，不许变成拒绝。**
+
+        ## 这条防的是方向 A 自己引入的新失效模式
+
+        锚点那条消息一旦被撤回或过期，之后每次 reply 都会被飞书拒
+        （真机实测 ``code=99992354 is not a valid open_message_id``）。
+        而上游对「发卡失败」的处置是**降级成拒绝** —— 两者叠加的后果是
+        **整条委派静默停在「已拒绝」，而没有任何人拒绝过任何东西**。
+
+        一次没用的拒绝比一次难看的卡糟糕得多：用户会以为是自己点错了，
+        而真因（锚点没了）没有任何提示。
+
+        锚点失效只影响「挂哪儿」，不影响「能不能发」：退回后卡片照样到人
+        手里、闸门照样工作，只是没聚拢 —— 没聚拢是外观损失，停掉委派是
+        功能损失。
+        """
+        clock = FakeClock()
+        prog = _FakeProgressSender()
+
+        class _DeadAnchor(_FakeToolSender):
+            """reply 一律失败（锚点没了），独立发送正常 —— 与真机同形。"""
+
+            def send_tool_card(self, *, open_id, subject, detail,
+                               credential, ttl_seconds, reply_to=""):
+                if reply_to:
+                    raise RuntimeError(
+                        "code=99992354 is not a valid open_message_id"
+                    )
+                return super().send_tool_card(
+                    open_id=open_id, subject=subject, detail=detail,
+                    credential=credential, ttl_seconds=ttl_seconds,
+                    reply_to=reply_to,
+                )
+
+        sender = _DeadAnchor(store)
+        out = _run(store, _FakeServer([_asked(), ("session.idle", {})]),
+                   progress=prog, clock=clock, tool_sender=sender)
+
+        assert out.ok, f"锚点失效不该拖垮委派：{out.summary}"
+        assert len(sender.cards) == 1, "授权卡仍必须发出去"
+        assert sender.cards[0]["reply_to"] == "", "退回后不走 reply"
+        # 关键：真的拿到「允许」，而不是被降级成的 deny
+        assert out.tool_calls and "允许" in out.tool_calls[0], (
+            f"必须是允许而不是被降级成拒绝：{out.tool_calls}"
+        )
+
+    def test_both_paths_failing_still_denies(self, store) -> None:
+        """两次都失败时**必须降级成 deny**，不许出现 allow。
+
+        ## 这里断言的是安全属性，不是结论真假
+
+        两条路都发不出去时，整条委派会继续跑完并报「完成（拒绝 1 次）」，
+        ``ok`` 仍是 True —— 那是既有设计（发卡失败 = 这次动作没被批准，
+        不是「整条委派崩了」）。所以**不断言 ok**，只断言那条真正要命的事：
+        无论卡片送没送到，结论都必须是**拒绝**。
+
+        写成「不许 allow」而不是「不许 ok=True」是有意的：后者会把一个
+        既有的、fail-closed 的正确行为写成回归红线，改动就会有人来「修」
+        它 —— 而修的方向往往是把 fail-open 改回来。
+        """
+        clock = FakeClock()
+        prog = _FakeProgressSender()
+
+        class _AllFail(_FakeToolSender):
+            def send_tool_card(self, **kw):
+                raise RuntimeError("飞书完全不可用")
+
+        sender = _AllFail(store)
+        out = _run(store, _FakeServer([_asked(), ("session.idle", {})]),
+                   progress=prog, clock=clock, tool_sender=sender)
+
+        assert sender.cards == [], "卡片确实一张都没发出去"
+        assert out.tool_calls == ("edit → C:/p/x.txt → 拒绝",), (
+            f"发不出去时必须降级成拒绝，绝不能是允许：{out.tool_calls}"
+        )
+        assert "允许 1 次" not in (out.summary or ""), (
+            f"结论里不许出现「允许」：{out.summary}"
+        )
+
+    def test_question_card_also_falls_back(self, store) -> None:
+        """提问卡**同样**要退回 —— 复制两份规则的话，改一处就会出现
+        「授权卡会退回、提问卡不会」，而那看起来像功能半成品不像 bug。
+        """
+        clock = FakeClock()
+        prog = _FakeProgressSender()
+
+        class _DeadAnchor(_FakeToolSender):
+            def send_question_card(self, *, open_id, subject, detail,
+                                   credential, ttl_seconds, reply_to=""):
+                if reply_to:
+                    raise RuntimeError("code=99992354 bad open_message_id")
+                return super().send_question_card(
+                    open_id=open_id, subject=subject, detail=detail,
+                    credential=credential, ttl_seconds=ttl_seconds,
+                    reply_to=reply_to,
+                )
+
+        def _q():
+            yield ("question.asked", {
+                "id": "que_1", "sessionID": "ses_fake",
+                "questions": ["改哪个？"],
+            })
+            yield ("session.idle", {})
+
+        sender = _DeadAnchor(store, answers=("只改 README",))
+        out = _run(store, _FakeServer(_q()), progress=prog, clock=clock,
+                   tool_sender=sender)
+
+        assert len(sender.question_cards) == 1
+        assert sender.question_cards[0]["reply_to"] == "", "退回后不走 reply"
+        assert out.ok, f"锚点失效不该让提问路径失败：{out.summary}"
+
 
 # --------------------------------------------------------------------------- #
 # 投影：tool_event_label —— 认不出就不显示，绝不猜
