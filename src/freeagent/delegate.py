@@ -359,6 +359,7 @@ def run_once_with_tool_gate(
     policy: DelegationPolicy | None = None,
     dry_run: bool = False,
     sender: "ToolCardSender | None",
+    progress_sender: "ProgressCardSender | None" = None,
     approver: str,
     server_factory: "ServerFactory | None" = None,
 ) -> DispatchReport:
@@ -402,6 +403,7 @@ def run_once_with_tool_gate(
                         task, project,
                         build_brief(task, task.intent, task.definition_of_done),
                         policy=the_policy, store=store, sender=sender,
+                        progress_sender=progress_sender,
                         # 同理：执行期的每一次授权也得知道**谁发起的这条委派**。
                         approver=task_requester(task, approver),
                         server_factory=server_factory,
@@ -675,6 +677,70 @@ def first_meaningful_line(text: str, limit: int = 160) -> str:
     return ""
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """取出 dict，**不是 dict 就当空的**。
+
+    ## 为什么不写 ``x.get("k") if isinstance(x.get("k"), dict) else {}``
+
+    那种写法把 ``get`` 调了两次，而**类型收窄不跨两次调用** —— 检查器在
+    真值那一侧收窄了，取值那一侧拿到的还是 ``X | None``，于是每一个
+    ``.get()`` 都报「可能为 None 的属性」。
+
+    那是**运行绝不会错、类型却过不了**的报错，而本项目禁止
+    ``# type: ignore``。所以这里收窄和取值是同一次调用 ——
+    既过了类型检查，也少一次字典查找。
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def tool_event_label(kind: str, props: Any) -> str:
+    """从一条 SSE 事件里挖出「正在做什么」，挖不出就返回 ``""``。
+
+    ## 为什么宁可显示不出来，也不要显示错
+
+    进度卡片是给人做判断用的。一张写着「正在 read」实际在 write 的卡片，
+    比没有卡片更坏 —— 用户会据此判断「它还在读文件，没在乱改」。所以这里
+    **只接受认得出的形状**，绝不按事件名猜工具。
+
+    ## 为什么认形状而不是认事件名
+
+    OpenCode 的事件类型名随版本变（``tool.execute.before`` /
+    ``message.part.updated`` / ``tool_call`` 都见过），而「载荷里有个
+    ``part.type == "tool"``」这类特征比事件名稳定。所以判据是**载荷形状**，
+    事件名只当辅助。
+
+    :return: 一句话说明（如 ``read D:/a.py``）；不是工具事件则空串。
+    """
+    if not isinstance(props, dict):
+        return ""
+    part = _as_dict(props.get("part"))
+    name = (props.get("tool") or props.get("toolName")
+            or part.get("tool") or part.get("name") or "")
+    if not isinstance(name, str) or not name:
+        return ""
+    # 事件名里带 tool、或工具名就摆在顶层，才算工具事件。两者至少命中
+    # 一个 —— 否则一条 `message.part.updated`（纯文本增量）会被当成
+    # 工具调用报出去，而「显示错」比「不显示」更坏。
+    looks_like_tool = (
+        part.get("type") == "tool"
+        or "tool" in kind.lower()
+        or props.get("tool") is not None
+        or props.get("toolName") is not None
+    )
+    if not looks_like_tool:
+        return ""
+    # 参数在 ``part.state.input`` 里（实测形状），但也有版本放顶层
+    # ``state``。**两个都找** —— 找错了就退化成「正在执行 read」，
+    # 丢掉文件名，而那正是用户唯一想看的部分。
+    state = _as_dict(part.get("state")) or _as_dict(props.get("state"))
+    target = _as_dict(state.get("input")) or _as_dict(state.get("args"))
+    arg = (target.get("filePath") or target.get("path")
+           or target.get("pattern") or target.get("command") or "")
+    if not isinstance(arg, str) or not arg:
+        return f"正在执行 {name}"
+    return f"正在执行 {name}：{arg[:80]}"
+
+
 class ToolCardSender(Protocol):
     """执行期发卡需要的**那一个方法**。
 
@@ -704,6 +770,27 @@ class QuestionCardSender(Protocol):
     ) -> str: ...
 
 
+class ProgressCardSender(Protocol):
+    """进度卡片需要的三个方法。
+
+    与 ToolCardSender / QuestionCardSender 分开声明：进度卡片的语义是
+    「持续更新同一个文本组件」，与前两者「发一张等回答的卡」不同。
+    合并会让「调用方到底需不需要实现进度更新」这个问题变得要看实现才知道。
+    """
+
+    def send_progress_card(
+        self, *, open_id: str, title: str, project: str, chat_id: str,
+    ) -> str: ...
+
+    def update_progress_text(
+        self, *, card_id: str, text: str, sequence: int,
+    ) -> None: ...
+
+    def close_progress_stream(
+        self, *, card_id: str, final_text: str, sequence: int,
+    ) -> None: ...
+
+
 class ServerFactory(Protocol):
     """造一个**隔离的** opencode 服务。
 
@@ -718,8 +805,14 @@ class ServerFactory(Protocol):
 
 
 def _default_server_factory(project: Path, command: str) -> "OpenCodeServer":
-    """生产用的工厂。**没有配置覆盖** —— 隔离是安全属性，不给开关。"""
-    return OpenCodeServer(project=project, executable=command)
+    """生产用的工厂。
+
+    跑**系统 opencode**（真实全局配置 → 用户原生的全局插件 / MCP / 技能，
+    离线、零重装），并用项目级覆盖层强制本项目的审批闸门。不再另起隔离
+    世界去复制用户配置（那样会重装、且离了网就坏）。
+    """
+    return OpenCodeServer(project=project, executable=command,
+                          isolate=False, apply_gate=True)
 
 
 #: 单条委派允许的**工具调用次数**上限（设计文档 12.7.2）。
@@ -735,6 +828,19 @@ def _default_server_factory(project: Path, command: str) -> "OpenCodeServer":
 #: 不该超过这个数。超了**不是失败**，是「这件事该拆开」——所以报错里
 #: 会直接这么说。
 DEFAULT_MAX_TOOL_CALLS = 40
+
+#: 进度卡片的**最小更新间隔**（秒），默认 5 秒。
+#:
+#: 为什么需要节流：飞书 CardKit 流式更新 API 有频率限制（50 次/秒），
+#: 但每条消息更新一次就是一次 HTTP 请求。一个跑 30 分钟的 agent 可能
+#: 问 40 次授权，每次都更新卡片的话就是 40 次请求 —— 不算多，但
+#: 大部分更新用户根本看不出来区别（"正在改第 3 个文件" 和 "正在改
+#: 第 4 个文件" 对人来说差不多）。5 秒间隔足够让用户感知到"它在动"，
+#: 又不会浪费请求配额。
+#:
+#: 关键节点（第一次工具调用、session.idle、session.error、step_capped、
+#: time_capped）立即更新，不受此间隔限制 —— 这些节点用户需要立刻看到。
+MIN_PROGRESS_INTERVAL = 5.0
 
 #: 单条委派的**总时长**上限（秒），默认 30 分钟。
 #:
@@ -759,6 +865,7 @@ def run_with_tool_gate(
     policy: DelegationPolicy,
     store: "ApprovalStore",
     sender: "ToolCardSender | QuestionCardSender | None",
+    progress_sender: "ProgressCardSender | None" = None,
     approver: str,
     server_factory: "ServerFactory | None" = None,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
@@ -782,6 +889,13 @@ def run_with_tool_gate(
 
     **超时即拒绝**（:meth:`ApprovalStore.wait` 的既有语义）。opencode 那侧
     会一直等下去，所以这里必须自己给期限 —— 沉默即拒绝，不是「等下去」。
+
+    ## 进度卡片（设计文档 11.16）
+
+    ``progress_sender`` 非 None 时，在执行前发一张 CardKit 2.0 流式卡片，
+    每次 ``permission.asked`` 更新内容（节流），结束关流式设最终内容。
+
+    为 None 时完全不发卡 —— 向后兼容，不配进度卡片的部署不受影响。
     """
     if sender is None:
         # **必须给出路**，不能只说「不派发」（设计文档 12.7.2 的 R3：
@@ -820,6 +934,14 @@ def run_with_tool_gate(
     #: 总时长超限。与 :data:`DEFAULT_MAX_TOOL_CALLS` **互补**：那个限次数，
     #: 这个限时长。一个一直有动静的 agent 次数上不去，但时间能拖很久。
     time_capped = False
+    #: 会话以 ``session.error`` 收场时的错误对象（``properties`` 原样）。
+    #:
+    #: 真机踩过（2026-10-10）：模型调用被拒（403 FreeTierError）时 opencode
+    #: 发 ``session.error``，而这里原先把 idle / error 无差别 break，循环后
+    #: 的统计标志一个都没命中，于是落到「完成」—— 一次失败的委派在库里
+    #: 长得和成功一模一样，用户被通知「待你验收」而界面上什么都没有。
+    #: 所以 error 必须单独记、单独报。
+    session_error: dict[str, Any] | None = None
     #: 默认 ``monotonic`` 而不是墙钟：墙钟会被 NTP 校时或用户改时间影响，
     #: 那样「已经跑了 30 分钟」可能突然变成负数，于是上限失效。
     #:
@@ -839,6 +961,112 @@ def run_with_tool_gate(
             oc.abort(session_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("中止会话失败（仍将按上限报出）：%s", exc)
+
+    # ── 进度卡片状态（设计文档 11.16）────────────────────────────────
+    #
+    # **刻意提到 try 之外**。这不是为了好看：ServerError / OSError 的
+    # 收口路径也要关闭流式卡片，而那时 `with` 内部已经抛过错。若这些
+    # 变量在 `with` 里才初始化，收口代码读到的就是「未赋值的局部变量」，
+    # 「关卡片」自己先抛 UnboundLocalError —— 把真正的错误盖掉，
+    # 于是「飞书抖了一下」变成一条谁也看不懂的失败。
+    progress_msg_id: str | None = None
+    progress_seq = 0
+    last_progress_update: float | None = None
+    progress_closed = False
+    #: 见过第一个工具事件。第一个**强制**更新（不吃节流）—— 卡片刚发
+    #: 出去时正文只写着「正在启动」，用户需要马上看到它真的动起来了。
+    seen_tool_event = False
+
+    def _note_tool_event(kind: str, props: Any) -> None:
+        """把一条工具事件投影成卡片上的一行「最近操作」。
+
+        **只投影,不判定**。判定「这一步要不要问人」是
+        :func:`permission_from_event` 的事；这里只是「让人看见它在动」。
+        两者混在一起就会出现「为了显示进度而必须理解载荷」—— 而载荷形状
+        随 opencode 版本变，于是每次升级都可能把进度显示弄坏。
+
+        形状认不出就**返回空串**（不显示），而不是猜一个工具名显示错的东西
+        —— 一张写着「正在 read」实际在 write 的卡片，比没有卡片更坏。
+        """
+        nonlocal seen_tool_event
+        label = tool_event_label(kind, props)
+        if not label:
+            return
+        first = not seen_tool_event
+        seen_tool_event = True
+        _update_progress(label, force=first)
+
+    def _card_body(status: str, recent: str) -> str:
+        """进度卡片的正文。**一处成形** —— 形状散在多处就会漂。"""
+        return (
+            f"**项目**：{project}\n\n"
+            f"**状态**：{status}\n\n"
+            f"**最近操作**：{recent}\n\n"
+            f"**工具调用**：{tool_calls} 次（允许 {granted} 次）"
+        )
+
+    def _update_progress(recent: str, *, status: str = "正在执行",
+                         force: bool = False) -> None:
+        """更新进度文本：节流 + 失败只记日志。**一个收口点**。
+
+        ## 失败不许影响执行
+
+        进度卡片是**展示层**。飞书抖动、sequence 冲突、卡片被删 ——
+        任何一种都不该把一次能跑完的委派报成失败。所以这里吞掉一切
+        异常只留日志：这条卡片的命，比不上这次委派的命。
+
+        ## 节流按时间，不按次数
+
+        OpenCode 的工具调用密度不固定（连着读三个文件，也可能静默
+        30 秒）。按次数节流会漏掉「长时间没动静之后的那一次」，
+        而那恰恰是最该让人看到的一次（「它卡住了？」）。
+
+        :param force: 关键节点强制更新（第一个工具事件、提问中、首次授权）。
+        """
+        nonlocal progress_seq, last_progress_update
+        if progress_sender is None or not progress_msg_id:
+            return
+        stamp = now()
+        if (not force and last_progress_update is not None
+                and stamp - last_progress_update < MIN_PROGRESS_INTERVAL):
+            return
+        try:
+            progress_sender.update_progress_text(
+                card_id=progress_msg_id,
+                text=_card_body(status, recent),
+                sequence=progress_seq,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "【执行期】进度卡片更新失败（task=%s）",
+                getattr(task, "id", "?"), exc_info=True,
+            )
+            return
+        progress_seq += 1
+        last_progress_update = stamp
+
+    def _close_progress_stream(final_text: str) -> None:
+        """关闭流式模式并设置最终内容。**幂等**。
+
+        幂等靠 ``progress_closed``：正常收口、异常收口、以及 return 级联
+        都可能走到这里，而重复关闭会让飞书报「sequence 不递增」。
+        """
+        nonlocal progress_seq, progress_closed
+        if progress_sender is None or not progress_msg_id or progress_closed:
+            return
+        progress_closed = True
+        try:
+            progress_sender.close_progress_stream(
+                card_id=progress_msg_id,
+                final_text=final_text,
+                sequence=progress_seq,
+            )
+            progress_seq += 1
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "【执行期】进度卡片关闭失败（task=%s）",
+                getattr(task, "id", "?"), exc_info=True,
+            )
 
     try:
         with make_server(project, policy.command) as oc:
@@ -866,6 +1094,46 @@ def run_with_tool_gate(
                         )
             oc.prompt_async(session_id, brief, model=policy.model,
                             agent=policy.agent, variant=policy.variant)
+            # ── 进度卡片（设计文档 11.16）────────────────────────────────
+            #
+            # 发卡时机：prompt_async 之后、事件循环之前。此时 opencode 已经
+            # 开始跑，但还没产生任何事件 —— 卡片发出去时显示"正在启动..."，
+            # 后续事件来了再更新内容。
+            #
+            # 为什么不在 prompt_async 之前发卡：那时 opencode 还没开始跑，
+            # 卡片发出去会显示"正在启动..."，但用户可能等很久才看到第一次
+            # 更新。放在 prompt_async 之后，卡片发出去时 opencode 已经在跑了，
+            # 第一次更新会很快到来。
+            #
+            # 无 progress_sender 时不发卡 —— 向后兼容，不配进度卡片的部署
+            # 不受影响。
+            if progress_sender is not None and task.delegate_chat_id:
+                try:
+                    progress_msg_id = progress_sender.send_progress_card(
+                        open_id=approver,
+                        title=task.title,
+                        project=str(project),
+                        chat_id=task.delegate_chat_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    # **发卡失败不许变成委派失败。** 展示层挂了就降级成
+                    # 「没卡片」，委派照跑 —— 反过来一次飞书抖动会让代码
+                    # 改动没跑成，而用户完全看不出这两件事的因果关系。
+                    # （FeishuError 不属于 ServerError/OSError，不接住的话
+                    # 它会直接冲出本函数，谁也拦不住。）
+                    log.warning(
+                        "【执行期】发进度卡片失败，降级为无卡片（task=%s）",
+                        getattr(task, "id", "?"), exc_info=True,
+                    )
+                    progress_msg_id = None
+                else:
+                    # **发卡用掉了 sequence=1**（见 FeishuSender 的创建载荷），
+                    # 所以第一次更新必须从 2 起。写成 1 的话第一次更新会被
+                    # 飞书判成时序倒流，而表现是「内容静默不更新」——
+                    # 卡停在那句「正在启动」上，没有任何报错。
+                    progress_seq = 2
+                    log.info("【执行期】已发进度卡片：task=%s card_id=%s",
+                             getattr(task, "id", "?"), progress_msg_id[:12])
             for kind, props in oc.events():
                 if deadline is not None and now() > deadline:
                     handled.append(
@@ -878,7 +1146,13 @@ def run_with_tool_gate(
                     )
                     _abort_quietly(oc)
                     break
-                if kind in ("session.idle", "session.error"):
+                if kind == "session.idle":
+                    break
+                if kind == "session.error":
+                    # 错误收场：只记不 abort —— 会话已经结束了（这是收场事件，
+                    # 不是挂起请求），abort 一个已死的会话没有意义。错误对象
+                    # 留给循环后统一报（见下面的 error 分支）。
+                    session_error = props if isinstance(props, dict) else {}
                     break
                 if kind == "question.asked":
                     # 提问**不计入授权统计**：它不是动作审批，
@@ -900,7 +1174,12 @@ def run_with_tool_gate(
                         break
                     continue
                 if kind != "permission.asked":
-                    # 其它事件（进度、消息）不处理。
+                    # 其它事件（进度、消息）不处理 —— **但工具事件要投影到卡片**
+                    # （设计文档 11.16）。`permission.asked` 只在「要人授权」
+                    # 时才来，而 OpenCode 的多数工具（读文件、检索、glob）是
+                    # 直接放的 —— 只看授权事件，用户看到的就是一段长时间空白，
+                    # 分不清「在干活」和「卡住」。这正是 11.16 要解决的问题。
+                    _note_tool_event(kind, props)
                     continue
                 req = permission_from_event(props)
                 if req is None:
@@ -938,6 +1217,23 @@ def run_with_tool_gate(
                 # **先把答案回给 opencode，再考虑中止** —— 顺序反了会让
                 # 那个挂起的请求没人回，opencode 会一直等着。
                 oc.reply_permission(req.request_id, decision)
+                # ── 进度卡片更新（设计文档 11.16）──────────────────────────
+                #
+                # 每次 permission.asked 都意味着 agent 做了一件工具调用。
+                # 更新卡片内容，但节流 —— 不是每次都更新。
+                #
+                # 关键节点立即更新：第一次工具调用（tool_calls == 1）、
+                # 用户叫停了（下面 if 里）。其它情况按间隔节流。
+                #
+                # 为什么不在事件循环里单独处理 tool_call 事件：
+                # OpenCode SSE 事件流里，permission.asked 就是工具调用的
+                # 信号。虽然事件流里可能有更细的 tool_call / text 事件，
+                # 但那些是"agent 正在思考"的中间状态，不是"agent 做了什么"
+                # 的有效信号。permission.asked 才是用户能感知的进展。
+                _update_progress(
+                    f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}",
+                    force=tool_calls == 1,
+                )
                 # ── 用户叫停了整条委派 ────────────────────────────────────
                 #
                 # 判定放在**回完答案之后**：这一次的授权已经有结论了（拒绝），
@@ -957,9 +1253,59 @@ def run_with_tool_gate(
                     _abort_quietly(oc)
                     break
     except (ServerError, OSError) as exc:
+        # ── 关闭进度卡片流式模式（设计文档 11.16）────────────────────
+        #
+        # 无论成功还是失败，流式模式都必须关闭 —— 不关的话飞书会在 10 分钟后
+        # 自动关闭，那时卡片内容可能还没写完，用户看到的是半截内容。
+        #
+        # 走**同一个** :func:`_close_progress_stream` 收口点，不在这里另抄一份
+        # （抄一份就多一处「两边的 sequence 规则会漂」的地方，而且异常路径
+        # 那一处曾经因为变量在 `with` 内初始化而读不到值）。
+        _close_progress_stream(
+            f"**项目**：{project}\n\n"
+            f"**状态**：授权链路失败\n\n"
+            f"**原因**：{type(exc).__name__}: {exc}"
+        )
         return DispatchOutcome(
             ok=False,
             summary=f"执行期授权链路失败：{type(exc).__name__}: {exc}",
+            session_id=session_id or None,
+            tool_calls=tuple(handled),
+        )
+
+    # ── 收尾：关掉进度卡片（设计文档 11.16）────────────────────────────
+    #
+    # 正常走出循环的统一收口。用与下面 return 级联**同一套判据**决定状态词，
+    # 顺序也一致 —— 用户看到的状态必须与库里落的结论是同一件事。
+    #
+    # 幂等：异常路径已在 except 里关过，这里是 no-op。
+    _final_status = (
+        "会话出错" if session_error is not None
+        else "提问未答" if unanswered
+        else "已叫停" if user_stopped
+        else "步数超限" if step_capped
+        else "时长超限" if time_capped
+        else "已完成"
+    )
+    _close_progress_stream(
+        f"**项目**：{project}\n\n**状态**：{_final_status}\n\n"
+        f"**工具调用**：{tool_calls} 次（允许 {granted} 次）"
+    )
+
+    # 会话级失败**优先于一切统计性结论**。理由：unanswered / user_stopped /
+    # step_capped / time_capped 描述的是「这一轮里发生了什么事」，而 error
+    # 描述的是「这一轮根本没能正常进行」。error 出现时去报「问了 3 次授权」
+    # 是把事故原因藏进了统计数字里 —— 用户在界面上看到「完成（执行期问了
+    # 3 次）」而实际模型一次都没跑成（真机 403 实测）。
+    if session_error is not None:
+        raw = json.dumps(session_error, ensure_ascii=False)
+        reason = (extract_error_message(raw)
+                  or first_meaningful_line(raw)
+                  or "（错误里挖不出可读原因）")
+        return DispatchOutcome(
+            ok=False,
+            summary=f"执行器会话出错：{reason}",
+            detail=raw[:4000],
             session_id=session_id or None,
             tool_calls=tuple(handled),
         )
@@ -1014,7 +1360,7 @@ def run_with_tool_gate(
                 f"  这不是「要做的事太多」，是**这件事卡住了**："
                 f"它一直有动静，所以次数没超，但时间拖到了上限。\n"
                 f"  已完成的改动还在，剩下的没做。可以看一眼它卡在哪，"
-                f"或者调高上限（DEFAULT_MAX_DISPATCH_SECONDS）。"
+                f"或者调高上限（当前 {max_seconds:g} 秒）。"
             ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
@@ -1670,9 +2016,14 @@ def main(argv: list[str] | None = None) -> int:
         # 而闸门要发卡、要人点 —— 在这里发卡会让预演变成一次真请求。
         gate = None if args.dry_run else build_real_gate()
         if args.tool_gate:
+            # 同一个 FeishuSender 实例 —— 它同时实现 ToolCardSender 与
+            # ProgressCardSender 两套方法。刻意只造一个：调两次会各自拿一份
+            # token 缓存、各刷新一次，而它们是同一个东西。
+            _sender = build_feishu_sender()
             report = run_once_with_tool_gate(
                 db_path=args.db, dry_run=args.dry_run, policy=policy,
-                sender=build_feishu_sender(), approver=current_approver(),
+                sender=_sender, approver=current_approver(),
+                progress_sender=_sender,
             )
         else:
             report = run_once(

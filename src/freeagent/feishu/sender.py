@@ -15,19 +15,39 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Mapping, Sequence
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .config import FeishuConfig
 
 __all__ = ["FeishuSender", "FeishuError", "urllib_transport", "Transport"]
 
-#: ``(url, payload, headers, timeout) -> 响应体文本``
+#: ``(url, payload, headers, timeout, method="POST") -> 响应体文本``
 #: 与 ``DeepSeekProvider`` 同一个签名，方便同一套测试替身复用。
 #: token 走 headers 而不是 payload —— payload 更容易被日志意外打印。
 #: ``payload=None`` 表示发 **GET**（见 :func:`urllib_transport`）。
-Transport = Callable[
-    [str, "Mapping[str, object] | None", Mapping[str, str], float], str
-]
+#:
+#: ``method`` 是 CardKit 加上去的：它要 PUT/PATCH，而「payload 空不空」
+#: 只能表达 GET/POST。
+#:
+#: **刻意用 Protocol 而不是 ``Callable[...]``**：``Callable`` 没法表达
+#: 「最后一个参数有默认值」，而 ``method`` **就是**有默认值
+#: （``urllib_transport`` 里写着 ``method: str = "POST"``）。写成
+#: ``Callable`` 且把 5 个参数都标成必填的话，每一个 4 参数的老调用点
+#: 都会被报「还差 1 个位置参数」—— 而那些调用点传 4 个**完全正确**。
+#: 报这种错只会逼人加 ``# type: ignore``，而本项目禁止那玩意。
+class Transport(Protocol):
+    """传输层的契约。``method`` 可省，默认 POST。"""
+
+    def __call__(
+        self,
+        url: str,
+        payload: Mapping[str, object] | None,
+        headers: Mapping[str, str],
+        timeout: float,
+        method: str = "POST",
+    ) -> str: ...
 
 #: 飞书 tenant_access_token 有效期 2 小时。留 10 分钟余量，
 #: 免得边界上发出一个「已过期」的请求再失败一次。
@@ -48,27 +68,55 @@ def urllib_transport(
     payload: Mapping[str, object] | None,
     headers: Mapping[str, str],
     timeout: float,
+    method: str = "POST",
 ) -> str:
-    """标准库 HTTP。``payload=None`` 发 GET，否则发 POST。出错时抛
+    """标准库 HTTP。``payload=None`` 发 GET，否则按 ``method`` 发。出错时抛
     :class:`FeishuError`，**不含 token**。
 
     刻意用「payload 为空」表达 GET，而不是给 Transport 加一个 ``method``
     参数 —— 那个签名是与 ``DeepSeekProvider`` 共享的，加参数会波及
     每一个测试替身。
+
+    ⚠️ 上面那句是**旧注释，已不成立**：CardKit 需要 PUT/PATCH，所以
+    ``method`` 最终还是加上了。保留「payload 为空 = GET」的旧约定只是
+    为了既有调用点不用改；新代码一律显式传 ``method``。
     """
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=body,
         headers={"Content-Type": "application/json", **dict(headers)},
-        method="GET" if body is None else "POST",
+        method="GET" if body is None else method,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        # 只留状态码：错误体里可能带敏感内容，不往异常里塞。
-        raise FeishuError(f"飞书接口 HTTP {exc.code}") from exc
+        # **保留 code / msg，丢掉响应体其余部分**（真机踩过，见下）。
+        #
+        # 原先只留状态码，于是 CardKit 创建卡片失败时报的是
+        # 「飞书接口 HTTP 400」—— 而飞书的 HTTP 400 **必然**带一个
+        # JSON 体说明原因（错误码 9999… 权限不足、200830 卡片结构不合法、
+        # 参数校验失败……）。把它扔掉等于把唯一有用的线索扔掉，
+        # 剩下的「400」查不动：既分不清是没加 CardKit 权限，
+        # 还是卡片 JSON 写错了，更不知道飞书把哪个字段当非法。
+        #
+        # 为什么只挑 code/msg 而不整段带出来：响应体其它字段可能回显
+        # 提交内容。这里要的是**可诊断**，不是把请求内容倒进日志。
+        #
+        # 仍然**绝不带 token**：token 只在请求头里，不在响应体里。
+        try:
+            raw_error = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - 读不到错误体也要报 HTTP 码
+            raw_error = ""
+        detail = ""
+        try:
+            parsed = json.loads(raw_error)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("code") is not None:
+            detail = f" code={parsed.get('code')} msg={parsed.get('msg')}"
+        raise FeishuError(f"飞书接口 HTTP {exc.code}{detail}") from exc
     except urllib.error.URLError as exc:
         raise FeishuError(f"连不上飞书：{exc.reason}") from exc
 
@@ -143,6 +191,34 @@ class FeishuSender:
             self.timeout,
         )
         return _require_ok(raw, f"GET {path}")
+
+    def _cardkit(
+        self, path: str, payload: Mapping[str, object], method: str, what: str,
+    ) -> dict[str, object]:
+        """CardKit（PUT / PATCH）请求。**走注入的 transport**。
+
+        刻意不复用 :meth:`_transport`：那个签名是
+        ``(url, payload, headers, timeout)``、用「payload 空不空」区分
+        GET/POST，而 CardKit 要 PUT/PATCH。所以 method 单独一个参数，
+        由这里显式传。
+
+        仍然走 ``self._transport`` 而不是另起 urllib —— **测试全程离线**
+        这条性质对本类同样成立（离线测试里真发一次网络请求，会以
+        HTTP 400 的形式失败，而那报的是飞书的错、不是我们的错）。
+        """
+        raw = self._transport(
+            f"{self.config.base_url}{path}",
+            payload,
+            {"Authorization": f"Bearer {self.token()}"},
+            self.timeout,
+            method=method,
+        )
+        body = _decode_twice(raw)
+        if body.get("code") != 0:
+            raise FeishuError(
+                f"{what}失败：code={body.get('code')} msg={body.get('msg')}"
+            )
+        return body
 
     # -- 发消息 ------------------------------------------------------------- #
     def send_text(self, chat_id: str, text: str) -> None:
@@ -327,6 +403,138 @@ class FeishuSender:
             )
         return str(((body.get("data") or {}).get("message_id")) or "")
 
+    # -- CardKit 2.0 流式进度卡片（设计文档 11.16） ---------------------- #
+    #
+    # 为什么用 CardKit 2.0 而不是 PUT 更新已发消息：
+    #   PUT /im/v1/messages/{id} 是全量替换，内容瞬间变化，没有流式效果。
+    #   CardKit 2.0 是飞书原生流式卡片协议，支持"打字机"效果，
+    #   且频率限制更宽松（50 次/秒 vs PUT 的 50 次/分钟）。
+    #
+    # 流式模式关键约束（飞书文档实测）：
+    #   - sequence 必须严格递增
+    #   - 流式模式下用户点击按钮会阻塞更新（需先关闭流式再处理回调）
+    #   - 流式模式 10 分钟后自动关闭（建议手动关闭）
+    #   - 卡片 JSON 必须 2.0 结构（schema + body.elements）
+
+    def send_progress_card(
+        self,
+        *,
+        open_id: str,
+        title: str,
+        project: str,
+        chat_id: str,
+    ) -> str:
+        """发一张 CardKit 2.0 流式进度卡片，返回 ``card_id``。
+
+        卡片初始内容包含一个 ``markdown`` 组件（``element_id =
+        "progress_text"``），后续通过 :meth:`update_progress_text`
+        流式更新它的内容。
+
+        ``streaming_mode: true`` 必须在创建时设置，否则后续流式更新
+        会报 ``300309 Card streaming closed``。
+        """
+        if not open_id:
+            raise ValueError("发进度卡片必须给收件人标识")
+        id_type = self._receive_id_type(open_id)
+        card = _progress_card(title, project)
+        raw = self._transport(
+            f"{self.config.base_url}/open-apis/cardkit/v1/cards",
+            {
+                "type": "card_json",
+                "data": json.dumps(card, ensure_ascii=False),
+                "uuid": str(uuid.uuid4()),
+                "sequence": 1,
+            },
+            {"Authorization": f"Bearer {self.token()}"},
+            self.timeout,
+        )
+        body = _require_ok(raw, "创建进度卡片")
+        # ``body.get("data")`` 的类型是 ``object``，不能直接 ``.get()``。
+        # **窄化成 dict 再取** —— 而不是 ``(body.get("data") or {}).get(...)``：
+        # 那种写法在 ``data`` 为 ``None`` 时靠运行期兜底，检查器却看到
+        # ``object`` 没有 ``get``，两条路都别扭。
+        data = body.get("data")
+        card_id = str(data.get("card_id") or "") if isinstance(data, dict) else ""
+        if not card_id:
+            raise FeishuError("创建进度卡片响应里没有 card_id")
+        return card_id
+
+    def update_progress_text(
+        self,
+        *,
+        card_id: str,
+        text: str,
+        sequence: int,
+    ) -> None:
+        """流式更新进度卡片的文本内容。
+
+        ``sequence`` 必须严格递增 —— 飞书用它保证多次更新的时序性。
+        调用方负责维护这个计数器（从 1 开始，每次 +1）。
+
+        频率限制 50 次/秒。调用方负责节流，不要每个事件都调。
+        """
+        raw = self._cardkit(
+            f"/open-apis/cardkit/v1/cards"
+            f"/{card_id}/elements/progress_text/content",
+            {
+                "uuid": str(uuid.uuid4()),
+                "content": text,
+                "sequence": sequence,
+            },
+            method="PUT",
+            what="流式更新进度文本",
+        )
+
+    def close_progress_stream(
+        self,
+        *,
+        card_id: str,
+        final_text: str,
+        sequence: int,
+    ) -> None:
+        """设最终内容并关闭流式模式。**顺序是真机定的，颠倒不行。**
+
+        ## 顺序：先 PUT 内容，再 PATCH 关流式
+
+        1. 先 PUT 设最终内容 —— **此时流式还开着**。
+        2. 再 PATCH 关 ``streaming_mode``。
+
+        ## 为什么不能反过来（真机踩过，2026-10-12）
+
+        我原先按「先关流式、再设内容」写，理由是「关掉之后 PUT 就是普通
+        更新」。真机一跑就报：
+
+            code=300309  ErrMsg: streaming mode is closed
+
+        也就是说 ``PATCH /settings`` 把流式关掉之后，**元素内容接口
+        就不再受理了** —— `elements/{id}/content` 只在流式期间可用。
+        所以关流式必须放在**最后**一步：它是收尾，不是前置。
+
+        ## 为什么不干脆不关
+
+        流式模式 10 分钟后会被飞书自动关闭，而期间**用户点按钮会被阻塞**
+        —— 进度卡上虽然不放按钮，但它占着流式通道。主动关掉是确定的
+        收尾，省得把卡片状态交给一个 10 分钟后的定时器。
+        """
+        # 1. 设最终内容（流式还开着，所以这个 PUT 有效）
+        self.update_progress_text(
+            card_id=card_id, text=final_text, sequence=sequence
+        )
+        # 2. 关流式（必须最后 —— 关掉之后元素内容接口就不再受理）
+        self._cardkit(
+            f"/open-apis/cardkit/v1/cards/{card_id}/settings",
+            {
+                "settings": json.dumps(
+                    {"config": {"streaming_mode": False}}, ensure_ascii=False
+                ),
+                "uuid": str(uuid.uuid4()),
+                # 接在第 1 步那个 PUT 之后 —— sequence 严格递增。
+                "sequence": sequence + 1,
+            },
+            method="PATCH",
+            what="关闭进度卡片流式模式",
+        )
+
     def send_to_allowlist_entry(self, entry: str, text: str) -> None:
         """按白名单条目的**形状**选 ``receive_id_type`` 发私聊。
 
@@ -416,6 +624,53 @@ def _approval_card(subject: str, detail: str, credential: str) -> dict[str, Any]
 #: 不可篡改……而那整套机制是为「授权」设计的，用在这里是**错配**，
 #: 而且凭空多出「卡片过期了但用户还没点」这类失败模式。
 VIEW_CHOICE_ACTION = "run_view"
+
+
+def _progress_card(title: str, project: str) -> dict[str, Any]:
+    """CardKit 2.0 流式进度卡片。
+
+    **必须是 JSON 2.0 结构**（``schema: "2.0"`` + ``body.elements``），
+    且 ``streaming_mode: true`` 必须在创建时设置 —— 否则后续流式更新
+    会报 ``300309 Card streaming closed``。
+
+    卡片只有一个 ``markdown`` 组件（``element_id = "progress_text"``），
+    后续通过 :meth:`FeishuSender.update_progress_text` 流式更新它的内容。
+
+    ``streaming_config`` 控制打字机效果的速度：
+    - ``print_frequency_ms: 70`` — 每 70ms 渲染一帧
+    - ``print_step: 1`` — 每帧输出 1 个字符
+    - ``print_strategy: "fast"`` — 快速策略
+
+    这些值是飞书文档推荐的默认值，实测效果流畅。
+    """
+    return {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "config": {
+            "streaming_mode": True,
+            "summary": {"content": ""},
+            "streaming_config": {
+                "print_frequency_ms": {
+                    "default": 70, "android": 70, "ios": 70, "pc": 70,
+                },
+                "print_step": {
+                    "default": 1, "android": 1, "ios": 1, "pc": 1,
+                },
+                "print_strategy": "fast",
+            },
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "element_id": "progress_text",
+                    "content": f"**项目**：{project}\n\n正在启动...",
+                },
+            ],
+        },
+    }
 
 
 def _question_card(subject: str, detail: str, ttl_seconds: int) -> dict[str, Any]:
@@ -1094,6 +1349,199 @@ def send_select_card(
     return str(((body.get("data") or {}).get("message_id")) or "")
 
 
+#: 委派简报确认卡的点击。与 :data:`SELECT_ACTION` **同族**（无状态、点了就执行），
+#: 但它**消费**桥接进程内存里的一条待填简报 —— 点完这条简报就没了。
+#:
+#: ## 为什么**必须新开**一个 action，不能复用现成的
+#:
+#: 若复用 :data:`COMMAND_ACTION`，其载荷里的 ``cmd`` 会被 bridge 当成命令
+#: **直接执行**（见 ``bridge._run_card_command`` 的设计）。而按钮 ``value``
+#: 是飞书客户端回传的、**用户可以伪造**（转发卡片、手改 JSON）—— 于是
+#: 「点一下」就可能触发一条本人没打算发的命令，包括危险的 ``/delegate``。
+#:
+#: 所以这张卡的载荷**只说点了哪个按钮**，具体要委派什么由桥接自己从内存
+#: 状态里取。这也正是它与 :data:`SELECT_ACTION` 的区别：选卡回传的是
+#: 「选了哪个选项」（数据），这张卡回传的是「点了哪个按钮」（意图），
+#: 内容一律不进载荷 —— 把内容塞进载荷就等于让卡片成为第二份真源，
+#: 而它会被转发、被缓存、会在会话淘汰后与真正的那份不一致。
+BRIEF_CONFIRM_ACTION = "brief_confirm"
+
+
+@dataclass(frozen=True, slots=True)
+class BriefPreview:
+    """确认卡要回显的那几行 —— **一个字段一行**。
+
+    刻意做成一个具名值对象，而不是往 ``brief_confirm_card`` 上堆六个位置
+    参数：这六个值同属一件事（「按当前选择会建出什么」），分开传会让调用点
+    变成一长串猜不出顺序的实参。``frozen=True`` 保证卡片构造期间读到的
+    就是调用时的快照 —— 确认卡的意义是「印出来的就是要执行的」，中途被改
+    就失了这句承诺。
+
+    注意：这是**给人看的预览**，不是载荷。它**不会**进按钮 ``value``
+    （见 :data:`BRIEF_CONFIRM_ACTION` 的说明）。
+    """
+
+    project: str
+    agent: str
+    model: str
+    variant: str
+    role: str
+    brief: str
+
+
+def brief_prompt_card(subject: str, *, chat_id: str) -> dict[str, Any]:
+    """交简报（第 5 步）的**提示卡**：请用户用一句话说清要做的事。
+
+    ⚠️ **必须是 JSON 1.0**（顶层 ``config``/``header``/``elements``），与
+    选卡那一族同版本。官方错误码 200830：2.0 卡不能更新成 1.0，反之亦然，
+    而这一族的卡会走同一条更新回写路径（``_card_action_response``）。
+
+    正文里刻意写明「**一句话**」并附例子，因为本仓有一条硬约束：
+    委派简报**必须单行** —— 提示里只要有换行，opencode 就会判定为
+    「复杂任务」并升级到主 agent 的强模型、**无视 ``--model``**，于是必然
+    失败。把这条约束放在用户点得到的地方，比事后丢回一个看不懂的失败有用。
+
+    只有一个按钮「先不做了」，``choice="cancel"``：中途退出的通道**必须**
+    给，否则用户被卡在第 5 步，只能硬编一句话才能脱身。
+    """
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": subject},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": (
+                "请用**一句话**说清要做的事，例如：\n"
+                "「修一下登录页在窄屏下的按钮错位」。\n"
+                "必须是**单行** —— 多行简报会被 opencode 判成复杂任务，"
+                "升级到强模型、无视你选的模型，必然失败。")}},
+            {"tag": "action", "actions": [
+                {"tag": "button",
+                 "text": {"tag": "plain_text", "content": "先不做了"},
+                 "type": "default",
+                 "value": {"action": BRIEF_CONFIRM_ACTION,
+                           "choice": "cancel", "chat": str(chat_id)}},
+            ]},
+        ],
+    }
+
+
+def brief_confirm_card(
+    subject: str, preview: BriefPreview, *, chat_id: str
+) -> dict[str, Any]:
+    """收到简报后的**确认卡**：回显将建的是什么，并给两个按钮。
+
+    ⚠️ **必须是 JSON 1.0**（同 :func:`select_card`），理由见
+    :func:`brief_prompt_card`。
+
+    ## 载荷里''一个字段都不带''
+
+    两个按钮的 ``value`` 都**只含** ``{action, choice, chat}`` 三个键 ——
+    项目 / 模型 / 工作模式 / 推理档位 / 简报**一个都不进载荷**。理由整个设计
+    的要害见 :data:`BRIEF_CONFIRM_ACTION`：载荷是客户端回传、**可伪造**的，
+    所以只说「点了哪个按钮」，要委派什么由桥接从内存状态里取。载荷里放
+    项目就等于让任何人伪造一个项目路径，绕过项目白名单那唯一一道闸门。
+
+    ## 「脉络」写成**预览**而不是确定归属
+
+    角色推断发生在桥接侧，这里只是把**当前**会怎么归先亮出来，并在括号里
+    注明「可改」——用户点「改一下」就能重说。写成确定归属等于替用户的
+    取舍背书，而那条规则（``infer_roles`` 之类）本就是启发式的、可反驳的。
+    """
+    lines = [
+        f"**项目**：{preview.project}",
+        f"**模型**：{preview.model}",
+        f"**工作模式**：{preview.agent}",
+        f"**推理档位**：{preview.variant}",
+        f"**脉络**：按现有规则会归到「{preview.role}」（可改）",
+        f"**要做的事**：{preview.brief}",
+    ]
+
+    def _btn(label: str, choice: str, primary: bool) -> dict[str, Any]:
+        return {
+            "tag": "button",
+            # 按钮文案上限 40 字，超了被飞书截成看不懂的东西。
+            "text": {"tag": "plain_text", "content": label[:40]},
+            "type": "primary" if primary else "default",
+            "value": {"action": BRIEF_CONFIRM_ACTION, "choice": choice,
+                      "chat": str(chat_id)},
+        }
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": subject},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": "\n".join(lines)}},
+            {"tag": "action", "actions": [
+                _btn("建这条委派", "create", True),
+                _btn("改一下", "retry", False),
+            ]},
+        ],
+    }
+
+
+def send_brief_prompt_card(
+    sender: Any, *, open_id: str, subject: str, chat_id: str
+) -> str:
+    """发简报提示卡，返回 message_id。与 :func:`send_select_card` 同一套发卡实现。"""
+    if not open_id:
+        raise ValueError("发简报提示卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = brief_prompt_card(subject, chat_id=chat_id)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发简报提示卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
+
+def send_brief_confirm_card(
+    sender: Any, *, open_id: str, subject: str, preview: BriefPreview,
+    chat_id: str,
+) -> str:
+    """发简报确认卡，返回 message_id。与 :func:`send_select_card` 同一套发卡实现。"""
+    if not open_id:
+        raise ValueError("发简报确认卡必须给收件人标识")
+    id_type = sender._receive_id_type(open_id)
+    card = brief_confirm_card(subject, preview, chat_id=chat_id)
+    raw = sender._transport(
+        f"{sender.config.base_url}/open-apis/im/v1/messages"
+        f"?receive_id_type={id_type}",
+        {
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        {"Authorization": f"Bearer {sender.token()}"},
+        sender.timeout,
+    )
+    body = _decode_twice(raw)
+    if body.get("code") != 0:
+        raise FeishuError(
+            f"发简报确认卡失败：code={body.get('code')} msg={body.get('msg')}"
+            f"（收件人={open_id!r} 形态={id_type}）"
+        )
+    return str(((body.get("data") or {}).get("message_id")) or "")
+
+
 def _decided_card(subject: str, line: str, *, granted: bool) -> dict[str, Any]:
     """**已处理完**的卡片：绿头/红头，**且没有按钮**。
 
@@ -1200,3 +1648,35 @@ def _require_ok(raw: str, what: str) -> dict[str, object]:
         msg = str(parsed.get("msg") or "（无 msg）")
         raise FeishuError(f"{what}失败：code={code} msg={msg}")
     return parsed
+
+
+def _urllib_cardkit(
+    url: str,
+    payload: Mapping[str, object],
+    headers: Mapping[str, str],
+    timeout: float,
+    method: str,
+) -> str:
+    """真实发 PUT / PATCH 的兜底 transport。
+
+    :func:`urllib_transport` 刻意只支持 GET/POST —— 它的签名与
+    :class:`DeepSeekProvider` 共享，加 ``method`` 参数会波及每一个
+    测试替身。所以 CardKit 走这一个，不复用那个签名。
+
+    ``method`` 显式传，不靠 ``payload`` 是否为空推断 —— PUT/PATCH
+    带 body 是正常的，用「空 body = GET」的约定会把它们全判成 GET。
+    """
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", **dict(headers)},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise FeishuError(f"飞书 CardKit {method} HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise FeishuError(f"连不上飞书：{exc.reason}") from exc

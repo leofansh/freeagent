@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from freeagent.domain import RecordType  # noqa: E402
 from freeagent.services.approval import (  # noqa: E402
     ApprovalStore,
     Decision,
@@ -479,6 +480,83 @@ class TestToolGateLoop:
         )
         assert out.ok is False
         assert "起不来" in out.summary
+
+    # ── session.error 收场的回归（2026-10-10 真机 403 实测）─────────────
+    #
+    # 真机事故：模型调用被拒时 opencode 发 ``session.error``，而
+    # ``run_with_tool_gate`` 原先把 idle / error 无差别 break，循环后的
+    # 统计标志一个都没命中，于是落到 ok=True「完成（未触发授权请求）」——
+    # 一次失败的委派在库里和成功一模一样。以下三条钉住修复。
+
+    #: 实测形状（2026-10-10，免费档模型经 serve 调用被拒）：
+    #: APIError 403 FreeTierError。刻意用**原样**而不是手搓的简写 ——
+    #: 回归测试的价值就在于它拦的是真正出过事的那个形状。
+    _FREE_TIER_ERROR = {
+        "sessionID": "ses_fake",
+        "error": {
+            "name": "APIError",
+            "data": {
+                "message": "OpenCode's free tier can only be used from "
+                           "within OpenCode",
+                "statusCode": 403,
+                "isRetryable": False,
+            },
+        },
+    }
+
+    def test_session_error_is_failure_with_reason(
+            self, store: ApprovalStore) -> None:
+        """``session.error`` → ok=False，且 summary 带**可读错因**。
+
+        为什么断言错因而不只断言 ok：一句没有行动价值的「执行器会话出错」
+        等于没报 —— 用户得知道是「免费档不能这么用」才能去做下一步。
+        """
+        server = _FakeServer([("session.error", self._FREE_TIER_ERROR)])
+        out = self._run(server, _FakeSender(), store)
+        assert out.ok is False
+        assert "free tier" in out.summary
+        assert out.session_id == "ses_fake"
+
+    def test_session_error_beats_permission_stats(
+            self, store: ApprovalStore) -> None:
+        """问过授权 + error 收场 → 报 error，不报「问了 N 次」。
+
+        两者并存时统计数字更显眼（「执行期问了 1 次，允许 1 次」），
+        但它会把事故原因藏起来 —— 那一轮的根本事实是出错了。
+        """
+        server = _FakeServer([
+            _asked("per_1"), ("session.error", self._FREE_TIER_ERROR),
+        ])
+        out = self._run(server, _FakeSender(), store)
+        assert out.ok is False
+        assert "free tier" in out.summary
+        assert "执行期问了" not in out.summary
+
+    def test_session_error_lands_as_failed_record(self, tmp_path) -> None:
+        """落库形状：记录是 ``delegation_failed``，产物正文带错因。
+
+        只断言 DispatchOutcome 不够 —— 用户是在 Web 界面看记录与产物的，
+        那里显示的必须是失败与原因，而不是「待你验收」。
+        """
+        from freeagent.app import build_app
+        from freeagent.delegate import _record_result
+        from freeagent.services.approval import ApprovalStore
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("默认脉络")
+            task = app.tasks.create("测试委派", [role.id], project_path="C:/p")
+            task = app.tasks.start(task.id)
+            server = _FakeServer([("session.error", self._FREE_TIER_ERROR)])
+            out = self._run(server, _FakeSender(), ApprovalStore(app.conn))
+            _record_result(app, task, out)
+            kinds = [r.type for r in app.record_repo.list_for_task(task.id)]
+            assert RecordType.DELEGATION_FAILED in kinds
+            assert RecordType.DELEGATION_SUCCEEDED not in kinds
+            drafts = app.artifacts.list_for_task(task.id)
+            assert drafts, "失败也必须落产物 —— 用户要在界面上看到原因"
+            assert "free tier" in drafts[-1].content
+        finally:
+            app.close()
 
 
 class TestTtlIsOneNumber:
