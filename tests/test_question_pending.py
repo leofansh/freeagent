@@ -60,7 +60,8 @@ def store(conn):
 
 class TestMigration:
     def test_version(self):
-        # 14 = stop_requests（第六道闸门「停止这条委派」的落库表）。
+        # 15 = delegate_progress + pending_approvals.task_id
+        #（WEB 委派实时面板，设计文档 12.8 / V1.35）。
         #
         # 改 SCHEMA_VERSION 时**必须**同步改这里。踩过的坑（2026-10-12）：
         # 13 → 14 那一步迁移**加了**、版本号**也加了**，唯独这条断言忘了改，
@@ -70,7 +71,7 @@ class TestMigration:
         # 这条断言存在的意义：迁移循环是 ``range(current, SCHEMA_VERSION)``，
         # 版本号与迁移条目任何一边对不上，最后一格就**安静地**被跳过 ——
         # 症状是「新表不存在」，而没有任何报错指向版本号。
-        assert SCHEMA_VERSION == 14
+        assert SCHEMA_VERSION == 15
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

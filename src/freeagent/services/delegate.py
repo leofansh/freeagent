@@ -72,6 +72,25 @@ class DelegationPolicy:
     #: 而错配的代价是 OpenCode **不校验**（实测错误 variant 也返回 204），
     #: 于是「推理档选了 High 却没生效」这件事极难排查。
     variant: str = ""
+    #: 插件：委派实例**要不要加载用户的 opencode 插件**。
+    #:
+    #: - ``inherit``（默认）—— 加载，于是用户原生的 MCP（codegraph /
+    #:   context7 / grep_app / lsp / websearch…）、技能、agent 都在。
+    #:   代价是**插件代码在闸门内运行**（``tool.execute.before/after`` 钩子
+    #:   **不受 permission 管**），且本机那个 steering 插件会把 agent 换成
+    #:   它自己的人格、一次回「OK」烧 2 万 input tokens（实测 2026-10-14）。
+    #: - ``off`` —— 加 ``OPENCODE_PURE=1``，opencode 在加载插件前就把它们全丢掉
+    #:   （``src/plugin/index.ts``）。最干净、最省、攻击面最小；代价是插件注入
+    #:   的 MCP 与技能**全部消失**。
+    #:
+    #: 为什么默认 ``inherit`` 而不是更保守的 ``off``：改默认会**静默削掉用户
+    #: 正在用的工具**（本机就有 codegraph），那是功能回退，不该由实现替用户决定。
+    #: 而闸门本身已经失败关闭（11.8.1 的 ``*: ask``），不依赖这个开关来保证安全。
+    #:
+    #: ⚠️ **只认这两个值**，别的（``true`` / ``none`` / ``""``）一律配置校验期
+    #: 报错 —— 猜错一个枚举值的后果是「以为关了插件其实开着」，而那正是最难发现
+    #: 的那种失效。
+    plugins: str = "inherit"
     #: 单次执行超时（秒）。opencode 改一个功能可能要很久，但不该无限等。
     timeout: float = 1800.0
 

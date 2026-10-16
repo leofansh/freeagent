@@ -388,6 +388,17 @@ class PendingApproval:
     #: 为什么不拆成 questions_json + question_count + answers_json 三列：
     #: 那是把同一份事实存三处，任何一处漂移都不太好查。**只存一次。**
     question_spec: str | None = None
+    #: 这条待决项**属于哪条委派事务**（12.8 / V1.35，schema v15）。
+    #:
+    #: 为什么飞书那条链路一直不需要它：授权卡挂在进度卡下面（11.16），
+    #: 「是哪条委派」由那张锚点卡提供，而卡正文只带 subject/detail。
+    #: WEB 面板没有锚点卡，所以它必须从库里**自己**认出来源 ——
+    #: 否则用户看到一张「允许 edit src/foo.py」的卡，不知道批给谁。
+    #:
+    #: **可空，且空是正常态**：加列前写的行没有归属（它们在几分钟内就
+    #: 被答复掉了）；本地操作类待批（services/localops）不来自委派，
+    #: 也一样没有归属。读侧按「空 = 不归属」处理，**不猜**。
+    task_id: str | None = None
 
     @property
     def spec(self) -> dict:
@@ -462,22 +473,27 @@ class ApprovalStore:
         credential: str | None = None,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         requested_by: str | None = None,
+        task_id: str | None = None,
     ) -> PendingApproval:
         """登记一条待确认请求，返回它（含凭据）。
 
         **同一个 subject 重复 ask 会换一个新的凭据**，旧的那条留在库里
         但已经没人会答它。这样「重试一次」是安全的，而不会出现
         「两个有效凭据同时指向同一次授权」的歧义。
+
+        ``task_id`` 是归属（12.8）：谁受益于这个信息，谁就该记得传 ——
+        只有 WEB 实时面板需要它，飞书那条链路至今没传过。
         """
         cred = credential or new_credential()
         now = self._clock()
         expires = now + datetime.timedelta(seconds=ttl_seconds)
         self._conn.execute(
             "INSERT INTO pending_approvals"
-            " (credential, subject, detail, asked_at, expires_at, requested_by)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (credential, subject, detail, asked_at, expires_at, requested_by,"
+            "  task_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (cred, subject, detail, now.isoformat(), expires.isoformat(),
-             requested_by),
+             requested_by, task_id),
         )
         self._conn.commit()
         got = self.get(cred)
@@ -498,6 +514,7 @@ class ApprovalStore:
         credential: str | None = None,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         requested_by: str | None = None,
+        task_id: str | None = None,
     ) -> PendingApproval:
         """登记一条「agent 在提问」，等用户给文本答复。
 
@@ -535,10 +552,10 @@ class ApprovalStore:
         self._conn.execute(
             "INSERT INTO pending_approvals"
             " (credential, subject, detail, asked_at, expires_at,"
-            "  requested_by, kind, question_spec)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'question', ?)",
+            "  requested_by, kind, question_spec, task_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'question', ?, ?)",
             (cred, subject, detail, now.isoformat(), expires.isoformat(),
-             requested_by, spec),
+             requested_by, spec, task_id),
         )
         self._conn.commit()
         got = self.get(cred)
@@ -877,6 +894,46 @@ class ApprovalStore:
                 continue                      # 不是发起人 → 不路由给他
             return item
         return None
+
+    # -- WEB 实时面板的只读入口（12.8 / V1.35）--------------------------- #
+
+    def pending_for_web(self) -> list[PendingApproval]:
+        """**全部**未决且未过期的待决项，按 ``asked_at`` 倒序。
+
+        刻意**不做**「只有 WEB/终端发起者」的过滤 —— 过滤是**显示层**的事
+        （见 12.8「可决范围」：读方全部看到，但只有没有身份声明的那批可决）。
+        这里把「能看见」与「能动手」分开，是为了让调用方**自己**决定展示
+        什么，而不是在存储层替它决定 —— 否则加一个新通道就得改这里，
+        而这条读取的语义（「现在桌上有哪些待决项」）与通道无关。
+
+        过期即排除：过期项在 :meth:`decide` 那里已经等于 ``deny``，
+        显示一条「等你批、其实早就过期了」的卡只会让人点一个无效按钮。
+        口径与 :meth:`decide` 同一份 ``self._clock()``，两处不能各判一次。
+
+        ⚠️ **提问不能只看 ``decision IS NULL``**：提问的答复走
+        ``put_answer``，它填 ``answer_text`` 而**不写** ``decision``，
+        所以一条已经答完的提问在 ``decision`` 这一列上仍然是空的。
+        少这一步过滤，面板上会出现一张「等回答」的问题卡，
+        而那个问题其实早就答完了 —— 于是点进去是个死胡同。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM pending_approvals WHERE decision IS NULL"
+            " ORDER BY asked_at DESC, rowid DESC"
+        ).fetchall()
+        now = self._clock()
+        out: list[PendingApproval] = []
+        for row in rows:
+            item = _row_to_obj(row)
+            if item is None or now >= item.expires_at:
+                continue
+            if item.is_question:
+                answers = item.spec.get("answers") or []
+                # 全空 = 还没开始答；全满 = 已经答完。两种都不该再显示成
+                # 「等回答」，只有中间态（还有空槽）才是真的在等人。
+                if answers and all(answers):
+                    continue
+            out.append(item)
+        return out
     def decide(self, credential: str) -> Decision | None:
         """读结论。**这是唯一该被调用方使用的读法。**
 
@@ -980,6 +1037,7 @@ class ApprovalStore:
         brief: str,
         role: str | None = None,
         context: ApprovalContext | None = None,
+        task_id: str | None = None,
     ) -> PendingApproval:
         """**委派前**登记一条待确认，并返回它（含凭据）。
 
@@ -1015,6 +1073,7 @@ class ApprovalStore:
             credential=new_credential("dp"),   # 前缀 dp = delegation pending
             ttl_seconds=policy.ttl_seconds,
             requested_by=context.who if context else None,
+            task_id=task_id,
         )
 
     # -- 执行期闸门（设计文档 11.8.1）------------------------------------- #
@@ -1026,6 +1085,7 @@ class ApprovalStore:
         diff: str | None = None,
         suggested_always: Sequence[str] = (),
         context: ApprovalContext | None = None,
+        task_id: str | None = None,
     ) -> PendingApproval:
         """**执行期**登记一条待确认：agent 想动手了。
 
@@ -1076,6 +1136,7 @@ class ApprovalStore:
             credential=new_credential("tp"),   # 前缀 tp = tool pending
             ttl_seconds=policy.ttl_seconds,
             requested_by=context.who if context else None,
+            task_id=task_id,
         )
 
     def purge_expired(self, older_than_seconds: int = 86400) -> int:
@@ -1119,4 +1180,6 @@ def _row_to_obj(row) -> PendingApproval:
         question_spec=(
             row["question_spec"] if "question_spec" in row.keys() else None
         ),
+        # 同上（v15 新列）：旧行没有归属就是没有，**不猜**。
+        task_id=(row["task_id"] if "task_id" in row.keys() else None),
     )

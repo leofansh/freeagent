@@ -28,6 +28,8 @@
 from __future__ import annotations
 
 import argparse
+import datetime
+import functools
 import json
 import logging
 import os
@@ -61,7 +63,6 @@ from .services.delegate import (
 )
 from .services.opencode_projects import authorized_names
 from .services.executors import (
-    V2_FIELD_RENAMES,
     adapter_for,
     dispatchable_majors,
     known_majors,
@@ -72,15 +73,18 @@ from .services.opencode_server import (
     ServerError,
     ToolPermission,
     ToolQuestion,
+    detect_adapter,
     permission_from_event,
     question_from_event,
+    stale_gate_note,
 )
 from .feishu.sender import ProgressCard
 
 __all__ = ["Runner", "subprocess_runner", "run_once", "main",
            "ApprovalGate", "Gate", "run_with_tool_gate",
            "ToolCardSender", "ServerFactory",
-           "SUPPORTED_OPENCODE_MAJOR", "KNOWN_OPENCODE_MAJORS",
+           "SUPPORTED_OPENCODE_MAJORS", "SUPPORTED_OPENCODE_MAJOR",
+           "KNOWN_OPENCODE_MAJORS",
            "parse_major_version",
            "detect_opencode_version", "detect_hermes_version",
            "version_mismatch_reason"]
@@ -120,25 +124,27 @@ def resolve_command(command: str) -> str:
     return shutil.which(command) or command
 
 
-#: 本仓**可派发**的 opencode 主版本 —— 由注册表推导，不硬编码。
+#: 本仓**可派发**的 opencode 主版本集合 —— 由注册表推导，不硬编码。
 #:
 #: V1 与 V2 的 permission 模型字段名完全不同（``permission`` 对象 /
 #: ``bash`` / ``task`` vs ``permissions`` 数组 / ``shell`` / ``subagent``），
 #: 而 :mod:`freeagent.services.opencode_server` 要写配置。
-#: **升到 V2 后旧字段会被静默忽略 —— 不报错，但闸门随之失效，
+#: **字段名对不上时旧配置会被静默忽略 —— 不报错，但闸门随之失效，
 #: 失效方向恰好是最危险的那侧**（默认回到 allow）。
 #:
-#: 所以这里朝**关**开：只放行注册表里 ``verified=True`` 的适配器，
-#: 而不是警告后照跑。V2 的适配器**存在但未验证**（数组元素形状官方未给出
-# 可据以接线的定义），所以它拿不到这个值 —— 也就是说**本次改动不改变
-# 任何运行时行为**，只是把「支持哪个版本」从常量变成注册表的一个查询。
+#: 所以放行集合就是**注册表里所有 ``verified=True`` 的适配器**：验证过的
+#: 才允许派发，而不是「认识就照跑」。现在 V1 与 V2 都对着真机验过
+#: （V2 的实测记录见设计文档 11.8.1），所以**两个都放行**；未验证的
+#: （hermes）与不认识的版本仍然 fail-closed（见
+#: :func:`version_mismatch_reason`）。
 #:
-#: 判定见 :func:`parse_major_version` 与 :func:`version_mismatch_reason`。
-#:
-#: 用「取第一个」而不是「取全部」是刻意的：一旦某天 V2 也验证过了，
-#: 这里会变成 2，而闸门仍然只放行 1 —— 那时要**显式**改这一行，
-#: 而不是让「多了一个已验证适配器」自动改变闸门行为。
-SUPPORTED_OPENCODE_MAJOR: int = next(iter(dispatchable_majors("opencode")), 1)
+#: 判定见 :func:`version_mismatch_reason`。
+SUPPORTED_OPENCODE_MAJORS: tuple[int, ...] = dispatchable_majors("opencode")
+
+#: 可派发集合里**最高**的主版本。**只用于给人看的话**（如探不到版本时的
+#: 提示、执行器探针里那句「期望形如 x.x.x」）——放行判定一律用上面的集合。
+#: 若这里被拿去当放行依据，「V1 与 V2 都放行」就会退化成「只认最大那个」。
+SUPPORTED_OPENCODE_MAJOR: int = max(SUPPORTED_OPENCODE_MAJORS, default=1)
 
 #: 本仓**知道**的主版本（不是可派发的）。用于给「不认识的版本」与
 #: 「知道但没验证」两种拒绝各一句**不同且能照着做**的话。
@@ -204,50 +210,51 @@ def detect_hermes_version(command: str = "hermes") -> int | None:
     return _detect_major_by_version_flag(command)
 
 
-def version_mismatch_reason(
-    detected: int | None, expected: int = SUPPORTED_OPENCODE_MAJOR
-) -> str | None:
-    """版本可用则返回 ``None``，否则给一句**能照着做**的原因。
+def version_mismatch_reason(detected: int | None) -> str | None:
+    """版本可派发则返回 ``None``，否则给一句**能照着做**的原因。
 
     探不到版本（``None``）与版本不对同等对待 —— 两者都意味着
     「我们不知道自己在跟什么东西说话」，按设计文档的默认朝关开。
 
-    三种拒绝各给**不同**的话，因为该做的事不同：
+    放行集合是**注册表里所有 ``verified=True`` 的主版本**
+    （:data:`SUPPORTED_OPENCODE_MAJORS`）——V1 与 V2 都对着真机验过，
+    所以两个都放行。四种情形各给**不同**的话，因为该做的事不同：
 
+    - **可派发的版本**（V1 / V2） → 放行
+    - **探不到版本** → 查装没装 / 输出格式
     - **不认识的版本** → 只能升级本仓（或降级执行器）
-    - **认识但未验证**（V2） → 先对着真实实例验完适配器
-    - **就是期望版本** → 放行
+    - **认识但未验证**（hermes） → 先对着真实实例验完适配器
     """
     if detected is None:
+        accepted = "、".join(str(n) for n in SUPPORTED_OPENCODE_MAJORS) or "无"
         return (
-            f"探不到 opencode 版本（期望主版本 {expected}）。"
+            f"探不到 opencode 版本（本仓可派发的主版本：{accepted}）。"
             "可能没装，或 `opencode --version` 输出变了格式。"
+            "本仓不猜 —— 说不上来在跟哪个版本说话时，宁可不派发。"
         )
-    if detected == expected:
+    if detected in SUPPORTED_OPENCODE_MAJORS:
         return None
 
     adapter = adapter_for(detected, "opencode")
     if adapter is None:
         return (
             f"opencode 主版本是 {detected}，本仓**不认识**它"
-            f"（已知的只有 {list(KNOWN_OPENCODE_MAJORS)}，见设计文档 11.8.1 "
-            "的版本陷阱表）。"
+            f"（已知的只有 {list(KNOWN_OPENCODE_MAJORS)}，可派发的有 "
+            f"{list(SUPPORTED_OPENCODE_MAJORS)}，见设计文档 11.8.1 的"
+            "版本陷阱表）。"
             "本仓拒绝派发而不是照跑 —— 未知版本的 permission 字段名会被"
             "**静默忽略**，闸门随之失效，且失效方向是回到 allow。"
             "请升级本仓，或把执行器降回已知版本。"
         )
-    # 认识但 verified=False —— 这就是 V2 当前的状态
+    # 认识但 verified=False —— 当前只有 hermes 会走到这里
     return (
         f"opencode 主版本是 {detected}，本仓**认识**它但**未验证**接线"
         f"（见设计文档 11.8.1 的版本陷阱表）。"
-        "本仓拒绝派发而不是照跑 —— V1→V2 的 permission 字段名全变，"
-        "旧配置会被**静默忽略**，闸门随之失效，且失效方向是回到 allow。\n"
-        f"已知改名：{V2_FIELD_RENAMES}。\n"
-        "未确认的是 `permissions` **数组元素的形状** —— 官方文档未给出"
-        "可据以接线的定义，猜一个『看起来很像对的』形状比拒绝更危险。\n"
-        "要接 V2：对着一个真实 V2 实例实测，改 "
-        "`freeagent/services/executors.py` 里那三个 `_v2_unverified`，"
-        "把 `verified` 改成 True，并同步设计文档 11.8.1。"
+        "本仓拒绝派发而不是照跑 —— 未验证版本的 permission 字段名可能"
+        "**静默忽略**，闸门随之失效，且失效方向是回到 allow。\n"
+        "要接它：对着一个真实实例逐项实测，填 "
+        "`freeagent/services/executors.py` 里对应适配器的形状函数，"
+        "再把 `verified` 改成 True，并同步设计文档 11.8.1。"
     )
 
 
@@ -400,6 +407,13 @@ def run_once_with_tool_gate(
                         the_policy, task.project_path or "",
                         known_names=authorized_names(the_policy.projects),
                     )
+                    # 上次委派被强杀会留下闸门覆盖层（见 ``stale_gate_note``）。
+                    # **只说、不自动删** —— 那份文件是项目级配置、真的在生效，
+                    # 用户多半不知道它在；静默替他删是替他做了没要求的决定。
+                    # 同一个项目只报一次，别在多轮委派里刷屏。
+                    leftover = stale_gate_note(project)
+                    if leftover and leftover not in notes:
+                        notes.append(leftover)
                     outcome = run_with_tool_gate(
                         task, project,
                         build_brief(task, task.intent, task.definition_of_done),
@@ -408,6 +422,11 @@ def run_once_with_tool_gate(
                         # 同理：执行期的每一次授权也得知道**谁发起的这条委派**。
                         approver=task_requester(task, approver),
                         server_factory=server_factory,
+                        # 落库进度投影（12.8）：WEB 面板读的就是这张表。
+                        # 传的是适配器而不是 TaskRepo 本身，因为
+                        # ``write_delegate_progress`` 还要把 ``now`` 换成一个
+                        # 墙上时钟 —— 而那条时钟属于存储层，不属于这里。
+                        progress_repo=_TaskRepoProgress(app.task_repo),
                     )
                 except FreeAgentError as exc:
                     outcome = DispatchOutcome(
@@ -586,7 +605,10 @@ class ApprovalGate:
             return "没有审批通道（store/sender 缺失）—— 无人能批准，故拒绝"
 
         pending = self._store.request_delegation(
-            project=str(project), brief=brief, context=ctx
+            project=str(project), brief=brief, context=ctx,
+            # 归属（12.8）：这道闸门的 `task_id` 本来就是入参，顺手透传，
+            # 不必再从 task 对象上取 —— `check` 拿得到的就是它。
+            task_id=task_id or None,
         )
         try:
             card = self._send_card(pending, to=who)
@@ -796,6 +818,28 @@ class ProgressCardSender(Protocol):
     ) -> None: ...
 
 
+class ProgressRepo(Protocol):
+    """进度**落库投影**需要的两个方法（设计文档 12.8 / V1.35）。
+
+    刻意是协议而不是直接吃 :class:`~freeagent.storage.repos.TaskRepo`：
+    这条路上有两类调用方 —— 真执行器（要跨进程落库）与
+    :func:`run_with_tool_gate` 的测试（只想断言文本，不想有库）。
+    写成具体类的话，测试就得为「不做落库」这件事造一个假库，
+    而那正好是「不传」本来要表达的。
+
+    与 ProgressCardSender **分成两个协议**是同一个理由：飞书那条路是
+    「推给用户看」，落库这条是「给 WEB 面板读」。把它们合成一个，
+    就会出现「为了在测试里不做落库而必须实现一个假飞书 sender」的荒唐。
+    """
+
+    def write_delegate_progress(
+        self, *, task_id: str, status: str, recent: str,
+        tool_calls: int, allowed: int, project: str,
+    ) -> None: ...
+
+    def clear_delegate_progress(self, task_id: str) -> None: ...
+
+
 class ServerFactory(Protocol):
     """造一个**隔离的** opencode 服务。
 
@@ -809,15 +853,89 @@ class ServerFactory(Protocol):
     def __call__(self, project: Path, command: str) -> ContextManager[Any]: ...
 
 
-def _default_server_factory(project: Path, command: str) -> "OpenCodeServer":
+def plugin_extra_env(plugins: str) -> dict[str, str]:
+    """插件模式 → 子进程环境变量。**纯函数**（无 IO、可直接测）。
+
+    ``off`` 返回 ``{"OPENCODE_PURE": "1"}``：opencode 在**加载插件之前**
+    就把 ``cfg.plugin_origins`` 整丢掉（``packages/opencode/src/plugin/index.ts``
+    的 ``Flag.OPENCODE_PURE ? [] : …``）。实测有效：带这个变量起实例时
+    ``GET /mcp`` 返回空 —— 插件注入的 5 个 MCP 服务器全部消失。
+
+    ⚠️ 别名 ``OPENCODE_PURE`` 不是笔误，opencode 自己就把它叫 pure
+    （``flag.ts`` 的 ``OPENCODE_PURE``，TUI 侧同一个变量）。
+
+    ``inherit`` 返回空 dict —— **刻意不传任何变量**。传一个「什么都不做」
+    的变量看起来更对称，但那样就分不清「忘了配」与「配了等于没配」。
+
+    未知取值**报错而不是当 inherit**：``true`` / ``none`` / ``""`` 这类值一旦
+    被当成「继承」，用户以为自己关了插件、实际插件全在，而且**界面上看不出
+    任何异常** —— 那是最难发现的一类失效。配置层已经校验过一遍，这里再挡
+    一次是因为这个函数是纯函数、可以零成本地失败关闭。
+    """
+    if plugins == "off":
+        return {"OPENCODE_PURE": "1"}
+    if plugins == "inherit":
+        return {}
+    raise ValueError(
+        f"未知的插件模式：{plugins!r}（只认 'inherit' 或 'off'）"
+    )
+
+
+def _default_server_factory(
+    project: Path, command: str, *, plugins: str = "inherit"
+) -> "OpenCodeServer":
     """生产用的工厂。
 
     跑**系统 opencode**（真实全局配置 → 用户原生的全局插件 / MCP / 技能，
     离线、零重装），并用项目级覆盖层强制本项目的审批闸门。不再另起隔离
     世界去复制用户配置（那样会重装、且离了网就坏）。
+
+    ``plugins`` 只决定**要不要加载用户的插件**（``delegate.plugins`` 配置项）：
+
+    - ``inherit``（默认）—— 与 V1.31 以来完全一致，一个字节都不多传。
+    - ``off`` —— 加 ``OPENCODE_PURE=1``，插件与其注入的 MCP / 技能全部不加载。
+
+    闸门（``apply_gate=True``）**两种模式下一律开着**：这个开关调节的是
+    「agent 能用什么」，不是「用之前问不问」。把它和闸门绑在一起会让人
+    以为关插件能顺便提高安全 —— 那是两件事。
     """
     return OpenCodeServer(project=project, executable=command,
-                          isolate=False, apply_gate=True)
+                          isolate=False, apply_gate=True,
+                          extra_env=plugin_extra_env(plugins))
+
+
+class _TaskRepoProgress:
+    """:class:`ProgressRepo` 的生产实现：把投影写进 ``delegate_progress``。
+
+    刻意是**一个类**而不是两段 lambda：``run_with_tool_gate`` 拿到的是
+    协议，而这一层负责**换时钟** —— 存储层要的是 ``datetime``（它自己
+    决定 ISO 格式），而执行器这一侧的时间是一个 ``Callable[[], float]``
+    的 monotonic 计数器（见 ``now=`` 参数，那是给**超时判定**用的，
+    拿它写时间戳会写出一个从开机起算的数）。
+
+    ⚠️ 所以这里用的是 ``datetime.now()``，**不是** ``now()``。两者混用
+    的症状很隐蔽：进度行的时间戳会变成「开机后多少秒」，
+    而 WEB 面板拿它跟真实时间比陈旧，永远算出「刚刚才动过」——
+    于是一条三天前的僵尸进度会永远显示「正在进行」。
+    """
+
+    __slots__ = ("_repo",)
+
+    def __init__(self, repo) -> None:
+        self._repo = repo
+
+    def write_delegate_progress(
+        self, *, task_id: str, status: str, recent: str,
+        tool_calls: int, allowed: int, project: str,
+    ) -> None:
+        self._repo.set_delegate_progress(
+            task_id=task_id, status=status, recent=recent,
+            tool_calls=tool_calls, allowed=allowed, project=project,
+            now=datetime.datetime.now(),
+        )
+
+    def clear_delegate_progress(self, task_id: str) -> None:
+        self._repo.clear_delegate_progress(task_id)
 
 
 #: 单条委派允许的**工具调用次数**上限（设计文档 12.7.2）。
@@ -876,6 +994,7 @@ def run_with_tool_gate(
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     max_seconds: float = DEFAULT_MAX_DISPATCH_SECONDS,
     now: Callable[[], float] = time.monotonic,
+    progress_repo: "ProgressRepo | None" = None,
 ) -> DispatchOutcome:
     """派一条委派，**执行期逐次授权**（设计文档 11.8.1）。
     与 :func:`_dispatch_one` 的分工：那是**无人值守**的老路（subprocess 一次
@@ -920,7 +1039,13 @@ def run_with_tool_gate(
             ),
         )
 
-    make_server = server_factory or _default_server_factory
+    # ``partial`` 而不是给工厂加位置参数：:class:`ServerFactory` 协议是
+    # ``(project, command)``，测试注入的假工厂就按这个签名写。加一个**带默认值的
+    # 关键字参数**仍然满足该协议，而 ``partial`` 让「插件模式」这件事在
+    # 生产路径上可见 —— 不用把配置读两遍，也不用模块级全局。
+    make_server = server_factory or functools.partial(
+        _default_server_factory, plugins=policy.plugins
+    )
     context = ApprovalContext("remote", who=approver)
     handled: list[str] = []
     granted = 0
@@ -1015,15 +1140,51 @@ def run_with_tool_gate(
             f"**工具调用**：{tool_calls} 次（允许 {granted} 次）"
         )
 
+    def _write_progress_row(status: str, recent: str) -> bool:
+        """**只**落库进度投影，不碰飞书卡。返回**有没有写成**。
+
+        与 :func:`_update_progress` 分开是因为**两者触发的时机不同**：
+        飞书卡的更新必须挤在节流窗后面（省 API 配额），而落库那行是
+        「起跑线」——它在 prompt_async 之后立刻要写，好让 WEB 面板
+        在第一个工具事件到来之前（可能要十几秒）就显示得出来。
+
+        早期版本把起跑线也走 :func:`_update_progress`，于是多推了**一张**
+        卡更新 —— 而那张卡的内容与建卡时的初始正文「正在启动」完全相同。
+        症状是 sequence 从 2 变成 3 而内容没变：飞书不报错，
+        只是白花一次配额，而「sequence 为什么跳了一格」会让人以为
+        有一次更新被吞了。**展示层不该为数据库的存在多花一次调用。**
+
+        返回值给节流用：**失败也算「这一格用掉了」**。理由是写失败
+        多半是数据库被占（另一个进程正在读），那种情况下继续写下去
+        只会把同一个错重复几十次；而「这一格丢了」与「卡住不动」
+        是同一类可接受的后果（有陈旧判定兜底）。
+        """
+        if progress_repo is None:
+            return False
+        try:
+            progress_repo.write_delegate_progress(
+                task_id=getattr(task, "id", "") or "",
+                status=status, recent=recent,
+                tool_calls=tool_calls, allowed=granted,
+                project=str(project),
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "【执行期】进度落库失败（task=%s，仅影响 WEB 面板）",
+                getattr(task, "id", "?"), exc_info=True,
+            )
+        return True
+
     def _update_progress(recent: str, *, status: str = "正在执行",
                          force: bool = False) -> None:
-        """更新进度文本：节流 + 失败只记日志。**一个收口点**。
+        """更新进度：**节流 + 两个去处**（飞书卡、落库投影）。**一个收口点**。
 
         ## 失败不许影响执行
 
-        进度卡片是**展示层**。飞书抖动、sequence 冲突、卡片被删 ——
-        任何一种都不该把一次能跑完的委派报成失败。所以这里吞掉一切
-        异常只留日志：这条卡片的命，比不上这次委派的命。
+        两边都是**展示层**。飞书抖动、sequence 冲突、卡片被删、
+        数据库被另一个进程锁住 —— 任何一种都不该把一次能跑完的委派
+        报成失败。所以这里吞掉一切异常只留日志：**这条进度的命，
+        比不上这次委派的命**。
 
         ## 节流按时间，不按次数
 
@@ -1031,14 +1192,35 @@ def run_with_tool_gate(
         30 秒）。按次数节流会漏掉「长时间没动静之后的那一次」，
         而那恰恰是最该让人看到的一次（「它卡住了？」）。
 
+        ## 落库**独立于**飞书卡（V1.35 的唯一偏差点）
+
+        早先这里是 ``if progress_sender is None or not progress_msg_id:
+        return`` —— 那一行在 V1.35 之前是对的（唯一的去处是飞书卡）。
+        现在有两个去处了，而「没配飞书」不该等于「WEB 面板也瞎着」：
+        纯终端部署没有飞书通道，而它照样开着 Web 界面。
+
+        所以落库挪到了那个门槛**之外**：``progress_sender`` 为 None 时
+        卡片那条路照旧不动，但库里照写。飞书的门槛与 sequence 规则
+        一个字没改。
+
         :param force: 关键节点强制更新（第一个工具事件、提问中、首次授权）。
         """
         nonlocal progress_seq, last_progress_update
-        if progress_sender is None or not progress_msg_id:
-            return
         stamp = now()
         if (not force and last_progress_update is not None
                 and stamp - last_progress_update < MIN_PROGRESS_INTERVAL):
+            return
+        # ⚠️ 顺序**不是**随意的 —— 先落库意味着「WEB 先看到、飞书后跟上」，
+        # 而倒过来会让飞书显示着一个 WEB 还没记下的进度。
+        #
+        # 落库那一格用掉了就推进节流，不等飞书卡那条路 ——
+        # 否则纯终端部署（没有 progress_sender）下节流永远不生效，
+        # 于是每一次工具事件都写一次库，而设计文档 12.8 明确禁止
+        # 「把 SQLite 写放大到工具调用密度」。
+        wrote = _write_progress_row(status, recent)
+        if progress_sender is None or not progress_msg_id:
+            if wrote:
+                last_progress_update = stamp
             return
         try:
             progress_sender.update_progress_text(
@@ -1054,6 +1236,27 @@ def run_with_tool_gate(
             return
         progress_seq += 1
         last_progress_update = stamp
+
+    def _clear_progress() -> None:
+        """清掉这条委派的落库进度行。**幂等、不抛**。
+
+        与 :meth:`_close_progress_stream` 并列但**不是**它的附属：
+        飞书卡发没发过与库里该不该留行是两件事 —— 没配飞书的那条路
+        没有卡，却同样需要清行。
+
+        「不抛」的理由：四个收口点都会调它（正常结束 / error / 超限 /
+        用户叫停），而重复清理是常态。让它抛会把「已经清干净了」
+        说成故障 —— 那正是本函数要防的那类误导。
+        """
+        if progress_repo is None:
+            return
+        try:
+            progress_repo.clear_delegate_progress(getattr(task, "id", "") or "")
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "【执行期】清进度行失败（task=%s，残留行会被按陈旧忽略）",
+                getattr(task, "id", "?"), exc_info=True,
+            )
 
     def _close_progress_stream(final_text: str) -> None:
         """关闭流式模式并设置最终内容。**幂等**。
@@ -1095,6 +1298,11 @@ def run_with_tool_gate(
                     from .services.oc_selection import agent_is_executable
                     if not agent_is_executable(_live_agents, policy.agent):
                         oc.abort(session_id)
+                        # 这一路径上还没有写过任何进度行（起跑线那行在
+                        # prompt_async 之后），但仍调一次清理：它幂等，
+                        # 而「万一以后把起跑线挪到前面」这件事不该让
+                        # 这里变成一个必须记住的隐含约束。
+                        _clear_progress()
                         return DispatchOutcome(
                             ok=False,
                             summary=(
@@ -1166,6 +1374,19 @@ def run_with_tool_gate(
                         getattr(task, "id", "?"), progress_card.card_id[:12],
                         progress_card.message_id[:12],
                     )
+            # ── 起跑线：落库投影的第一行（12.8 / V1.35）────────────────────
+            #
+            # 刻意**紧接发卡之后**、事件循环之前 —— 与卡片的初始内容
+            # （"正在启动..."）同一时刻、同一份数据。
+            #
+            # 为什么要这一行而不是等第一个工具事件：那一来可能要十几秒，
+            # 而这段时间里 WEB 面板会**显示不出这条委派** —— 用户刚点
+            # 「开始做」就看到空面板，与「没派出去」长得一模一样。
+            #
+            # 走 `_write_progress_row`（只落库、不推卡）而不是
+            # `_update_progress`：卡片的初始正文本来就是「正在启动」，
+            # 再推一次同样的内容只会白花一次 sequence（见那函数的说明）。
+            _write_progress_row("正在启动", "")
             for kind, props in oc.events():
                 if deadline is not None and now() > deadline:
                     handled.append(
@@ -1196,7 +1417,8 @@ def run_with_tool_gate(
                         continue
                     note = _ask_one_question(oc, q, store=store, sender=sender,
                                          approver=approver, context=context,
-                                         reply_to=progress_anchor_id or "")
+                                         reply_to=progress_anchor_id or "",
+                                         task_id=getattr(task, "id", "") or "")
                     if note:
                         handled.append(note)
                     else:
@@ -1245,6 +1467,8 @@ def run_with_tool_gate(
                     # 授权卡挂到进度卡下面（设计文档 11.16）。空串时 sender
                     # 走原路径，所以「没进度卡」不影响授权流程。
                     reply_to=progress_anchor_id or "",
+                    # 归属（12.8）：让 WEB 面板能把这张卡指回是哪条委派。
+                    task_id=getattr(task, "id", "") or "",
                 )
                 handled.append(f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}")
                 tool_calls += 1
@@ -1302,6 +1526,9 @@ def run_with_tool_gate(
             f"**状态**：授权链路失败\n\n"
             f"**原因**：{type(exc).__name__}: {exc}"
         )
+        # 异常路径**同样要清落库进度**：不清的话 WEB 面板会一直显示
+        # 「正在执行」配一个再也不动的时间戳，而那与「卡住了」无法区分。
+        _clear_progress()
         return DispatchOutcome(
             ok=False,
             summary=f"执行期授权链路失败：{type(exc).__name__}: {exc}",
@@ -1327,6 +1554,10 @@ def run_with_tool_gate(
         f"**项目**：{project}\n\n**状态**：{_final_status}\n\n"
         f"**工具调用**：{tool_calls} 次（允许 {granted} 次）"
     )
+    # 收尾清行。放在**状态词算完之后、统一收口那里**（而不是每个 return
+    # 分支各清一次）：分开放的必然漏一条，而漏掉的那条症状是
+    # 「面板上永远挂着一条僵尸进度」。
+    _clear_progress()
 
     # 会话级失败**优先于一切统计性结论**。理由：unanswered / user_stopped /
     # step_capped / time_capped 描述的是「这一轮里发生了什么事」，而 error
@@ -1466,6 +1697,7 @@ def _ask_one_question(
     approver: str,
     context: "ApprovalContext",
     reply_to: str = "",
+    task_id: str = "",
 ) -> str:
     """问一次（一次问一个），把答复送回 opencode。**返回一句话摘要**。
 
@@ -1489,6 +1721,7 @@ def _ask_one_question(
         # 一旦自己传了，就多了一个凭据的来源。
         ttl_seconds=policy.ttl_seconds,
         requested_by=context.who,
+        task_id=task_id or None,
     )
 
     # **一问一卡，发完立刻等那一问。**
@@ -1616,6 +1849,7 @@ def _ask_one_tool(
     approver: str,
     context: "ApprovalContext",
     reply_to: str = "",
+    task_id: str = "",
 ) -> tuple[str, str]:
     """问一次，回 ``(结论, 凭据)``。**只回结论，不解释** —— 解释是卡片的事。
 
@@ -1641,6 +1875,7 @@ def _ask_one_tool(
     pending = store.request_tool_call(
         permission=req.permission, paths=req.paths, diff=req.diff,
         suggested_always=req.suggested_always, context=context,
+        task_id=task_id or None,
     )
     try:
         message_id = _send_card_threaded(
@@ -2004,10 +2239,16 @@ def main(argv: list[str] | None = None) -> int:
     # 之一就是「照着接缝写的东西在真环境里成不成立」，版本都不对的话
     # 预演结果没有意义。
     probe_policy = _delegate_policy(build_app(args.db))
-    mismatch = version_mismatch_reason(detect_opencode_version(probe_policy.command))
+    detected = detect_opencode_version(probe_policy.command)
+    mismatch = version_mismatch_reason(detected)
     if mismatch is not None:
         print(f"⚠ opencode 版本不可用 —— 不派发任何委派\n  {mismatch}")
         return 2
+    # 版本可用 ⇒ **把当前适配器切成这个版本**。协议知识（端点、字段名、
+    # 事件形状）全在适配器里；用错版本不报错，只会让闸门**静默失效**。
+    # ``detect_adapter`` 取不到就 raise（不静默回退到 V1），而上面已确认
+    # ``detected`` 在可派发集合里，所以这里不会抛。
+    detect_adapter(detected)
 
     def build_real_gate():
         """**真**闸门：落 pending → 发飞书卡 → 等人点。

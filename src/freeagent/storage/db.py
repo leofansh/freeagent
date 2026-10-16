@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 #: 每次 DDL 结构变更递增。
-#: 14 = stop_requests（第六道闸门「停止这条委派」的落库表）。
+#: 15 = delegate_progress + pending_approvals.task_id（WEB 委派实时面板，12.8）。
 #:
 #: ⚠️ 加了 ``_MIGRATIONS`` 条目**必须**同时改这个数，否则那条迁移永远跑不到
 #: ——而症状是「表不存在」，不是「版本号不对」：
@@ -40,7 +40,7 @@ __all__ = [
 #:
 #: 反过来也成立：**改了这个数却没有对应的迁移条目**，同样会让最后一格
 #: 静默失效。``tests/test_question_pending.py::test_version`` 同时守两边。
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -189,6 +189,19 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         )
         """,
     ),
+    (
+        "14 → 15：pending_approvals 加 task_id（待批项要能指回它属于哪条委派）",
+        # 为什么现在才加（V1.35，12.8）：飞书那条链路**从来不需要**它 ——
+        # 授权卡挂在进度卡下面（11.16），上下文由那张卡提供，而卡正文
+        # 只带 subject/detail，压根不查库去认「哪条事务」。
+        # WEB 面板没有那张锚点卡：它的待批项必须**自己说清是哪条委派**，
+        # 否则用户看到一张「允许 edit src/foo.py」的卡，不知道该批给谁。
+        #
+        # **可空，且旧行必须照常可读**：加列前写的待批行没有归属 ——
+        # 那些行本来就在几分钟内被答复掉，不该为了它们做任何补写。
+        # 判定按「空 = 不归属」处理（前端不显示归属，不猜）。
+        "ALTER TABLE pending_approvals ADD COLUMN task_id TEXT",
+    ),
 )
 
 
@@ -279,6 +292,33 @@ END;
 #: 版本号仍然**一步一版**，不会因为加了域步骤就跳版。
 _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
     (8, _KNOWLEDGE_SCHEMA),
+    # 15 → delegate_progress：委派执行期进度的**落库投影**（12.8 / V1.35）。
+    #
+    # 走这条多语句通道而不是并进 14→15 那一步，是因为「一步一版」的不变量
+    # 要求每个版本号只对应一条语句；而这一版要干的正好是两条
+    # （上面那条 ALTER + 这里这张 CREATE）。
+    #
+    # 为什么必须是新表而不是往 tasks 上加列：进度是**执行期状态**，
+    # 跑完就该消失；而 tasks 行是**长期真源**，在它身上挂「正在执行」，
+    # 于是「跑完了没清干净」会变成事务身上一条永久的假状态。
+    # 独立表的另一面好处：清掉就是 DELETE 一行，不碰任何真源列。
+    #
+    # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等；
+    # 新库走 init_schema 时已有同款建表，重复执行无害。
+    (
+        15,
+        """
+        CREATE TABLE IF NOT EXISTS delegate_progress (
+            task_id     TEXT PRIMARY KEY,
+            status      TEXT,
+            recent      TEXT,
+            tool_calls  INTEGER NOT NULL DEFAULT 0,
+            allowed     INTEGER NOT NULL DEFAULT 0,
+            project     TEXT,
+            updated_at  TEXT NOT NULL
+        )
+        """,
+    ),
 )
 
 #: 覆盖默认数据目录的环境变量名。
@@ -379,7 +419,11 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     decided_by      TEXT,
     decided_at      TEXT,
     open_message_id TEXT,
-    requested_by    TEXT
+    requested_by    TEXT,
+    kind            TEXT,
+    answer_text     TEXT,
+    question_spec   TEXT,
+    task_id         TEXT          -- 这条待批项属于哪条委派（12.8 / V1.35）；可空（旧行）
 );
 
 -- 配对码（设计文档 11.9.8）。治「第一次装时手里没有 open_id」的死循环：
@@ -425,6 +469,30 @@ CREATE TABLE IF NOT EXISTS stop_requests (
     credential  TEXT PRIMARY KEY,
     requested_by TEXT,
     requested_at TEXT NOT NULL
+);
+
+-- 委派执行期进度的**落库投影**（12.8 / V1.35）。
+--
+-- 为什么它**不是** tasks 上的一列：这是「此刻跑到哪了」的易失状态，
+-- 一次委派结束就该消失；而 tasks 是长期真源，在它身上挂执行期状态，
+-- 漏清一次就变成「这条事务永远显示正在执行」。
+--
+-- 为什么**独立成表**而不是复用 pending_approvals：那张表的语义是
+-- 「有人要批准某件事」，有 decision / decided_by / TTL 语义，
+-- 进度没有决策也没有时效，两者混在一张表里会让每个读它的人
+-- 都要先判断「这行是审批还是进度」。
+--
+-- ⚠️ **投影不是真源**：执行器进程被杀时行会留在盘上，所以读方
+-- 必须按 ``updated_at`` 判陈旧（前端超过阈值显示「疑似卡住」），
+-- 不许把「有行」当成「在跑」。
+CREATE TABLE IF NOT EXISTS delegate_progress (
+    task_id     TEXT PRIMARY KEY,
+    status      TEXT,
+    recent      TEXT,
+    tool_calls  INTEGER NOT NULL DEFAULT 0,
+    allowed     INTEGER NOT NULL DEFAULT 0,
+    project     TEXT,
+    updated_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS plan_sessions (

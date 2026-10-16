@@ -98,6 +98,7 @@ def oc_dispatch(app: App, body: dict[str, Any]) -> dict[str, Any]:
             note +
             "点「开始做」后，执行器（独立进程）才会接手 —— "
             "它得在跑（python -m freeagent.delegate）。"
-            "之后 opencode 每要动手一次，会在飞书给你一张授权卡。"
+            "之后本页顶部那块面板会实时显示进度、每次动手要你批的授权卡，"
+            "以及它反问你的问题（飞书那边是同一套卡）。"
         ),
     }

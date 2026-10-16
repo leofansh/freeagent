@@ -24,7 +24,9 @@ from pathlib import Path
 import pytest
 
 from freeagent.app import App, build_app
+from freeagent.services import opencode_server
 from freeagent.services.clock import FrozenClock
+from freeagent.services.executors import adapter_for
 from freeagent.services.sorting import EnergyWindows
 
 
@@ -66,6 +68,30 @@ def _isolate_feishu_config(tmp_path_factory: pytest.TempPathFactory):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _pin_opencode_adapter_to_factory_default():
+    """每个用例都从出厂适配器（V1）开始，结束时回到它。
+
+    ``OpenCodeServer.start()`` 会把**进程级**协议适配器采纳为本机装的版本
+    （``_adopt_installed_adapter``：本机装了 opencode V2，就翻成 V2）—— 那是
+    长驻进程要的行为，但对测试是越界的全局副作用：一个用例触发过真实探测，
+    后面拿 V1 假数据说话的用例就全对不上，症状是「单跑绿、全量红」
+    （2026-10-16 排查全量 86 红时确认）。
+
+    一个已知触发路径是 ``build_app() → _capability_view → list_projects``；
+    那条空项目路径已不再空转探测（见 app.py），这里仍是兜底：凡是要换
+    适配器的用例，自己 ``set_current_adapter`` 显式钉住，并在用例里写清
+    它模拟的是哪个版本 —— 隐式依赖别的用例留下的全局状态，正是上面那个坑。
+    """
+    factory = adapter_for(1)
+    assert factory is not None, "V1 适配器必须存在"
+    opencode_server.set_current_adapter(factory)
+    try:
+        yield
+    finally:
+        opencode_server.set_current_adapter(factory)
 
 
 @pytest.fixture()

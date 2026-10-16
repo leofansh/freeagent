@@ -100,7 +100,7 @@ class TestHermesIsRegisteredButNotDispatchable:
         这是本次改动的**核心安全断言**：多登记一个执行器是加法，
         不能顺手把既有闸门松开一格。
         """
-        assert E.dispatchable_majors("opencode") == (1,)
+        assert E.dispatchable_majors("opencode") == (1, 2)
         assert E.dispatchable_majors("hermes") == ()
 
     def test_every_protocol_hook_refuses_instead_of_guessing(self):

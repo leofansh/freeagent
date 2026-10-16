@@ -220,23 +220,33 @@ def list_agent_options(rows: Iterable[dict[str, Any]]) -> list[Option]:
     能不能跑由 :func:`agent_is_executable` 判（在端点里标到选项上），
     **不是**在这里用 ``model`` 当代理指标提前筛掉。``mode`` 字段实测存在
     （primary / subagent / all）。
+    为什么必须要名字这道闸门，但**不能**只靠它：
+    V2 的内部件（``compaction`` / ``title`` / ``summary``）带 ``hidden: true``，
+    且它们的 ``mode`` 也是 ``primary`` —— 只按名字挡，万一哪天改了名就漏；
+    只按 ``hidden`` 挡，V1 又没有这个字段。所以两道都上（V1 无 ``hidden`` 时
+    该判断自然为假）。
     """
     out: list[Option] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if row.get("hidden") is True:
+            continue
         name = str(row.get("name") or "").strip()
-        if not name or name in _INTERNAL_AGENTS:
+        if not name or name.casefold() in _INTERNAL_AGENTS:
             continue
         if str(row.get("mode") or "") != "primary":
             continue
+        # ``name`` 是**回传的标识**（V2 上适配器已把 ``Agent.ID`` 挪进来）；
+        # ``label`` 是显示名（V2 适配器另给的 ``label``；V1 没有就用 name）。
+        label = str(row.get("label") or "").strip() or name
         model = row.get("model")
         hint = ""
         if isinstance(model, dict):
             provider = str(model.get("providerID") or "").strip()
             model_id = str(model.get("modelID") or "").strip()
             hint = f"{provider}/{model_id}" if provider and model_id else ""
-        out.append(Option(value=name, label=name, hint=hint))
+        out.append(Option(value=name, label=label, hint=hint))
     return out
 
 
@@ -310,8 +320,10 @@ def agent_is_executable(rows: Iterable[dict[str, Any]], agent: str) -> bool:
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if row.get("hidden") is True:
+            continue
         name = str(row.get("name") or "").strip()
-        if not name or name in _INTERNAL_AGENTS:
+        if not name or name.casefold() in _INTERNAL_AGENTS:
             continue
         if name == agent:
             return str(row.get("mode") or "") == "primary"

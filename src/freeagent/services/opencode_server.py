@@ -33,7 +33,6 @@ import tempfile
 import time
 import logging
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Iterable, Iterator, Mapping
@@ -42,7 +41,9 @@ from .executors import (
     ExecutorAdapter,
     ToolPermission,
     ToolQuestion,
+    UnverifiedExecutorError,
     adapter_for,
+    known_majors,
 )
 
 __all__ = [
@@ -59,9 +60,11 @@ __all__ = [
     "build_child_env",
     "child_env_visibility",
     "OpenCodeServer",
+    "stale_gate_note",
     "free_port",
     "current_adapter",
     "set_current_adapter",
+    "detect_adapter",
 ]
 
 
@@ -93,16 +96,41 @@ def current_adapter() -> ExecutorAdapter:
 
 
 def set_current_adapter(adapter: ExecutorAdapter | None) -> None:
-    """换掉当前适配器。**只给测试用** —— 换完记得换回来。
+    """换掉当前适配器。**只给测试与探针用** —— 换完记得换回来。
 
-    存在的理由：V2 适配器是 :class:`~freeagent.services.executors.UnverifiedExecutorError`
-    的来源，必须能验证「用它会响」而不是「没人调用它所以看起来没事」。
+    存在的理由：未验证的适配器是
+    :class:`~freeagent.services.executors.UnverifiedExecutorError` 的来源，
+    必须能验证「用它会响」而不是「没人调用它所以看起来没事」。
+    现在扮演那个角色的是 hermes（V2 已实测转正）。
     """
     global _CURRENT_ADAPTER
     if adapter is None:
         adapter = adapter_for(1)
         assert adapter is not None
     _CURRENT_ADAPTER = adapter
+
+
+def detect_adapter(major: int, executor: str = "opencode") -> ExecutorAdapter:
+    """按**探测到的主版本**挑选适配器，并**显式覆盖**当前值。
+
+    为什么要「显式覆盖」而不是「取不到就回退到默认（V1）」：回退是
+    **静默降级**，而这里的降级方向恰好是最危险的那侧 —— 拿 V1 的端点与
+    字段名去跟 V2 说话，配置会被静默忽略、闸门随之失效。所以取不到就
+    ``raise``，让派发**响亮地失败**（fail-closed），而不是悄悄地跑起来。
+
+    注意这**不是**「配置驱动」：调用方给的是**探测结果**（跑
+    ``opencode --version`` 得到的），不是人手写的声明表。手写的能力声明
+    会陈旧，而陈旧的方向同样是危险的那侧。
+    """
+    adapter = adapter_for(major, executor)
+    if adapter is None:
+        known = ", ".join(str(n) for n in known_majors(executor))
+        raise ServerError(
+            f"不认识 {executor} 的主版本 {major}（已知：{known or '无'}）"
+            "—— 拒绝用别的版本的适配器代跑"
+        )
+    set_current_adapter(adapter)
+    return adapter
 
 
 # ── 纯函数（可测，无 IO）─────────────────────────────────────────────── #
@@ -129,9 +157,9 @@ def read_only_permission_config() -> dict[str, Any]:
     而 ``/ask`` 必须「**改不了**」。
 
     为什么 ``/ask`` 需要一份单独的配置（设计文档 11.10.6 写「它不改任何东西，
-    所以没有『有副作用』可拦」）：那句话是**假设**。V1 未命中规则时大多默认
-    ``allow``，所以「不改任何东西」必须由这里这份配置**强制**。
-    详见 :func:`freeagent.services.executors._v1_read_only_config`。
+    所以没有『有副作用』可拦」）：那句话是**假设**。真正的原因是「只读」必须
+    由**配置强制**—— 兜底是 ``deny``，没登记的工具一律不许，而不是靠执行器
+    自觉。详见 :func:`freeagent.services.executors._v1_read_only_config`。
     """
     return current_adapter().build_read_only_config()
 
@@ -166,6 +194,56 @@ _PROBE_WINDOW = 180.0
 
 #: 探针两次尝试之间的间隔（秒）。
 _PROBE_INTERVAL = 3.0
+
+#: 覆盖层里写的**标记**（也是本模块判断「这份配置是我们写的」的**唯一**依据）。
+#:
+#: 为什么必须精确到标记、而不是「长得像闸门就当残留」：项目里本来就可能有
+#: 用户自己写的 ``opencode.jsonc``。用启发式去认残留，就会在用户手写了相似
+#: 配置时**删掉他的文件** —— 而「在用户背后改他的项目文件」这个仓库明确不做
+#: （同 12.7.2 的失败关闭纪律）。**宁可漏认，绝不误删。**
+_OVERLAY_MARKER = "freeagent-delegation-gate"
+
+#: 覆盖层顶部写的注释。顺带把「这个文件是什么、为什么会残留、怎么办」写给
+#: **下一个看到它的人**（多半是被吓一跳的项目主人）。
+_OVERLAY_HEADER = (
+    f"// {_OVERLAY_MARKER}：这是 FreeAgent 委派闸门覆盖层，正常结束会自动删除。\n"
+    "// 若你看到它留在项目里，说明上一次委派被强杀或机器重启了。\n"
+    "// 它是项目级配置、真的会生效，所以可以直接删掉这个文件。\n"
+)
+
+
+def _is_our_overlay(path: pathlib.Path) -> bool:
+    """这个文件是不是**我们**写的覆盖层（凭 :data:`_OVERLAY_MARKER`）。
+
+    读不出来 / 不是 ``.jsonc`` / 没标记 ⇒ 一律 ``False``。宁可漏认。
+    """
+    try:
+        if path.suffix != ".jsonc":
+            return False
+        return _OVERLAY_MARKER in path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def stale_gate_note(project: pathlib.Path) -> str | None:
+    """项目里有没有上次委派留下的闸门覆盖层；有就返回**给用户看的话**。
+
+    为什么是「返回一句话」而不是「顺手删掉」（2026-10-14 与用户确认）：
+    自动清理看着省事，但那份文件是**项目级配置、真的在生效**，而用户很可能
+    不知道它在那儿。静默删掉 = 替用户做了一个他没要求的决定；万一认错（把
+    用户自己的配置当残留）就是**毁掉他的文件**。所以这里只**说**，
+    清理由下一次委派正常收尾时完成（见 :meth:`OpenCodeServer._restore_overlay`）。
+    """
+    for cand in ("opencode.jsonc", "opencode.json"):
+        p = pathlib.Path(project) / cand
+        if _is_our_overlay(p):
+            return (
+                f"⚠️ 项目里有一份**上次委派残留**的闸门覆盖层：{p}\n"
+                "   原因是上次委派被强杀或机器重启，收尾没跑到。\n"
+                "   它是项目级配置、**真的会生效**（包含当时的权限规则），\n"
+                "   直接删掉这个文件即可；本次委派正常结束时也会替你收尾。"
+            )
+    return None
 
 
 def _child_log_dir() -> pathlib.Path:
@@ -379,12 +457,33 @@ def permission_from_event(properties: Any) -> ToolPermission | None:
     return current_adapter().parse_request(properties)
 
 
+def _current_api() -> Any:
+    """当前适配器的 HTTP 面。取不到就**响亮失败**（不是回退到别的版本）。"""
+    api = current_adapter().api
+    if api is None:
+        raise ServerError(
+            f"{current_adapter().executor} 的适配器没有 HTTP 面"
+            "（未验证的执行器不该被用来起服务）"
+        )
+    return api
+
+
 def parse_sse_event(line: str) -> tuple[str, Any] | None:
-    """解析一行 SSE。返回 ``(type, properties)``，不是事件则 ``None``。
+    """解析一行 SSE。返回 ``(type, payload)``，不是事件则 ``None``。
 
     SSE 每条消息是多行的 ``event:``/``data:``，但 opencode 实测只发
     ``data: {...}``（类型在 JSON 里的 ``type`` 字段）。所以只认 ``data:`` 前缀，
     其余（``:`` 心跳、空行、注释）一律忽略。
+
+    **信封识别留在这里，载荷与事件名归适配器**（见
+    :meth:`~freeagent.services.executors.ExecutorApi.parse_event`）：V1 载荷在
+    ``properties``、V2 在 ``data``，而**认错这个键不会报错** —— 每条事件都变成
+    「不认识」，于是授权卡永不出现、会话一直跑到时长上限。这正是最坏的一类
+    失败，所以它必须和协议一起住在适配器里、能一次改对。
+
+    返回的 ``type`` 是**内部事件名**：V2 的原始名由适配器翻成调用方认识的
+    （``form.created`` → ``question.asked`` 等），所以 delegate/ask 里的分支
+    不必知道版本。
     """
     if not line or not line.startswith("data:"):
         return None
@@ -395,10 +494,7 @@ def parse_sse_event(line: str) -> tuple[str, Any] | None:
         return None
     if not isinstance(obj, dict):
         return None
-    kind = obj.get("type")
-    if not isinstance(kind, str) or not kind:
-        return None
-    return kind, obj.get("properties")
+    return _current_api().parse_event(obj)
 
 
 def reply_payload(decision: str) -> dict[str, str]:
@@ -450,6 +546,43 @@ def free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _empty_catalog(value: Any) -> bool:
+    """归一化后的目录结果算不算「空」。
+
+    只给 V2 的加载窗口用（见 :meth:`OpenCodeServer._catalog`）：V2 在目录齐
+    之前会回**空数组**，而空结果会让上层误判（「没有工作模式可用」）——
+    所以空要在窗口内重试。V1 的窗口是 0，这个函数对 V1 无影响。
+
+    - dict（``list_models`` 的 ``{"all": …, "connected": …}``）：全部值为假才算空
+    - list（项目 / agent）：空列表算空
+    - 其它（``None`` 等）：算空
+    """
+    if isinstance(value, dict):
+        return not any(value.values())
+    if isinstance(value, list):
+        return not value
+    return value is None
+
+
+def _as_request_list(raw: Any) -> list[Any]:
+    """把「挂起请求」端点的响应归一成列表。
+
+    两种形状都出现过：
+
+    - V1 的 ``/permission`` / ``/question``：**裸数组** ``[{…}, …]``
+    - V2 的 ``/api/permission/request`` / ``/api/form``：``{location, data:[…]}``
+
+    认错信封不会报错，只会**静默当成「没有挂起请求」** —— 于是重启后的现场
+    恢复整段失效（那些问过没答的请求不会被拒，opencode 一直等）。所以两种都认，
+    认不出才回空列表。
+    """
+    if isinstance(raw, list):
+        return list(raw)
+    if isinstance(raw, dict) and isinstance(raw.get("data"), list):
+        return list(raw["data"])
+    return []
+
+
 # ── 服务生命周期（IO）────────────────────────────────────────────────── #
 
 class OpenCodeServer:
@@ -496,6 +629,13 @@ class OpenCodeServer:
         #: = False``，如 ``discovery()``）时 :meth:`_write_overlay` 不会被调用，
         #: 若这里不兜底初始化，``close()`` 会 ``AttributeError`` 崩溃。
         self._overlay_written = False
+        #: 写覆盖层时发现的那份**是我们自己的残留**（凭 :data:`_OVERLAY_MARKER`）。
+        #: 真 ⇒ 收尾时**删掉**而不是「还原」——还原等于把那份失效方向的旧闸门
+        #: 再放回去，而它本来就该消失。认不出就 ``False``（宁可漏认）。
+        #:
+        #: ⚠️ **必须在这里初始化**：``close()`` 无条件读它，而不开闸门时
+        #: ``_write_overlay`` 不会被调用 —— 与 ``_overlay_written`` 同一条理由。
+        self._overlay_was_our_leftover = False
         #: 子进程日志落盘位置（诊断用，见 :meth:`child_log`）。
         self._log_path: pathlib.Path | None = None
         #: 日志文件句柄。自己拿着、自己关（见 :meth:`_popen`）。
@@ -510,6 +650,11 @@ class OpenCodeServer:
         self._auth = "Basic " + base64.b64encode(
             f"opencode:{self._password}".encode()
         ).decode()
+        #: 本实例建过的那个会话 id。**只用于拼 V2 的答复路径**
+        #: （``/api/session/{sid}/permission/{pid}/reply``）—— V1 的答复路径不带
+        #: 会话，所以那边取到空串也无所谓。一个实例只建一个会话（``create_session``
+        #: 在 delegate 与 /ask 里都只调一次），所以这个状态是良定义的。
+        self._session_id: str = ""
 
     # -- 生命周期 -------------------------------------------------------- #
     def effective_config(self) -> dict[str, Any]:
@@ -529,7 +674,41 @@ class OpenCodeServer:
         return dict(self._permission_config) if self._permission_config is not None \
             else dict(delegation_permission_config())
 
+    def _adopt_installed_adapter(self) -> None:
+        """把当前适配器切成**本机实际装的**那个 opencode 主版本。
+
+        为什么每个实例起服务前都要先定版本：起服务要用的**全部**端点 —— 就绪
+        探针、建会话、目录、事件流、答复路径、覆盖层写哪个键 —— **都随主版本
+        而变**。用错版本不会报错：V2 会把不认识的路径当 SPA 返回 200，旧字段名
+        被静默忽略。于是症状是「明明有项目却一个都看不到」「闸门没生效却不报错」。
+
+        为什么是这里：``start()`` 是所有真实实例（派发、``/ask``、发现、执行世界）
+        唯一的入口，而 ``delegate.main()`` 只在**派发**那条路上设过适配器。
+        把版本定在入口处，四者就不会各自漂移 —— 这正是 11.8.1 要消灭的那条缝。
+
+        为什么先于 :meth:`_write_overlay` 与 :meth:`_wait_ready`：覆盖层写哪个键
+        （``permission`` 还是 ``permissions``）与就绪探哪个路径都依赖版本，顺序
+        反了就会写错键 / 探错路径。
+
+        探不到就 **raise**（不是回退到 V1）：说不上来在跟哪个版本说话时，拿 V1
+        的端点去问 V2 是**静默失效**，而这里的默认朝关开。
+        """
+        # 延迟 import：``delegate`` 在模块级 import 本模块，顶层 import 会成环。
+        # 与 :mod:`oc_discovery` 里 ``from .opencode_server import OpenCodeServer``
+        # 同一手法。
+        from ..delegate import detect_opencode_version
+
+        major = detect_opencode_version(self._exe)
+        if major is None:
+            raise ServerError(
+                f"探不到 opencode 版本（`{self._exe} --version` 没有可解析的输出）"
+                " —— 不知道在跟哪个版本说话时，拒绝起服务去拿错的端点问它。"
+            )
+        detect_adapter(major)
+
     def start(self) -> "OpenCodeServer":
+        # 先按本机实际版本挑好适配器，再起任何东西（覆盖层键名 / 就绪路径都靠它）。
+        self._adopt_installed_adapter()
         # 非隔离 = 直接跑系统 opencode（真实全局配置 → 用户原生的全局插件 /
         # MCP / 技能，**离线、零重装**）。若开了闸门，把本项目 permission 写成
         # 项目级覆盖层压进去（见 :meth:`_write_overlay`），随 close 还原。
@@ -616,6 +795,22 @@ class OpenCodeServer:
         且离线、零重装。
 
         覆盖层是临时文件：退出时由 :meth:`_restore_overlay` 还原，不污染项目。
+
+        ## 被强杀 ⇒ 残留（2026-10-14 实测踩到）
+
+        执行器被强杀或机器重启时 :meth:`close` 不会执行，覆盖层就**留在用户的
+        项目里**。实测在`` D:/PycharmProjects/xiaoyuan`` 见到一份残留，内容是
+        **当时那份**闸门（写残留时兜底还是 ``*: allow``）—— 它是项目级配置，
+        所以对该项目的**任何** opencode 使用（含手动跑、Desktop）都生效。
+
+        对策分两步，且**刻意不做「启动时静默删掉」**：
+
+        1. **能被精确认出来**：写进去时带 :data:`_OVERLAY_MARKER` 标记注释。
+           「长得像闸门就当残留删掉」这种启发式会在用户自己写了相似配置时
+           **删掉他的文件** —— 在用户背后改他的项目文件，这个仓库明确不做。
+        2. **先告知，再由正常收尾清掉**：认出来时先 :func:`stale_gate_note`
+           把话说给用户听；清理由本次委派结束时的 :meth:`_restore_overlay`
+           完成 —— 那是**把上次没走完的那一步补上**，不是偷偷替他收拾。
         """
         # 尊重已有配置文件名（``.jsonc`` 或 ``.json``），写同名的覆盖层；
         # 关闭时原样还原。若原本没有，则我们创建的那份删掉。
@@ -627,34 +822,60 @@ class OpenCodeServer:
                 break
         if cfg_path is None:
             cfg_path = self._project / "opencode.jsonc"
+        # 认残留：**只认带我们标记的那一份**（见函数 docstring 第 1 条）。
+        # 认不出就当普通既有文件 —— 宁可漏认，绝不误删用户的配置。
+        self._overlay_was_our_leftover = _is_our_overlay(cfg_path)
         self._overlay_backup = cfg_path.read_bytes() if cfg_path.exists() else None
         self._overlay_path = cfg_path
         # ``effective_config()`` 返回的是**完整配置**对象（含 ``$schema`` 与
-        # ``permission`` 两个键，见 :meth:`effective_config` 的文档）—— 它给
-        # 隔离实例当整份配置用。但项目级覆盖层只想压 ``permission`` 一项，
-        # **不能把整份对象再套一层 ``permission``**，否则会变成
+        # 权限容器两个键，见 :meth:`effective_config` 的文档）—— 它给
+        # 隔离实例当整份配置用。但项目级覆盖层只想压**权限**那一项，
+        # **不能把整份对象再套一层容器**，否则会变成
         # ``{"permission": {"$schema": …, "permission": {…}}}`` —— 双层
         # ``permission`` 让 opencode 把这份项目配置当成非法、整份丢弃，回退到
         # 内置默认值（插件 / MCP 全空、权限 ``{}``）。这正是冒烟里「7 插件
         # 变 0、permission 变 {}」的根因。所以这里只取内层规则。
+        #
+        # 容器名**随版本而变**（V1 ``permission``、V2 ``permissions``，见
+        # :data:`~freeagent.services.executors.V2_FIELD_RENAMES`）：读内层与写外层
+        # **必须是同一个键**，否则 V2 下会写出 ``{"permission": …}`` —— 一个 V2
+        # **不认识**的键，于是闸门被静默忽略（回到默认 allow）。这正是我们
+        # 最怕的那类失效，所以键名从适配器一处取。
+        container = current_adapter().field_names["container"]
         full = self.effective_config()
-        rules = full.get("permission", full) if isinstance(full, dict) else full
-        cfg_path.write_text(
-            json.dumps({"permission": rules}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        rules = full.get(container, full) if isinstance(full, dict) else full
+        body = json.dumps({container: rules}, ensure_ascii=False, indent=2)
+        # 标记**只写进 .jsonc**：``.json`` 是严格 JSON，写注释会让整份配置作废，
+        # 而配置作废的后果是「闸门静默失效」—— 那是最坏的一种坏法。
+        # （实测 opencode 用 ``jsonc-parser`` 读 ``.jsonc``，注释没问题：
+        # ``config.ts`` 的 ``parseJsonc(text, errors, {allowTrailingComma: true})``。）
+        if cfg_path.suffix == ".jsonc":
+            body = _OVERLAY_HEADER + body
+        cfg_path.write_text(body, encoding="utf-8")
+        if self._overlay_was_our_leftover:
+            log.warning(
+                "发现上次委派残留的闸门覆盖层：%s（已告知用户；本次委派收尾时会清掉）",
+                cfg_path,
+            )
         self._overlay_written = True
 
     def _restore_overlay(self) -> None:
-        """还原项目级覆盖层（见 :meth:`_write_overlay`）。"""
+        """还原项目级覆盖层（见 :meth:`_write_overlay`）。
+
+        残留那份（:attr:`_overlay_was_our_leftover`）**删掉而不是还原** ——
+        还原等于把那份失效方向的旧闸门（当时可能还是 ``*: allow``）再放回去，
+        而它本来就该消失。
+        """
         if not self._overlay_written:
             return
         path = self._overlay_path
+        was_leftover = self._overlay_was_our_leftover
         self._overlay_written = False
         self._overlay_path = None
+        self._overlay_was_our_leftover = False
         if path is not None:
             try:
-                if self._overlay_backup is None:
+                if self._overlay_backup is None or was_leftover:
                     path.unlink(missing_ok=True)
                 else:
                     path.write_bytes(self._overlay_backup)
@@ -790,11 +1011,19 @@ class OpenCodeServer:
         return text[-max_chars:]
 
     def _wait_ready(self) -> bool:
+        # 就绪探针是**按版本换的**（见 `ExecutorApi.ready_path`）。
+        #
+        # V1 探 ``/config``；V2 探 ``/api/info``。**不能用同一个路径**：V2 对
+        # 非 ``/api/`` 路径一律回一份 SPA 的 HTML（HTTP 200），所以拿 V1 的
+        # ``/config`` 探 V2 会「立刻 200 就绪」—— 而此刻真正的 API 还没起来，
+        # 于是第一次调用就神秘地失败。这是最坏的一类坏法：就绪判定比服务本身
+        # 还宽松，把失败推给下游、还看起来像业务错误。
+        ready_path = _current_api().ready_path
         deadline = time.monotonic() + self._startup_timeout
         while time.monotonic() < deadline:
             if self._proc is not None and self._proc.poll() is not None:
                 return False
-            code, _ = self.call("/config")
+            code, _ = self.call(ready_path)
             if code != -1:
                 return True
             time.sleep(0.5)
@@ -892,6 +1121,63 @@ class OpenCodeServer:
             return raw.decode("utf-8", "replace")
 
     # -- 委派要用到的四件事 ------------------------------------------------ #
+    def _catalog(
+        self,
+        paths: tuple[str, ...],
+        normalize: Any,
+    ) -> Any:
+        """取一组**目录端点**并归一化。V2 的目录有加载窗口，这里负责等它。
+
+        ## 为什么需要「等」
+
+        V2 实测：``/api/info`` 大约 0.6s 就能 200，但**目录数据**（``/api/model``、
+        ``/api/agent``、``/api/provider``）要到约 2.7s 才齐 —— 在那之前
+        ``/api/model`` 回 **503**，而 ``/api/agent``/``/api/provider`` 回 200
+        **但是空数组**。空 agent 列表会让 :mod:`freeagent.delegate` 的
+        「工作模式是否仍有效」那一步**误判为失效并中止一次本来合法的委派**。
+        所以窗口内的空/失败要重试，而不是当场当结论。
+
+        V1 的 ``catalog_lag_seconds`` 是 ``0.0``：单次尝试、行为与从前**逐字一致**
+        （成功即返回，空也返回，失败即抛）。不会给 V1 引入任何轮询。
+
+        :param paths: 端点路径，顺序即请求顺序。
+        :param normalize: 适配器的归一化函数，吃 ``{path: 原始响应}``。
+        """
+        api = _current_api()
+        lag = max(0.0, api.catalog_lag_seconds)
+        deadline = time.monotonic() + lag
+        while True:
+            responses: dict[str, Any] = {}
+            error: Exception | None = None
+            for path in paths:
+                try:
+                    responses[path] = self._must(path)
+                except ServerError as exc:
+                    error = exc
+                    break
+            result: Any = None
+            if error is None:
+                try:
+                    result = normalize(responses)
+                except UnverifiedExecutorError as exc:
+                    # 归一化说「形状不是预期的」。这与「连不上」不同，但对调用方
+                    # 都是「拿不到可用目录」——统一成 ServerError（fail-closed），
+                    # 别把 UnverifiedExecutorError 漏给上层（它只描述适配器状态）。
+                    error = exc
+            if error is None and (
+                not _empty_catalog(result) or time.monotonic() >= deadline
+            ):
+                return result
+            if time.monotonic() >= deadline:
+                if error is not None:
+                    raise ServerError(
+                        f"取目录 {'/'.join(paths)} 失败（等了 {lag:g}s）：{error}"
+                    ) from error
+                # 成功但始终为空：**如实返回空**，不谎报成错误。
+                # 「真的没有任何项目/模型」与「端点坏了」是两件事，上层处置不同。
+                return result
+            time.sleep(0.5)
+
     def create_session(self) -> str:
         """建会话。
 
@@ -899,15 +1185,22 @@ class OpenCodeServer:
         而本类已经在启动时把 cwd 设成委派项目了。再加一个「这次要用哪个目录」
         的入口，就多一条「传的目录和跑的目录不是同一个」的路 ——
         闸门判定的目录必须**只有一个**来源。
+
+        **会话 id 记在实例上**（:attr:`_session_id`）：V2 的答复路径是
+        ``/api/session/{sid}/permission/{pid}/reply``，带会话，而 V1 不带。
+        一个实例只建一个会话，所以这个状态是良定义的。取 id 的形状（V1 顶层
+        ``id``、V2 ``data.id``）住在适配器的 ``session_id_of`` 里。
         """
-        body = self._must("/session", "POST", {})
-        sid = body.get("id") if isinstance(body, dict) else None
-        if not isinstance(sid, str) or not sid:
+        api = _current_api()
+        body = self._must(api.session_create_path, "POST", {})
+        sid = api.session_id_of(body)
+        if not sid:
             raise ServerError(f"建会话没拿到 sessionID：{body!r}")
+        self._session_id = sid
         return sid
 
     def list_projects(self) -> list[dict[str, Any]]:
-        r"""``GET /project`` —— 项目列表。
+        r"""项目列表（V1 ``GET /project`` / V2 ``GET /api/project``）。
 
         ## 为什么不用 ``/config/projects``
 
@@ -917,31 +1210,28 @@ class OpenCodeServer:
         **注意 worktree 的斜杠方向**：实测 HTTP 返回 ``D:\PycharmProjects\openmos``
         （反斜杠），而旧的 ``opencode db`` 查询返回 ``D:/PycharmProjects/openmos``。
         两种都出现过，所以 :mod:`opencode_projects` 的解析必须两种都能处理。
+
+        端点路径与归一化都住在适配器里：V2 的项目对象没有 ``worktree`` 字段
+        （只有一个 ``canonical``），所以由 :func:`_v2_normalize_projects` 合成。
         """
-        raw = self._must("/project")
-        if isinstance(raw, list):
-            return [x for x in raw if isinstance(x, dict)]
-        raise ServerError(f"/project 返回了预期外的形状：{type(raw).__name__}")
+        api = _current_api()
+        return self._catalog(api.projects_paths, api.normalize_projects)
 
     def list_agents(self) -> list[dict[str, Any]]:
-        """``GET /agent`` —— 可选 Agent（工作模式）。
+        """可选 Agent（工作模式）（V1 ``GET /agent`` / V2 ``GET /api/agent``）。
 
-        实测 17 个，含 ``Sisyphus - ultraworker``（primary）、
+        实测（V1）17 个，含 ``Sisyphus - ultraworker``（primary）、
         ``Prometheus - Plan Builder``（primary，自带 variant=xhigh）、
         ``explore`` / ``oracle`` 等 subagent。
 
-        每个元素的 ``model`` 是 ``{providerID, modelID}``，``variant`` 可选 ——
-        也就是说 **Agent 自带的默认 variant 会盖过会话级的选择**，这与
-        ``UserMessage.model.variant`` 的关系需要在真机上验一次（见
-        :meth:`prompt_async` 的注释）。
+        V2 的形状不同（``{location, data:[…]}`` 信封，且 agent 的 ``model``
+        一般是 ``null``）。归一化住在适配器里，调用方拿到的仍是「一个 dict 列表」。
         """
-        raw = self._must("/agent")
-        if isinstance(raw, list):
-            return [x for x in raw if isinstance(x, dict)]
-        raise ServerError(f"/agent 返回了预期外的形状：{type(raw).__name__}")
+        api = _current_api()
+        return self._catalog(api.agents_paths, api.normalize_agents)
 
     def list_models(self) -> dict[str, Any]:
-        """``GET /provider`` —— 可选 provider / 模型 / 推理档位。
+        """可选 provider / 模型 / 推理档位（V1 ``GET /provider`` / V2 ``GET /api/model``+``/api/provider``）。
 
         ## 为什么用 ``/provider`` 而**不是** ``/config/providers``
 
@@ -950,21 +1240,18 @@ class OpenCodeServer:
 
         ``/provider`` 是干净的（``all`` / ``default`` / ``connected``）。
 
-        ## 返回形状
+        ## 返回形状（归一化后**跨版本一致**）
 
         - ``all``          所有 provider，每个带 ``models``（dict）
-        - ``connected``    **已配凭据的** provider id（实测 ``['deepseek','opencode']``）
+        - ``connected``    **已配凭据的** provider id
         - ``default``      provider -> 默认模型
 
-        每个模型带 ``capabilities.reasoning``（能否推理）与
-        ``variants``（可用档位，如 ``{"high": {"reasoningEffort": "high"}}``）。
-        **只有 4300/8475 个模型有 variants，且没有一个带 ``default`` 档** ——
-        所以「不指定推理级别」= 不施加 variant，用模型基线。
+        V2 的 ``/api/model`` 与 ``/api/provider`` 是**两个**端点（``models_paths``
+        有两个），且 ``cost``/``variants`` 都是**数组**、没有 ``connected`` 字段
+        —— 这些差异全在 :func:`_v2_normalize_models` 里抹平。
         """
-        raw = self._must("/provider")
-        if isinstance(raw, dict) and isinstance(raw.get("all"), list):
-            return raw
-        raise ServerError(f"/provider 返回了预期外的形状：{type(raw).__name__}")
+        api = _current_api()
+        return self._catalog(api.models_paths, api.normalize_models)
 
     def prompt_async(
         self,
@@ -1006,62 +1293,68 @@ class OpenCodeServer:
         ``model="opencode/fledge-alpha-free", variant="high"`` 会变成
         ``{"model": {"providerID": "opencode", "modelID": "fledge-alpha-free"},
         "variant": "high", "parts": [...]}``。
+
+        ## 为什么这里只做「发出去」
+
+        载荷形状（``variant`` 在哪一层、``model`` 用 ``modelID`` 还是 ``id``）
+        以及**发几次**都随版本而变：V1 是一次 ``prompt_async``，V2 是三次
+        （先 ``/model``、再 ``/agent``、最后 ``/prompt``）。这些差异全住在
+        :func:`freeagent.services.executors._v1_prompt_calls` /
+        :func:`~freeagent.services.executors._v2_prompt_calls` 里。本方法只负责
+        把适配器给出的每一次调用**逐一发出去**。
         """
-        path = f"/session/{session_id}/prompt_async"
-        if directory:
-            path += f"?directory={urllib.parse.quote(directory, safe='')}"
-        payload: dict[str, Any] = {"parts": [{"type": "text", "text": brief}]}
-        if model:
-            provider, _, name = model.partition("/")
-            # **``variant`` 不在这里** —— 见下面「variant 在顶层」那段。
-            payload["model"] = {
-                "providerID": provider,
-                "modelID": name or provider,
-            }
-        if variant:
-            # **variant 是 ``UserMessage`` 的顶层字段**，不是 ``model`` 的成员。
-            #
-            # 踩过的坑（实测 2026-10-07，opencode 1.18.34）：第一版把它塞进
-            # ``model`` 里，依据是 OpenAPI 里 ``Session.model`` 的形状——
-            # 而那**不是** ``UserMessage.model``。后果极其隐蔽：
-            #   - 服务端**不报错**（HTTP 204，与乱传档名表现完全一样）
-            #   - ``GET /session/{id}`` 回显 ``variant: "default"``
-            #   - 而同一个模型的 ``opencode run --variant high`` 回显 ``high``
-            # 也就是说「选了 High 却没生效」，且**没有任何报错可查**。
-            #
-            # 正确形状由抓 CLI 的真实请求确认：
-            #   ``{"model": {"providerID","modelID"}, "variant": "high", "parts": [...]}``
-            #
-            # 只在真的指定时才带 —— 省略与带空串**不是一回事**（空串会被
-            # 当成 variant 名去查，然后查不到）。
-            payload["variant"] = variant
-        if agent:
-            payload["agent"] = agent
-        # **这一行曾经丢过**，而 prompt_async 因此变成静默的 no-op：
-        # 它把 payload 构造好就返回，什么都没发。断言落在假的 server 上，
-        # 于是测试全绿而真机不工作。构造完**必须**发出去。
-        self._must(path, "POST", payload)
+        api = _current_api()
+        try:
+            calls = api.prompt_calls(session_id, brief, model, agent, variant)
+        except ValueError as exc:
+            # 调用方给错了（如「指定了 variant 却没给 model」）。**绝不静默降级**
+            # —— 那会变成「选了推理级别却没生效、且没有任何报错」，正是本文件
+            # 开头那段踩坑史。翻成 ServerError（fail-closed），让派发响亮失败。
+            raise ServerError(f"指令参数不合法：{exc}") from exc
+        suffix = api.directory_query(directory) if directory else ""
+        # **每一个 call 都必须发出去**（V1 一发、V2 三发）。曾经「构造完 payload
+        # 忘了发」让 prompt_async 变成静默 no-op：断言落在假 server 上、测试全绿
+        # 而真机不动。所以这里对每个 call 都 ``_must``。
+        for method, path, body in calls:
+            self._must(path + suffix, method, body)
 
     def pending_permissions(self, *, directory: str | None = None) -> list[Any]:
         """列出**当前挂起**的授权请求。
 
         用途不是「轮询主路径」（主路径走事件流），而是**恢复现场**：
         执行器重启后，靠它把「上次问过但没人答」的那些捞出来按拒绝处理。
+
+        V1 回**裸数组**、V2 回 ``{location, data:[…]}`` 信封（见
+        :func:`_unwrap_list`）——两种都收，调用方只看见一个列表。
         """
-        path = "/permission"
+        api = _current_api()
+        path = api.permission_pending_path
         if directory:
-            path += f"?directory={urllib.parse.quote(directory, safe='')}"
-        got = self._must(path)
-        return list(got) if isinstance(got, list) else []
+            path += api.directory_query(directory)
+        return _as_request_list(self._must(path))
 
     def reply_permission(
         self, request_id: str, decision: str, *, directory: str | None = None
     ) -> None:
-        """把人的结论送回 opencode。"""
-        path = f"/permission/{urllib.parse.quote(request_id, safe='')}/reply"
+        """把人的结论送回 opencode。
+
+        V2 的答复路径**带 sessionID**（``/api/session/{sid}/permission/{pid}/reply``），
+        所以没建过会话就**响亮拒绝**：发一条注定打到别处（或 404）的答复，
+        症状是「授权卡点了没反应、会话一直等到超时」——比报错难查得多。
+        会话 id 由 :meth:`create_session` 记在实例上。
+        """
+        api = _current_api()
+        if api.reply_needs_session and not self._session_id:
+            raise ServerError(
+                "要回授权，但本实例还没建过会话（V2 的答复路径带 sessionID）"
+                "—— 拒绝发一条注定失败的答复"
+            )
+        method, path, body = api.permission_reply(
+            self._session_id, request_id, decision
+        )
         if directory:
-            path += f"?directory={urllib.parse.quote(directory, safe='')}"
-        self._must(path, "POST", reply_payload(decision))
+            path += api.directory_query(directory)
+        self._must(path, method, body)
 
     def pending_questions(
         self, *, directory: str | None = None
@@ -1073,12 +1366,13 @@ class OpenCodeServer:
         等一个不会来的答复。
 
         刻意**不轮询它**当主路径 —— 主路径走事件流，轮询只是重启后的兜底。
+        V1 回裸数组、V2 回 ``{location, data:[…]}``（端点是 ``GET /api/form``）。
         """
-        path = "/question"
+        api = _current_api()
+        path = api.question_pending_path
         if directory:
-            path += f"?directory={urllib.parse.quote(directory, safe='')}"
-        got = self._must(path)
-        return list(got) if isinstance(got, list) else []
+            path += api.directory_query(directory)
+        return _as_request_list(self._must(path))
 
     def reply_question(
         self,
@@ -1089,22 +1383,38 @@ class OpenCodeServer:
     ) -> None:
         """把人的答复送回 opencode（**一次问一个**攒起来的那份）。
 
-        端点是 ``POST /question/{id}/reply``，与 permission 那条**不是同一个**
-        —— 实测过，别把两条路径合并成一个方法：形状不同、失败含义也不同。
+        端点按版本不同：V1 ``POST /question/{id}/reply``，V2
+        ``POST /api/session/{sid}/form/{id}/reply`` —— 与 permission 那条**不是
+        同一个**，实测过，别把两条路径合并：形状不同、失败含义也不同。
 
-        ``request_id`` 必须 URL 转义：它是执行器给的串，我们不保证它不含
-        斜杠之类需要转义的字符，而未转义的路径会被 ``/`` 切成多段，
-        打到**别的端点**上 —— 那种失败看起来像「服务端说不行」。
+        ``request_id`` 必须 URL 转义（**在适配器里做**）：它是执行器给的串，
+        我们不保证它不含斜杠之类需要转义的字符，而未转义的路径会被 ``/`` 切成
+        多段、打到**别的端点**上 —— 那种失败看起来像「服务端说不行」。
+
+        答复载荷的校验（空答复不许发）也在适配器里，且**先于**任何 IO ——
+        这样「参数不合法」不会先发出一条半截请求。
         """
-        path = f"/question/{urllib.parse.quote(request_id, safe='')}/reply"
+        api = _current_api()
+        if api.reply_needs_session and not self._session_id:
+            raise ServerError(
+                "要回提问，但本实例还没建过会话（V2 的答复路径带 sessionID）"
+                "—— 拒绝发一条注定失败的答复"
+            )
+        method, path, body = api.question_reply(
+            self._session_id, request_id, answers
+        )
         if directory:
-            path += f"?directory={urllib.parse.quote(directory, safe='')}"
-        self._must(path, "POST", question_reply_payload(answers))
+            path += api.directory_query(directory)
+        self._must(path, method, body)
 
     def abort(self, session_id: str) -> None:
-        """叫停。失败只记不抛 —— 叫停是尽力而为，不是必须成功。"""
+        """叫停。失败只记不抛 —— 叫停是尽力而为，不是必须成功。
+
+        V1 是 ``POST /session/{id}/abort``，V2 换成 ``POST /api/session/{id}/interrupt``
+        ——端点名都不同，所以路径由适配器给。
+        """
         with contextlib.suppress(ServerError):
-            self._must(f"/session/{session_id}/abort", "POST", {})
+            self._must(_current_api().abort_path(session_id), "POST", {})
 
     def events(self, *, directory: str | None = None,
                timeout: float = 600.0) -> Iterator[tuple[str, Any]]:
@@ -1112,10 +1422,15 @@ class OpenCodeServer:
 
         用 ``urlopen`` 直接迭代行：SSE 就是「一行一条 data:」，
         上第三方 SSE 库反而多一个依赖。
+
+        端点按版本不同（V1 ``/event``、V2 ``/api/event``），事件名与载荷键的
+        差由 :func:`parse_sse_event` 交给适配器翻译 —— 所以本方法 yield 的
+        ``type`` 仍是调用方认识的**内部事件名**。
         """
-        url = f"{self.base_url}/event"
+        api = _current_api()
+        url = f"{self.base_url}{api.events_path}"
         if directory:
-            url += f"?directory={urllib.parse.quote(directory, safe='')}"
+            url += api.directory_query(directory)
         req = urllib.request.Request(url)
         req.add_header("Authorization", self._auth)
         with urllib.request.urlopen(req, timeout=timeout) as resp:

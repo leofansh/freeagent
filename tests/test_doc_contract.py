@@ -325,6 +325,67 @@ def test_user_docs_mention_the_new_switches():
         assert "私聊" in text, f"{name} 没写清私聊不受影响，代价只限群聊"
 
 
+def test_readme_does_not_revive_the_abandoned_jail_claims():
+    """委派**看得见**用户配置；文档不许再往「更安全」的方向撒谎。
+
+    V1.31 放弃了「隔离 jail + 复制用户配置」，但 README 一直留着 jail 时代的
+    三句话（「配置隔离在一次性目录」「不加载你的插件」「看不到你的环境变量」）。
+    它们是**往安全的方向撒谎** —— 用户会因为这三点而相信一件不成立的事，
+    于是不会去查真相（2026-10-14 实测撞见：委派其实加载 45 个插件 / 5 个 MCP，
+    子进程 ``dict(os.environ)`` 全量继承环境变量）。
+
+    这里锁的是**事实**而不是措辞（仓库自己的教训，见
+    ``test_user_docs_must_state_when_the_unsupported_hint_is_sent`` 的注释：
+    中文子串锁措辞必然脆）。所以断言分两半：
+
+    - **否定**：两句具体的假话不许回来（它们在任何地方都只剩历史陈述的资格）。
+    - **肯定**：README 必须如实说「看得见 / 继承」。将来有人改写措辞，
+      只要概念还在就放过；概念被删掉则红。
+    """
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+
+    false_claims = (
+        # 委派读用户真实配置（isolate=False + dict(os.environ)），这两句是反的
+        "委派不继承你的 opencode 配置",
+        "委派出去的 opencode 看不到你的环境变量",
+    )
+    for phrase in false_claims:
+        assert phrase not in readme, (
+            f"README 又写回了已放弃的 jail 口径：{phrase}"
+        )
+
+    # 肯定侧：必须如实说「看得见」。将来有人改写措辞，只要概念还在就放过。
+    #
+    # ⚠️ 候选词必须**极性安全**：第一版这里写了「继承你的 opencode 配置」，
+    # 而「**不**继承你的 opencode 配置」把它当子串含着了 —— 于是文档写回假话时，
+    # 肯定侧断言照样通过（正向对照当场抓到）。中文子串匹配分不开 继承/不继承，
+    # 但分得开 看得见/看不见。所以只留这类词。
+    assert any(s in readme for s in (
+        "看得见你的 opencode 配置", "不再隔离",
+    )), "README 没写清委派看得见用户配置（真实行为）"
+    # 环境变量那半同理：候选词随 README 的实际措辞跟（它现在写「全量继承」）。
+    # 这一半是**软**断言 —— 防的是「更正被整段删掉、文档重新变哑」；
+    # 硬断言是上面那两条否定（具体假话不许回来）。
+    assert any(s in readme for s in (
+        "全量继承", "看得见你的环境变量",
+    )), "README 没写清委派继承环境变量（真实行为）"
+
+
+def test_readme_splits_will_not_do_from_deferred():
+    """「决定不做」与「延后」必须分开，且「不做」要连代价。
+
+    混在一起写的后果很具体：读者分不清哪条该等、哪条永远不该等，
+    于是把「永久代价」当成「下个版本就有」。分开 + 标代价，
+    这条定位才算可执行。
+    """
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "README.md").read_text(encoding="utf-8")
+    assert "我们决定不做什么" in text, "缺「决定不做」小节"
+    assert "延后" in text, "缺「延后」小节 —— 不做的和还没做的混了"
+    assert "代价" in text, "「不做」没连代价一起写，那只是口号"
+
+
 # --------------------------------------------------------------------- 结构
 def test_doc_code_structure_matches_reality(doc_text: str):
     """文档 12.2 节列出的模块必须真的存在，且都在结构树里出现过。

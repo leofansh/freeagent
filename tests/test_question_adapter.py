@@ -145,23 +145,62 @@ class TestBuildQuestionReply:
         assert "2" in str(exc.value)
 
 
-class TestVersionGateRefusesQuestions:
-    """V2 对提问链路**也**必须拒绝 —— 与它对 permission 的处置一致。
+class TestVersionGateAcceptsQuestions:
+    """V2 对提问链路**已经对着真机验过**，这里守的是它的实测形状。
 
-    猜一个「看起来很像对」的形状比拒绝更危险：错的形状会让 agent 拿到一个
-    自身的回答，而不是人的。
+    原名 ``TestVersionGateRefusesQuestions``，写的是「V2 的提问也必须拒绝」。
+    那在 V2 还没验过时是对的，理由仍然成立：猜一个「看起来很像对」的形状
+    比拒绝更危险 —— 错的形状会让 agent 拿到一个自身的回答，而不是人的。
+    V2 验过之后，这条纪律的**正面**形态是：按实测载荷解析，且选项**按题分组**
+    （V1 那个「扁平选项池」在 V2 上已被证伪）。
+
+    纪律本身没消失，只是载体从「拒绝」换成了「按实测形状解析」。
     """
 
-    def test_parse_raises(self):
-        with pytest.raises(UnverifiedExecutorError):
-            V2.parse_question({"id": "q", "questions": ["x"]})
+    #: 一条 V2 ``form.created`` 的实测载荷（形状见 _v2_parse_question 的 docstring）
+    _FORM = {
+        "id": "frm_1",
+        "sessionID": "ses_1",
+        "title": "Questions",
+        "metadata": {"kind": "question"},
+        "fields": [
+            {
+                "key": "q0",
+                "title": "Color preference",
+                "type": "string",
+                "options": [
+                    {"value": "red", "label": "red"},
+                    {"value": "blue", "label": "blue"},
+                ],
+            },
+            {"key": "q1", "title": "Size", "type": "string"},
+        ],
+    }
 
-    def test_build_reply_raises(self):
-        with pytest.raises(UnverifiedExecutorError):
-            V2.build_question_reply([["x"]])
+    def test_v2_question_adapter_parses_the_real_form_shape(self):
+        q = V2.parse_question(self._FORM)
+        assert q is not None
+        assert q.request_id == "frm_1"
+        assert q.questions == ("Color preference", "Size")
 
-    def test_v2_still_not_dispatchable(self):
-        """这次改动**不改变任何运行时行为** —— V2 仍然拒绝派发。"""
+    def test_v2_options_are_grouped_per_question(self):
+        """V2 的 options 挂在 field 上，一题一组。
+
+        若填成扁平 ``options``，第 2 题的选项会混到第 1 张卡上 ——
+        那正是 V1 那个被证伪的语义。``options`` 必须留空。
+        """
+        q = V2.parse_question(self._FORM)
+        assert q is not None
+        assert q.options == (), "扁平选项池在 V2 上是错的语义"
+        assert q.option_groups == (("red", "blue"), ())
+
+    def test_v2_question_reply_uses_the_answer_envelope(self):
+        """V2 的答复是 ``{"answer": {"q0": ...}}``，键名按位置推导。"""
+        out = V2.build_question_reply([["red"], ["large"]])
+        assert out == {"answer": {"q0": "red", "q1": "large"}}
+
+    def test_v2_is_dispatchable(self):
+        """V2 现在也是已验证的，所以它应该能派发。"""
         from freeagent.services.executors import dispatchable_majors
-        assert 2 not in dispatchable_majors()
-        assert dispatchable_majors() == (1,)
+        assert 2 in dispatchable_majors()
+        assert set(dispatchable_majors()) == {1, 2}

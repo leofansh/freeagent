@@ -488,6 +488,77 @@ class TaskRepo(_RepoBase):
         if cursor.rowcount == 0:
             raise NotFoundError("事务", task_id)
 
+    # -- 委派执行期进度投影（12.8 / V1.35）---------------------------------- #
+    #
+    # 这一组方法**只存取不判断**（12.3 的分层纪律）。特别是：
+    # 「这行算不算陈旧」「这条委派算不算还在跑」都不在这里判定 ——
+    # 陈旧要按读方的时钟算（执行器与 Web 是两个进程，各有各的 now），
+    # 而把「陈旧阈值」写进存储层就等于让存储层知道有个 Web 在读它。
+    # 所以这里只给 ``updated_at``，判陈旧是读方的事。
+
+    def set_delegate_progress(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        recent: str,
+        tool_calls: int,
+        allowed: int,
+        project: str,
+        now: datetime,
+    ) -> None:
+        """写下这条委派「此刻跑到哪了」。**UPSERT**。
+
+        为什么是 UPSERT 而不是先删后插：一次委派会写几十次，
+        「删+插」每次多一条事务，而执行器那边还要抢 ``App.lock``
+        （另一个进程可能正在读同一条任务）。单条 UPSERT 是一趟往返，
+        也让「这一瞬间只有一行」由数据库自己保证。
+        """
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO delegate_progress"
+                " (task_id, status, recent, tool_calls, allowed, project,"
+                "  updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(task_id) DO UPDATE SET"
+                " status=excluded.status, recent=excluded.recent,"
+                " tool_calls=excluded.tool_calls, allowed=excluded.allowed,"
+                " project=excluded.project, updated_at=excluded.updated_at",
+                (task_id, status, recent, tool_calls, allowed, project,
+                 now.isoformat()),
+            )
+
+    def clear_delegate_progress(self, task_id: str) -> None:
+        """清掉这条委派的进度行。**跑完就调用，幂等**。
+
+        刻意**不**抛「行不存在」：四个收口点都会调它，而重复清理
+        （正常结束 + 异常收口都走一遍）是常态。让它抛会把
+        「已经清干净了」说成故障。
+        """
+        with self._tx():
+            self._conn.execute(
+                "DELETE FROM delegate_progress WHERE task_id = ?", (task_id,)
+            )
+
+    def delegate_progress(self, task_id: str) -> dict[str, object] | None:
+        """读单条进度投影。没有行返回 ``None``（不抛）。"""
+        row = self._conn.execute(
+            "SELECT * FROM delegate_progress WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return _progress_row_to_dict(row) if row is not None else None
+
+    def open_delegate_progress(self) -> list[dict[str, object]]:
+        """全部进度投影，**按更新时间倒序**（最近动的在最前）。
+
+        倒序而不是按 task_id：这张表的读取方是 WEB 面板，
+        它要回答「现在有什么在动」，而那个顺序只由「最后动的时间」决定。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM delegate_progress"
+            " ORDER BY updated_at DESC, task_id"
+        ).fetchall()
+        return [_progress_row_to_dict(r) for r in rows]
+
     # -- 读 ------------------------------------------------------------------ #
     def get(self, task_id: str) -> Task:
         row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -852,6 +923,29 @@ class ArtifactRepo(_RepoBase):
             accepted_at=_dt_in(row["accepted_at"]),
             supersedes=row["supersedes"],
         )
+
+
+def _progress_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    """一行进度投影 → 字典（12.8）。
+
+    **刻意不建成 dataclass**：这张表没有不变量、没有状态机、没有合法值
+    集合 —— 它是一组给人看的字符串与两个计数器。为它定义一个值对象，
+    等于把「进度」提升成领域概念，而它在设计上是**展示层投影**（12.8
+    明确它不是真源）。真源那份是飞书卡的正文与任务的 append-only 日志。
+
+    计数取 ``int(...)``：SQLite 的 INTEGER 取回来已经是 int，
+    而列有 NOT NULL DEFAULT 0 兜底，所以这里不会读到 None ——
+    真读到了就是**数据库坏了**，那应该炸出来而不是被静默当成 0。
+    """
+    return {
+        "task_id": row["task_id"],
+        "status": row["status"] or "",
+        "recent": row["recent"] or "",
+        "tool_calls": int(row["tool_calls"]),
+        "allowed": int(row["allowed"]),
+        "project": row["project"] or "",
+        "updated_at": row["updated_at"],
+    }
 
 
 # --------------------------------------------------------------------------- #

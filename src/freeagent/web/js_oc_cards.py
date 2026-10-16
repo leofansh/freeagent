@@ -20,7 +20,8 @@ script 块」，所以拆分**不能**变成多个 script。
 ## 为什么派发卡要说「建了事务≠ 已经在跑」
 
 执行器是独立进程，只跑「已确认且已 ``/start``」的事务。话术里不说清，
-用户会以为建完就有人在改代码了 —— 而授权卡还在飞书等着他点。
+用户会以为建完就有人在改代码了 —— 而授权卡还等着他点（现在是在本页顶部
+那块面板里等着，设计文档 12.8）。
 """
 
 from __future__ import annotations
@@ -165,7 +166,7 @@ function ocDispatchView(data, root, repaint) {
             try {
               go.textContent = "已开始";
               st.textContent = "执行器会接手（它得在跑：python -m freeagent.delegate）";
-              toast("已开始 —— 动手前的授权卡会发到飞书");
+              toast("已开始 —— 进度与授权卡会出现在本页顶部的面板里");
             } catch (err2) {
               st.textContent = "开始失败：" + err2.message;
               go.disabled = false;
@@ -196,7 +197,9 @@ function ocDispatchView(data, root, repaint) {
   box.appendChild(el("div", "hint",
     "<strong>建了事务 ≠ 已经在跑。</strong> 建好后点「开始做」，执行器（独立进程）" +
     "才会接手 —— 它得在跑（python -m freeagent.delegate）。<br>" +
-    "opencode 每要动手一次，仍然会在<strong>飞书</strong>给你一张授权卡。" +
+    "开始之后，上面那块面板会实时显示进度、每次动手要你批的授权卡、" +
+    "以及它反问你的问题。飞书那边是同一套卡（两个界面互不干扰）。<br>" +
+    "<strong>授权不会因为你没看面板就通过</strong> —— 沉默按拒绝算，" +
     "代码不该在你没点过的情况下动。"));
   return box;
 }

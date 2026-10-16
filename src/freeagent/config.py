@@ -78,6 +78,20 @@ DEFAULT_PROVIDER = "deepseek"
 #: provider 的环境变量覆盖名。与 MODEL_ENV / BASE_URL_ENV 同一套优先级语义。
 PROVIDER_ENV = "FREEAGENT_LLM_PROVIDER"
 
+#: 委派实例「要不要加载用户 opencode 插件」的全部合法取值。
+#:
+#: 为什么用**枚举**而不是布尔：``true`` / ``"yes"`` / ``""`` 都能被读成布尔，
+#: 而「以为关了插件其实开着」是**最难发现**的那种失效 —— 界面上看不出任何异常，
+#: 委派照跑，只是多了一群没人审的工具。写错就直接报错。
+PLUGIN_MODES = ("inherit", "off")
+
+#: 默认**继承**插件（保持现状、保留用户原生的 MCP 与技能）。
+#:
+#: 刻意不默认 ``off``：那会**静默削掉用户正在用的工具**（本机就有 codegraph /
+#: context7 / grep_app / lsp / websearch），是功能回退，不该由实现替用户决定。
+#: 安全性不靠这个开关 —— 执行期闸门已经失败关闭（设计文档 11.8.1 的 ``*: ask``）。
+DEFAULT_PLUGIN_MODE = "inherit"
+
 
 def config_path(home: str | Path | None = None) -> Path:
     """配置文件路径。目录不存在则返回预期路径（不创建）。
@@ -217,6 +231,9 @@ class Config:
     #: 刻意不给收费的默认值：账户余额不足时收费模型会直接 402 失败。
     #: 要指定就用实测不需要余额的那批（名字带 ``-free``）。
     delegate_model: str = ""
+    #: 委派实例要不要加载用户的 opencode 插件。**只认两个值**（见
+    #: :data:`PLUGIN_MODES` 与 :meth:`delegate_policy` 的字段注释）。
+    delegate_plugins: str = DEFAULT_PLUGIN_MODE
     home: str | None = None
 
     @property
@@ -315,6 +332,7 @@ class Config:
             model=self.delegate_model or selection.model,
             agent=selection.agent,
             variant=selection.variant,
+            plugins=self.delegate_plugins,
         )
 
 
@@ -355,6 +373,24 @@ def load_config(home: str | Path | None = None) -> Config:
 
     delegate_model = str(delegate_raw.get("model") or "").strip()
 
+    # 插件模式。**「没写」与「写了但是错的」必须分开**：
+    #
+    # - 键**不存在** ⇒ 用默认（这是可选项，没配就该正常跑）。
+    # - 键**存在** ⇒ 必须落在枚举里，哪怕值是 ``""`` / ``null``。
+    #
+    # 之前写成 ``get("plugins") or DEFAULT``，于是 ``"plugins": ""`` 被当成
+    # 「没配」而静默继承插件 —— 失败方向错了：用户以为自己关了插件，实际全在，
+    # 而且界面上看不出任何异常（自己的测试当场抓到了这个）。
+    if "plugins" in delegate_raw:
+        delegate_plugins = str(delegate_raw["plugins"] or "").strip()
+        if delegate_plugins not in PLUGIN_MODES:
+            raise ValidationError(
+                f"config.delegate.plugins 只能是 {' 或 '.join(PLUGIN_MODES)}"
+                f"，收到：{delegate_plugins!r}"
+            )
+    else:
+        delegate_plugins = DEFAULT_PLUGIN_MODE
+
     model = os.environ.get(MODEL_ENV) or llm.get("model") or DEFAULT_MODEL
     vision_model = (
         os.environ.get(VISION_MODEL_ENV)
@@ -389,6 +425,7 @@ def load_config(home: str | Path | None = None) -> Config:
         llm_view_routing=bool(llm.get("view_routing", False)),
         delegate_projects=tuple(delegate_projects),
         delegate_model=delegate_model,
+        delegate_plugins=delegate_plugins,
         home=resolved_home,
     )
 
@@ -521,6 +558,9 @@ def config_from_settings(
         # 最硬的安全约束。设置页本来就不该碰它，所以照搬、不接受输入。
         delegate_projects=base.delegate_projects,
         delegate_model=base.delegate_model,
+        # 同样照搬：插件模式决定委派实例加载什么，属于执行期行为，
+        # 不该被「在设置页存一次设置」顺手改掉。
+        delegate_plugins=base.delegate_plugins,
         home=base.home,
     )
 
@@ -560,6 +600,7 @@ def save_config(config: Config, home: str | Path | None = None) -> Path:
         "delegate": {
             "projects": list(config.delegate_projects),
             "model": config.delegate_model,
+            "plugins": config.delegate_plugins,
         },
     }
     path.write_text(

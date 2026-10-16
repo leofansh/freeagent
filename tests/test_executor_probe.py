@@ -42,6 +42,25 @@ def major(monkeypatch):
     return _set
 
 
+@pytest.fixture()
+def unverified_major(monkeypatch):
+    """造一个**认识但没验过**的 opencode 主版本（借 hermes 的 verified=False）。
+
+    为什么需要这个夹具：V1 与 V2 现在**都** ``verified=True``，
+    拿其中任何一个当「未验证」的反例都不成立 —— 那会让
+    「未验证时一桶都不给」这条纪律失去载体。
+    """
+    import dataclasses
+
+    from freeagent.services import executors as ex
+
+    hermes = ex.adapter_for(0, "hermes")
+    assert hermes is not None and not hermes.verified
+    fake = dataclasses.replace(hermes, executor="opencode", major=7)
+    monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, fake))
+    return 7
+
+
 # --------------------------------------------------------------------------- #
 # 三桶（11.10.3）
 # --------------------------------------------------------------------------- #
@@ -55,17 +74,21 @@ class TestBuckets:
         assert got.dispatchable is True
         assert got.capabilities == (P.READ, P.WRITE, P.APPROVE)
 
-    def test_unverified_gets_no_bucket_at_all(self, which, major):
+    def test_unverified_gets_no_bucket_at_all(self, which, major, unverified_major):
         """⚠️ 未验证时**一桶都不给** —— 不给「至少能读」。
 
         「能读」在 opencode 侧对应 ``allow`` 规则，声称它就是在声称
         「权限配置生效了」，而那正是未验证时**不能声称**的。
+
+        用夹具造的 V7 当反例：V1/V2 都已 ``verified=True``，
+        拿它们当「未验证」的例子会让这条纪律失效。
         """
         which(True)
-        major(2)          # 认识但 verified=False
+        major(unverified_major)
         got = P.probe_opencode()
         assert got.dispatchable is False
-        assert got.capabilities == ()
+        assert got.capabilities == (), "未验证时一桶都不给，连 read 也不给"
+        assert "未验证" in got.unavailable_reason
 
     def test_there_are_exactly_three_buckets(self):
         """桶**只**这三个 —— 多一个就等于「flag 多到没人能读」。"""
@@ -103,14 +126,14 @@ class TestNoSilentFallback:
         assert got.dispatchable is False
         assert "探不到" in got.unavailable_reason
 
-    def test_unknown_major_and_unverified_major_differ(self, which, major):
+    def test_unknown_major_and_unverified_major_differ(self, which, major, unverified_major):
         """「不认识」与「认识但没验过」必须给**不同**的话。
 
         该做的事不同：前者要升级/降级本仓，后者要对真机实测适配器。
         合成一句「不可用」等于让人自己猜下一步。
         """
         which(True)
-        major(2)
+        major(unverified_major)
         unverified = P.probe_opencode().unavailable_reason
         which(True)
         major(99)
@@ -187,9 +210,9 @@ class TestRender:
         assert "探不到" in text
         assert "主版本：0" not in text
 
-    def test_gives_the_reason_when_not_dispatchable(self, which, major):
+    def test_gives_the_reason_when_not_dispatchable(self, which, major, unverified_major):
         which(True)
-        major(2)
+        major(unverified_major)
         text = P.render_probe(P.probe_opencode())
         assert "未验证" in text
         assert "为什么不可派发" in text

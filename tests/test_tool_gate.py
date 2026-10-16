@@ -48,15 +48,28 @@ class TestIsolatedConfig:
         assert perm["task"] == "deny"
 
     def test_mutating_actions_ask(self) -> None:
-        """改文件 / 跑命令 / 出网 —— 逐次授权闸门真正要拦的。"""
+        """改文件 / 跑命令 / 出网 —— 逐次授权闸门真正要拦的。
+
+        ⚠️ 写文件在 V1 是**四个**工具（2026-10-14 实测）：``edit`` /
+        ``write`` / ``multiedit`` / ``apply_patch``。漏掉后三个时它们落到兜底
+        规则，而 ``tool/registry.ts`` 对含 ``gpt-`` 的模型只给 ``apply_patch``
+        并把 ``edit``/``write`` 过滤掉 —— 那时闸门被整体绕过。
+        """
         perm = delegation_permission_config()["permission"]
-        for action in ("edit", "bash", "webfetch", "websearch"):
+        for action in ("edit", "write", "multiedit", "apply_patch",
+                       "bash", "webfetch", "websearch", "skill"):
             assert perm[action] == "ask", f"{action} 必须是 ask"
 
     def test_read_only_stays_allowed(self) -> None:
-        """read/grep/glob 全 ask 会让 agent 一直问 —— 问到最后就是无脑点。"""
+        """read/grep/glob 全 ask 会让 agent 一直问 —— 问到最后就是无脑点。
+
+        断言的是**这些工具本身**放行，而不是「靠 ``*: allow`` 顺带放行」：
+        兜底已改成 ``ask``（失败关闭），放行必须逐个登记。
+        """
         perm = delegation_permission_config()["permission"]
-        assert perm["*"] == "allow"
+        for tool in ("read", "list", "glob", "grep", "codesearch", "lsp"):
+            assert perm[tool] == "allow", f"{tool} 是干活必需的，不该问"
+        assert perm["*"] == "ask", "兜底失败关闭：未登记的一律要人点头"
 
     def test_serialises_as_v1_object(self) -> None:
         """必须是 V1 的**对象**形态（V2 是数组）。"""

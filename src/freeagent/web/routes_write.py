@@ -24,6 +24,7 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_delegate_action,
     endpoints_delegate_projects,
     endpoints_feishu_config,
     endpoints_oc_dispatch,
@@ -83,6 +84,27 @@ def dispatch_post(
         # 触发」的路径（浏览器预取、爬虫、`<img src>` 都会自动发 GET）。
         return HTTPStatus.OK, endpoints_delegate_projects.delegate_projects_save(
             app, read_body()
+        )
+
+    # 委派实时交互（12.8 / V1.35）。三条都是「点一下就改授权状态」，
+    # 全部 POST-only —— 与 delegate/projects 同一条纪律：能被预取的
+    # 方法绝不能挂在改变安全状态的操作上。
+    if (len(parts) == 4 and parts[:3] == ["api", "delegate", "approvals"]):
+        return HTTPStatus.OK, endpoints_delegate_action.approval_action(
+            app, parts[3], read_body()
+        )
+
+    if (len(parts) == 5 and parts[:3] == ["api", "delegate", "approvals"]
+            and parts[4] == "stop"):
+        # 「停止这条委派」是**两件事**：回掉当前挂起 + 记停止请求。
+        # 缺任一件的症状不同但都像「点了没反应」，见端点说明。
+        return HTTPStatus.OK, endpoints_delegate_action.approval_stop(
+            app, parts[3]
+        )
+
+    if (len(parts) == 4 and parts[:3] == ["api", "delegate", "questions"]):
+        return HTTPStatus.OK, endpoints_delegate_action.question_answer(
+            app, parts[3], read_body()
         )
 
     if len(parts) == 4 and parts[:2] == ["api", "services"]:

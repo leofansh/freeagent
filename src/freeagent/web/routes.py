@@ -16,6 +16,7 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_delegate_live,
     endpoints_delegate_projects,
     endpoints_feishu,
     endpoints_feishu_config,
@@ -45,6 +46,10 @@ def feishu_routes() -> dict[str, Callable[..., Any]]:
         # 委派白名单候选（只读）。**授权动作另走 POST** —— 查是纯观测、
         # 可以随手做；授权是安全边界，得单独一步。见设计文档 12.7.1。
         "/api/delegate/projects": endpoints_delegate_projects.delegate_projects,
+        # 委派实时面板的只读快照（12.8 / V1.35）。**纯只读**：每 2 秒调一次，
+        # 任何副作用都会在几秒内变成事故（参见 routes 里 _reminders 那段
+        # 「GET 有副作用」的旧账）。决定动作在 POST 侧，见 routes_write。
+        "/api/delegate/live": endpoints_delegate_live.delegate_live,
         # 后台服务统一状态（只读）。启停动作在 POST 侧，见 routes_write。
         "/api/services": endpoints_services.services,
         # OpenCode 四段选项（只读）。选择与清单的**修改**在 POST 侧 ——

@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from freeagent import delegate as dg
@@ -26,9 +28,14 @@ from freeagent.services import opencode_server as oc
 
 class TestRegistry:
     def test_known_is_not_the_same_as_dispatchable(self):
-        """「知道」与「能派发」是两个概念，混淆它就是闸门失效的前置。"""
+        """「知道」与「能派发」是两个概念，混淆它就是闸门失效的前置。
+
+        opencode 的 V1/V2 都 ``verified=True``，所以它俩已知即可派；
+        未验证的那条纪律改由 ``hermes`` 承载（见 TestUnverifiedRefusesLoudly）。
+        """
         assert ex.known_majors("opencode") == (1, 2)
-        assert ex.dispatchable_majors("opencode") == (1,)
+        assert ex.dispatchable_majors("opencode") == (1, 2)
+        assert ex.dispatchable_majors("hermes") == ()
 
     def test_unknown_major_returns_none_and_never_falls_back(self):
         """**最关键的一条。** 回落是原 bug 的形状：字段名对不上、
@@ -46,18 +53,29 @@ class TestRegistry:
         assert a is not None and a.verified
         assert a.executor == "opencode"
 
-    def test_v2_adapter_exists_but_is_not_verified(self):
-        """**存在但未验证** —— 这是本次改动的核心状态。
-
-        有了它，版本闸门才能说「认识但没验过」而不是笼统的「不认识」。
-        """
+    def test_v2_adapter_is_verified_too(self):
+        """V2 已对着真机验过（实测 opencode 2.0.29），与 V1 同为可派发。"""
         a = ex.adapter_for(2)
         assert a is not None
-        assert a.verified is False
+        assert a.verified is True
 
 
-class TestV2RefusesLoudly:
-    """V2 照文档写、没实测 —— 所以每个方法都要抛，而不是给一个猜的形状。"""
+class TestUnverifiedRefusesLoudly:
+    """**未验证**的执行器，每个协议入口都要抛，而不是给一个猜的形状。
+
+    原名 ``TestV2RefusesLoudly``，写的是「V2 照文档写、没实测」。
+    V2 后来对着真机验过了，于是这条纪律换了载体：守的不再是
+    「V2 不许用」，而是「**没对着真机验过的执行器不许用**」——
+    由 ``hermes``（``verified=False``、``major=0``）继续承载。
+
+    注意抛错的机制：不是 ``verified`` 字段自动生效，而是适配器里的
+    协议函数**本身**被换成了抛错的桩（``_hermes_unverified``）。
+    所以这个测试守的是「桩真的在每个入口都装上了」——
+    漏一个入口，就等于在那个入口给出了一个猜的形状。
+
+    换载体而不是删测试：猜形状会让 permission 被静默忽略、
+    闸门失效且方向回到 allow，那是本仓最恨的一类失败。
+    """
 
     @pytest.mark.parametrize(
         "call",
@@ -69,20 +87,40 @@ class TestV2RefusesLoudly:
         ids=["permission_config", "parse_request", "reply_payload"],
     )
     def test_every_entry_point_raises(self, call):
-        a = ex.adapter_for(2)
+        a = ex.adapter_for(0, "hermes")
+        assert a is not None, "hermes 必须已登记 —— 它是这条纪律的载体"
         with pytest.raises(ex.UnverifiedExecutorError) as exc:
             call(a)
         msg = str(exc.value)
         # 错误信息要能照着做：说清缺的是什么、要去哪改
         assert "尚未验证" in msg
-        assert "executors.py" in msg or "官方文档" in msg
+        assert "设计文档" in msg or "executors.py" in msg or "官方文档" in msg
 
     def test_error_names_the_missing_piece(self):
-        """具体到「数组元素的形状」，而不是笼统的「不支持」。"""
-        a = ex.adapter_for(2)
-        with pytest.raises(ex.UnverifiedExecutorError) as exc:
-            a.build_permission_config()
-        assert "数组元素" in str(exc.value)
+        """要指名**缺的是哪一块**，而不是笼统的「不支持」。
+
+        逐入口点名，因为漏一个入口 = 那个入口会给出一个猜的形状。
+        """
+        a = ex.adapter_for(0, "hermes")
+        expected = {
+            "build_permission_config": ("permission 配置形状", ()),
+            "build_read_only_config": ("只读配置形状", ()),
+            "parse_request": ("授权请求事件形状", ({"id": "per_1"},)),
+            "build_reply": ("答复载荷形状", ("allow",)),
+            "parse_question": ("提问事件形状", ({"id": "q_1"},)),
+            "build_question_reply": ("提问答复载荷形状", ("form_1", ["a"])),
+        }
+        for method, (piece, args) in expected.items():
+            with pytest.raises(ex.UnverifiedExecutorError) as exc:
+                getattr(a, method)(*args)
+            assert piece in str(exc.value), f"{method} 要指名缺「{piece}」"
+
+    def test_hermes_is_registered_but_not_dispatchable(self):
+        """登记 ≠ 能派 —— 清单里要有它，闸门不许放。"""
+        assert ex.adapter_for(0, "hermes") is not None
+        assert "hermes" in ex.known_executors()
+        assert ex.known_majors("hermes") == (0,)
+        assert ex.dispatchable_majors("hermes") == ()
 
     def test_known_renames_are_recorded_as_data(self):
         """**我们确实知道**的改名要被记下来且可断言 —— 那部分不是猜的。"""
@@ -96,32 +134,53 @@ class TestV2RefusesLoudly:
 
 class TestVersionGate:
     def test_supported_major_is_derived_from_registry(self):
-        """闸门放行的版本来自注册表，不是硬编码常量。"""
-        assert dg.SUPPORTED_OPENCODE_MAJOR == 1
+        """闸门放行的版本来自注册表，不是硬编码常量。
+
+        刻意**不**写死成某个数字：V1 与 V2 都对着真机验过
+        （``verified=True``），所以「最新那个」会随注册表变。
+        断言的是**来源**，不是当前值。
+        """
+        assert dg.SUPPORTED_OPENCODE_MAJOR == max(ex.dispatchable_majors("opencode"))
         assert dg.SUPPORTED_OPENCODE_MAJOR in ex.dispatchable_majors("opencode")
 
-    def test_expected_version_passes(self):
+    def test_both_verified_majors_pass(self):
+        """V1 与 V2 都对着真机验过 —— 两个都必须放行。"""
         assert dg.version_mismatch_reason(1) is None
+        assert dg.version_mismatch_reason(2) is None
 
     def test_unprobeable_is_refused(self):
         r = dg.version_mismatch_reason(None) or ""
         assert "探不到" in r
 
-    def test_unverified_major_is_refused_with_its_own_reason(self):
-        r = dg.version_mismatch_reason(2) or ""
+    def test_unverified_major_is_refused_with_its_own_reason(self, monkeypatch):
+        # 「未验证」与「不认识」是**两条不同的拒绝分支**，做的事不同：
+        # 前者是「本仓知道有这个版本但没对着真机验过」，后者是「压根没见过」。
+        # 触发前者需要注册表里**存在**一个 verified=False 的条目 ——
+        # 借 hermes（真·未验证）改一个主版本号来当例子，比伪造一个假适配器更真。
+        hermes = ex.adapter_for(0, "hermes")
+        assert hermes is not None and not hermes.verified
+        as_v7 = dataclasses.replace(hermes, executor="opencode", major=7)
+        monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, as_v7))
+        r = dg.version_mismatch_reason(7) or ""
         assert "未验证" in r
-        assert "数组元素" in r, "要指出到底缺哪一块，而不只是「不支持」"
+        # 要指出**下一步怎么接**，而不只是「不支持」——
+        # 拒绝理由必须能照着做，否则用户只能去猜。
+        assert "executors.py" in r, "要指名去哪个文件填形状"
+        assert "verified" in r, "要指名改哪个字段才能放行"
 
-    def test_unknown_major_is_refused_with_a_different_reason(self):
-        """三种拒绝必须**各不相同** —— 该做的事不同，说法就该不同。"""
-        unknown = dg.version_mismatch_reason(3) or ""
-        unverified = dg.version_mismatch_reason(2) or ""
+    def test_unknown_major_is_refused_with_a_different_reason(self, monkeypatch):
+        """两种拒绝必须**各不相同** —— 该做的事不同，说法就该不同。"""
+        hermes = ex.adapter_for(0, "hermes")
+        as_v7 = dataclasses.replace(hermes, executor="opencode", major=7)
+        monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, as_v7))
+        unknown = dg.version_mismatch_reason(99) or ""
+        unverified = dg.version_mismatch_reason(7) or ""
         assert unknown != unverified
         assert "不认识" in unknown
         assert "升级本仓" in unknown or "降回" in unknown
 
     def test_the_message_lists_known_versions(self):
-        r = dg.version_mismatch_reason(3) or ""
+        r = dg.version_mismatch_reason(99) or ""
         assert "[1, 2]" in r, "要告诉用户本仓知道哪些版本"
 
     @pytest.mark.parametrize(
@@ -171,16 +230,36 @@ class TestBackendKnowledgeLivesInOnePlace:
             ex.adapter_for(1).build_permission_config()
 
     def test_permission_config_keeps_the_v1_shape(self):
-        """V1 的字段名与键序 —— 键序有意义（last matching rule wins）。"""
+        """V1 的字段名与键序 —— 键序有意义（last matching rule wins）。
+
+        兜底是 ``*: ask`` 而不是 ``*: allow``（2026-10-14 实测改的）：
+        未登记的工具必须逐次问人，否则 opencode 将来新增一个能改文件的
+        工具时，会**静默继承 allow** —— 闸门失效的方向是放开，不是收紧。
+        """
         cfg = oc.delegation_permission_config()
         assert "permission" in cfg, "V1 用 permission 对象"
         body = cfg["permission"]
-        assert list(body) == [
-            "*", "edit", "bash", "webfetch", "websearch",
-            "task", "external_directory",
-        ], "通配必须最前、deny 必须最后，否则被 *: allow 覆盖"
+        keys = list(body)
+        assert keys[0] == "*", "通配必须最前，否则后面逐条 allow 就没有兜底意义"
+        assert body["*"] == "ask", "未登记的一律要人点头 —— 这是 fail-closed"
+        assert keys[-1] == "external_directory", "deny 必须最后，否则被覆盖"
         assert body["external_directory"] == "deny", "永不越界"
         assert body["task"] == "deny", "不让它拉子代理"
+
+    def test_write_tools_all_ask(self):
+        """会改文件的每个工具都要逐次问 —— 漏一个就是一个后门。"""
+        body = oc.delegation_permission_config()["permission"]
+        for tool in ("edit", "write", "multiedit", "apply_patch", "bash", "skill"):
+            assert body[tool] == "ask", f"{tool} 必须逐次授权"
+
+    def test_read_tools_are_allowed_so_gates_do_not_turn_deaf(self):
+        """读与检索不拦 —— 全拦会一路问到用户开始无脑点「允许」。
+
+        这条与上一条是一对：写要问、读不问，闸门才既安全又可用。
+        """
+        body = oc.delegation_permission_config()["permission"]
+        for tool in ("read", "list", "glob", "grep", "codesearch", "lsp"):
+            assert body[tool] == "allow", f"{tool} 是只读，不该拦"
 
     def test_reply_payload_shape_is_preserved(self):
         """实测：裸字符串 → 400 Expected object；必须带 reply 键。"""
@@ -233,15 +312,21 @@ class TestBackendKnowledgeLivesInOnePlace:
 
 class TestAdapterSwapping:
     def test_set_current_adapter_is_reversible(self):
-        """换适配器必须能换回来 —— 它是全局状态，测试之间会互相污染。"""
+        """换适配器必须能换回来 —— 它是全局状态，测试之间会互相污染。
+
+        原断言是「切到 V2 会抛 UnverifiedExecutorError」，那写在 V2 还没对着
+        真机验过时。V2 现在是实测实现，改成断言**它给出的确实是 V2 的形状**——
+        这才是这条纪律的正面 counterpart：切了适配器，配置就得跟着变。
+        """
         original = oc.current_adapter()
         v2 = ex.adapter_for(2)
         try:
             oc.set_current_adapter(v2)
             assert oc.current_adapter() is v2
-            # 换过去之后调用会响，而不是静默给出 V1 的形状
-            with pytest.raises(ex.UnverifiedExecutorError):
-                oc.delegation_permission_config()
+            cfg = oc.delegation_permission_config()
+            assert "shell" in str(cfg) or "subagent" in str(cfg), (
+                "切到 V2 后配置应是 V2 的形状，而不是 V1 的"
+            )
         finally:
             oc.set_current_adapter(None)
         assert oc.current_adapter() is original

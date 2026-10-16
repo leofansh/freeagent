@@ -89,12 +89,15 @@ function renderOcSelection(data, root) {
   // ``getElementById`` 返回的是**第一份**，于是「清单已生效」也看不出来。
   // 症状是「勾了没反应」—— 而真实原因是自己把自己画了两遍。
   root.appendChild(el("div", "title", "编程"));
+  // 实时面板**放最上面**：有委派在跑或等你批时，那是这一页最该先看到的东西，
+  // 埋在四段下拉与清单下面就等于没有（设计文档 12.8）。
+  mountLivePanel(root);
   root.appendChild(el("div", "hint",
     "这四段决定「交给 opencode 时用哪个项目、哪个工作模式、" +
     "哪个模型、哪个推理档」。跟飞书里那四张卡<strong>是同一份数据</strong>，" +
     "所以在飞书选过的这里也一样。<br>" +
-    "这个页签主要是<strong>配置与试验</strong>：" +
-    "真正干活时工具授权卡仍走飞书 —— 代码不该在你没点过的情况下动。"));
+    "这个页签<strong>配置 + 实时交互</strong>：授权卡与提问都在上面的面板里，" +
+    "飞书那边是同一套 —— 代码不该在你没点过的情况下动。"));
 
   if (!data.discovery_ok) {
     root.appendChild(el("div", "note",

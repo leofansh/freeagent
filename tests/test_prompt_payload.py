@@ -19,6 +19,11 @@
 验不了「服务端认不认」。
 
 所以这里除了形状断言，还锁一条**真机**对照（需要 opencode，默认跳过）。
+
+V2 的读回路径与信封不同（实测 2026-10-16，2.0.29）：``GET /api/session/{id}``
+回 ``{"data": {...}}``，``model`` 在里面一层；而打 V1 的 ``/session/{id}``
+只会拿到**200 的 SPA HTML**（``json.loads`` 直接炸）。所以真机对照的读回
+先按**采纳的适配器**选路径。
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import time
 
 import pytest
 
+from freeagent.services import opencode_server
 from freeagent.services.opencode_server import OpenCodeServer
 
 
@@ -56,7 +62,11 @@ def sent():
     return cap
 
 
-# ── 形状 ──────────────────────────────────────────────────────────────── #
+# ── 形状（V1） ────────────────────────────────────────────────────────── #
+# 这一段钉在 V1 适配器上（conftest 的 autouse 夹具）：V2 的载荷是另一组
+# 调用（先 ``/model``、再 ``/agent``、最后 ``/prompt``，见
+# ``services/executors.py`` 的 ``_v2_prompt_calls``），由真机对照与
+# tests/test_executors.py 守着。这里保留 V1 形状，机器是 V2 也照样验。
 
 def test_variant_is_top_level_not_inside_model(sent):
     """``variant`` 是 ``UserMessage`` 顶层字段。
@@ -144,15 +154,33 @@ needs_opencode = pytest.mark.skipif(
 )
 
 
+def _read_back_variant(oc, sid: str) -> str:
+    """读回会话的 ``model.variant`` —— 端点与信封按**采纳的适配器**选。
+
+    两版的实测形状（V2 于 2026-10-16 在 2.0.29 复核）：
+
+    - V1：``GET /session/{id}`` 裸对象，``model`` 在顶层
+    - V2：``GET /api/session/{id}`` 回 ``{"data": {...}}``，向下取一层
+
+    拿错端点的症状不是 404，而是一张**200 的 SPA HTML** —— ``json.loads``
+    直接炸。别把它误读成「服务端改了形状」。
+    """
+    if opencode_server.current_adapter().major >= 2:
+        info = json.loads(oc.call(f"/api/session/{sid}")[1]).get("data") or {}
+    else:
+        info = json.loads(oc.call(f"/session/{sid}")[1])
+    return (info.get("model") or {}).get("variant")
+
+
 @pytest.mark.live
 @needs_opencode
 def test_server_actually_records_the_variant():
     """真机：发出去的 variant **被服务端记下来了**。
 
     这是唯一能证伪「variant 放错层级」的断言 —— 单测验不出，因为假的
-    server 会照单全收。读回 ``GET /session/{id}`` 的 ``model.variant``。
+    server 会照单全收。读回会话的 ``model.variant``。
 
-    实测对照（2026-10-07）：
+    实测对照（2026-10-07，V1）：
 
     - 放顶层 → 回显 ``high`` ✅
     - 塞进 ``model`` → 回显 ``default`` ❌（且 HTTP 204，无报错）
@@ -165,8 +193,7 @@ def test_server_actually_records_the_variant():
             oc.prompt_async(sid, "只回复一行：OK",
                             model="opencode/fledge-alpha-free", variant="high")
             time.sleep(1.5)
-            info = json.loads(oc.call(f"/session/{sid}")[1])
-            assert (info.get("model") or {}).get("variant") == "high", (
+            assert _read_back_variant(oc, sid) == "high", (
                 "服务端没记下 variant —— 它多半被放进了 model 对象里。"
                 "对照：opencode run --variant high 是生效的。")
         finally:
@@ -179,7 +206,8 @@ def test_omitting_variant_gives_the_model_baseline():
     """不给 variant = 模型基线（回显 ``default``），不是「查不到」。
 
     实测 4300/8475 个模型带 variants，且**没有一个带 ``default`` 档**，
-    所以 ``default`` 是「未施加」而不是「某个默认档」。
+    所以 ``default`` 是「未施加」而不是「某个默认档」。V2 实测
+    （2026-10-16）同样回显 ``default``。
     """
     project = pathlib.Path("D:/PycharmProjects/freeagent")
     with OpenCodeServer.discovery(cwd=project) as oc:
@@ -188,7 +216,6 @@ def test_omitting_variant_gives_the_model_baseline():
             oc.prompt_async(sid, "只回复一行：OK",
                             model="opencode/fledge-alpha-free")
             time.sleep(1.5)
-            info = json.loads(oc.call(f"/session/{sid}")[1])
-            assert (info.get("model") or {}).get("variant") == "default"
+            assert _read_back_variant(oc, sid) == "default"
         finally:
             oc.abort(sid)

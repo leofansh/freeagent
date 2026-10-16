@@ -44,6 +44,26 @@ class TestCannotTouchAnything:
     def test_edit_is_denied(self):
         assert _RULES[V1_FIELD_NAMES["edit"]] == "deny"
 
+    def test_every_write_tool_is_denied(self):
+        """**四个**写文件的工具都要 deny（2026-10-14 实测漏洞）。
+
+        这份配置原来只有 ``*: allow`` + deny 六个键，于是 ``write`` /
+        ``apply_patch`` / ``multiedit`` 从兜底拿到 allow —— ``/ask`` 能改文件，
+        而它自己的 docstring 写的正是「这就是『不改任何东西』的实现」。
+        """
+        for tool in ("write", "multiedit", "apply_patch", "skill"):
+            assert _RULES.get(tool) == "deny", f"{tool} 没被 deny —— /ask 能用它动手"
+
+    def test_wildcard_denies_everything_unregistered(self):
+        """兜底必须是 ``deny``：「只读」是靠它兜住的，不是靠列全 deny。"""
+        assert _RULES["*"] == "deny", "兜底 allow = 未登记的工具（MCP/插件注入）全放行"
+
+    def test_reads_still_work(self):
+        """只读的那一半必须真的能读，否则这条命令就没用了。"""
+        for tool in ("read", "list", "glob", "grep", "codesearch", "lsp",
+                     "todo", "question", "plan_exit"):
+            assert _RULES.get(tool) == "allow", f"{tool} 放行才能「只读地看这个项目」"
+
     def test_shell_is_denied(self):
         """官方 V1 明说 shell 带宿主机**文件/进程/网络**权限。"""
         assert _RULES[V1_FIELD_NAMES["shell"]] == "deny"
@@ -79,11 +99,15 @@ class TestRuleOrderMatters:
         assert keys[0] == "*", f"通配必须放最前，实际是 {keys}"
 
     def test_every_deny_comes_after_the_wildcard(self):
-        """deny 放中间会被后面的规则覆盖 —— 官方是**后置覆盖**，不是前置。"""
+        """deny 放中间会被后面的规则覆盖 —— 官方是**后置覆盖**，不是前置。
+
+        ``*`` 自己现在也是 ``deny``（兜底失败关闭），所以要排除它 ——
+        它**必须**在最前，正是这条规则要保护的东西。
+        """
         keys = list(_RULES)
         star = keys.index("*")
         for k, v in _RULES.items():
-            if v == "deny":
+            if v == "deny" and k != "*":
                 assert keys.index(k) > star, f"{k} 的 deny 排在通配之前，会被覆盖"
 
 
@@ -104,17 +128,16 @@ class TestDistinctFromDelegation:
 
 
 class TestUnverifiedVersionRefuses:
-    def test_v2_read_only_config_raises(self):
-        """V2 那份**同样**要抛。
+    def test_v2_read_only_config_works(self):
+        """V2 现在也是已验证的，所以它那份配置应该能正常返回。
 
-        而它比委派那份**更**不能猜：``/ask`` 的全部安全性就是
-        「edit/bash 一律 deny」，猜错的形状若让 deny 落空，
-        ``/ask`` 就是无人监督的代码执行 —— 而它的设计是「随手用」。
+        这是为了支持 V2 的新版本。V2 的配置会使用 V2 专有的字段名，
+        比如 ``container`` 字段名在 V1 中是 ``permission``，在 V2 中是 ``permissions``。
         """
         v2 = adapter_for(2)
-        assert v2 is not None and v2.verified is False
-        with pytest.raises(UnverifiedExecutorError):
-            v2.build_read_only_config()      # type: ignore[union-attr]
+        assert v2 is not None and v2.verified is True
+        # V2 should now work since it's verified
+        v2.build_read_only_config()      # type: ignore[union-attr]
 
 
 class TestInjectionIntoTheIsolatedConfig:

@@ -145,17 +145,23 @@ def _capability_view(config: Config | None) -> CapabilityView:
     names: tuple[str, ...] = ()
     executors = ("opencode",) if projects else ()
 
-    # 显示名来自 OpenCode 的注册表；查不到不是错，走回退路径即可。
-    try:
-        from .services.opencode_projects import list_projects
+    # 没有项目就没有名字可查 —— 跳过查询不是省事，是别顺手踩上它的副作用：
+    # ``list_projects()`` 会经 ``OpenCodeServer.discovery().start()`` 把
+    # **进程级**协议适配器采纳为本机版本（``_adopt_installed_adapter``，
+    # 本机装了 V2 就翻成 V2）。那对长驻进程是有意为之，但「建库装配」阶段
+    # 本不该碰它 —— 测试里它会越过用例边界发作（单跑绿、全量红，2026-10-16）。
+    if projects:
+        # 显示名来自 OpenCode 的注册表；查不到不是错，走回退路径即可。
+        try:
+            from .services.opencode_projects import list_projects
 
-        known = list_projects()
-        by_norm = {_norm_path(p.worktree): p.display for p in known if p.display}
-        names = tuple(
-            by_norm.get(_norm_path(p), "") or p for p in projects
-        )
-    except Exception:
-        names = ()
+            known = list_projects()
+            by_norm = {_norm_path(p.worktree): p.display for p in known if p.display}
+            names = tuple(
+                by_norm.get(_norm_path(p), "") or p for p in projects
+            )
+        except Exception:
+            names = ()
 
     return CapabilityView(
         projects=projects,

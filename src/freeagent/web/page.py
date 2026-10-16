@@ -27,6 +27,8 @@ from .js_detail import JS_DETAIL
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
 from .js_delegate_projects import JS_DELEGATE_PROJECTS
+from .js_delegate_live import JS_DELEGATE_LIVE
+from .js_delegate_live_poll import JS_DELEGATE_LIVE_POLL
 from .js_services import JS_SERVICES
 from .js_oc_cards import JS_OC_CARDS
 from .js_oc_selection import JS_OC_SELECTION
@@ -72,6 +74,14 @@ INDEX_HTML = (
             # 两块之间顺序按依赖写（声明会提升，反了也能跑，别让人猜）。
             JS_OC_CARDS,
             JS_OC_SELECTION,
+            # delegate_live 提供 mountLivePanel（编程页签最上面那块面板）。
+            # 它只用 JS_CORE 的 el/esc/api/toast，但 oc_selection 会调它 ——
+            # 声明提升让顺序无关，这里按依赖写在 oc_selection 之后。
+            JS_DELEGATE_LIVE,
+            # delegate_live_poll 是「什么时候画」那一半（轮询/签名/不重建 DOM）。
+            # 它调 js_delegate_live 里的 liveItemView，也被 oc_selection 的
+            # mountLivePanel 用到 —— 声明提升让顺序无关，写成依赖序。
+            JS_DELEGATE_LIVE_POLL,
             # services 提供 loadServices（boot 分发 data-view=services 用），
             # 必须在 JS_BOOT 之前进页面。
             JS_SERVICES,

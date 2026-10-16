@@ -70,16 +70,21 @@ class TestVersionMismatchReason:
     def test_v1_passes(self) -> None:
         assert dl.version_mismatch_reason(1) is None
 
-    def test_v2_is_rejected(self) -> None:
-        reason = dl.version_mismatch_reason(2)
-        assert reason is not None, "V2 必须拒绝派发"
+    def test_unknown_major_is_rejected(self) -> None:
+        """不认识的主版本必须拒绝派发。
 
-    def test_v2_reason_is_actionable(self) -> None:
+        原名 ``test_v2_is_rejected``：那时 V2 还没验过，V2 就是「不认识的」。
+        V2 验过之后它成了「认识的」，反例换成 99 ——
+        纪律（闸门拦下一切不认识的主版本）没变，只是载体换了。
+        """
+        assert dl.version_mismatch_reason(99) is not None
+
+    def test_unknown_reason_is_actionable(self) -> None:
         """理由要能照着做：说清「静默失效」与「去哪看」。"""
-        reason = dl.version_mismatch_reason(2) or ""
+        reason = dl.version_mismatch_reason(99) or ""
         assert "静默忽略" in reason, "必须说明失效是静默的"
         assert "11.8.1" in reason, "必须指向设计文档的版本陷阱表"
-        assert "2" in reason, "必须报出实际检测到的版本"
+        assert "99" in reason, "必须报出实际检测到的版本"
 
     def test_unknown_version_is_also_rejected(self) -> None:
         """探不到版本 ≠ 放行。"""
@@ -89,16 +94,17 @@ class TestVersionMismatchReason:
         reason = dl.version_mismatch_reason(None) or ""
         assert str(dl.SUPPORTED_OPENCODE_MAJOR) in reason
 
-    def test_supported_major_is_one(self) -> None:
-        """本仓只按 V1 接缝实现（实测 opencode 1.18.31）。"""
-        assert dl.SUPPORTED_OPENCODE_MAJOR == 1
 
 
 class TestMainVersionGate:
     """端到端：main() 必须在派发**之前**挡住，且不产生任何派发。"""
 
-    def test_rejects_v2_without_dispatching(self, tmp_path, capsys, monkeypatch) -> None:
-        monkeypatch.setattr(dl, "detect_opencode_version", lambda command="opencode": 2)
+    def test_rejects_unknown_major_without_dispatching(self, tmp_path, capsys, monkeypatch) -> None:
+        # 原名 ``test_rejects_v2_without_dispatching``：那时 V2 还没对着真机
+        # 验过，所以拿 V2 当「该被拒」的例子。V2 现在验过了（实测 2.0.29），
+        # 拿它当反例会与「V2 放行」自相矛盾。换成真的不认识的主版本，
+        # 这条「版本不对就不派发」的纪律才继续被守住。
+        monkeypatch.setattr(dl, "detect_opencode_version", lambda command="opencode": 99)
         calls: list[str] = []
 
         def _boom(*a, **k):  # 若真派发了，这里会炸
@@ -122,7 +128,7 @@ class TestMainVersionGate:
 
     def test_dry_run_also_gated(self, tmp_path, capsys, monkeypatch) -> None:
         """预演也过这关 —— 版本不对时预演结果没有意义。"""
-        monkeypatch.setattr(dl, "detect_opencode_version", lambda command="opencode": 2)
+        monkeypatch.setattr(dl, "detect_opencode_version", lambda command="opencode": 99)
         assert dl.main(["--db", str(tmp_path / "a.db"), "--dry-run"]) == 2
         assert "不派发" in capsys.readouterr().out
 
