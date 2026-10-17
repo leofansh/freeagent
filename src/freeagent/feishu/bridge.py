@@ -102,19 +102,26 @@ _PAIRING_RATE_LIMIT_SECONDS = 3600.0
 
 #: 卡片按钮**允许合成哪些命令**（设计文档 11.9.8「卡片按钮 → 合成命令」）。
 #:
-#: **刻意只放三个状态迁移。** 按钮 ``value`` 是客户端回传的，而
-#: :meth:`ChannelService.handle`` 见 ``/`` 开头就当命令派发 —— 照单全收等于
-#: 开一个「点一下就能执行任意命令」的口子，伪造载荷即可借桥接跑到
-#: ``/merge``、``/role-del``、``/delegate`` 上。
+#: **刻意只放四条**：三个状态迁移 ＋ 一个采纳。按钮 ``value`` 是客户端
+#: 回传的，而 :meth:`ChannelService.handle`` 见 ``/`` 开头就当命令派发 ——
+#: 照单全收等于开一个「点一下就能执行任意命令」的口子，伪造载荷即可借桥接
+#: 跑到 ``/merge``、``/role-del``、``/delegate`` 上。
 #:
 #: 设计文档 11.8.1 引的官方警告是同一件事：*不要试图枚举所有危险命令，
 #: 要用**窄白名单***。所以这里是白名单而不是黑名单：新增按钮要**显式**
 #: 加一行，而不是「没被列出来就自动放行」。
 #:
-#: 三个命令都只改``state``，且真伪由 :meth:`TaskService.set_state` 自己校验
+#: 前三条都只改 ``state``，且真伪由 :meth:`TaskService.set_state` 自己校验
 #: （``ALLOWED_TRANSITIONS`` + 不变式），非法迁移会报错而不会静默改坏数据。
+#:
+#: ``/accept`` 是 2026-10-17 加的第四条，理由与前三条不同 —— 它是**补一个
+#: 断掉的闭环**：委派产出被 ``create_draft`` 落成 DRAFT 后，飞书文案写着
+#: 「待你验收」，但 ``accept`` 的唯一调用点在终端，于是承诺在飞书、兑现
+#: 在另一个终端（违反 12.1.1「一份能力一份实现」）。
+#: 它安全：只改 artifact 状态，不碰代码、不改组织结构，且真伪由
+#: :meth:`ArtifactService.accept` 自己校验（任务下最多一个 ACCEPTED）。
 _CARD_COMMAND_ALLOWLIST: frozenset[str] = frozenset({
-    "/start", "/done", "/pause",
+    "/start", "/done", "/pause", "/accept",
 })
 
 #: 身份探测失败后的重试退避（秒）。取值抄 openclaw 的
@@ -2299,9 +2306,11 @@ def _run_card_command(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     两件事。设计文档 11.8.1 引的官方警告是同一件事：
     *不要试图枚举所有危险命令，要用**窄白名单***。
 
-    所以只放三个状态迁移，且**刻意不含** ``/start`` 之外的任何写操作 ——
-    ``/done`` / ``/pause`` 走 :meth:`TaskService.set_state`，
-    而它自己会校验 ``ALLOWED_TRANSITIONS`` 与不变式，非法迁移会报错。
+    所以只放三个状态迁移 ＋ 一个采纳，且**刻意不含**任何会触发本地代码
+    执行或改组织结构的命令 —— ``/done`` / ``/pause`` 走
+    :meth:`TaskService.set_state`，它自己会校验 ``ALLOWED_TRANSITIONS``
+    与不变式，非法迁移会报错；``/accept`` 只改 artifact 状态，
+    由 :meth:`ArtifactService.accept` 保证「一个任务最多一个 ACCEPTED」。
     """
     cmd = str(value.get("cmd") or "").strip()
     task_id = str(value.get("id") or "").strip()

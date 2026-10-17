@@ -24,6 +24,7 @@ from .js_chat_select import JS_CHAT_SELECT
 from .js_chat_store import JS_CHAT_STORE
 from .js_core import JS_CORE
 from .js_detail import JS_DETAIL
+from .js_artifact import JS_ARTIFACT
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
 from .js_delegate_projects import JS_DELEGATE_PROJECTS
@@ -63,6 +64,10 @@ INDEX_HTML = (
             JS_SETTINGS_LLM,
             JS_SETTINGS,
             JS_DETAIL,
+            # artifact 提供 artifactBar（验收按钮），由 JS_DETAIL 的
+            # renderTask 调用 —— 用的是 js_detail 里的 post/toast/openTask。
+            # 声明提升让顺序无关，写成依赖序。
+            JS_ARTIFACT,
             JS_FEISHU,
             JS_FEISHU_CONFIG,
             # delegate_projects 只用 JS_FEISHU_* 里已有的 el/esc/api/toast，

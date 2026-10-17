@@ -24,6 +24,7 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_artifact,
     endpoints_delegate_action,
     endpoints_delegate_projects,
     endpoints_feishu_config,
@@ -148,6 +149,19 @@ def dispatch_post(
         # 前端连发 N 次单条：批量要有整体上限与逐条汇总
         # （见 endpoints_write.drop_tasks 的说明）。
         return HTTPStatus.OK, endpoints_write.drop_tasks(app, read_body())
+
+    # 产物验收（2026-10-17）。刻意排在下面那个通用 `/api/task/<id>/<action>`
+    # 分支**之前**：那里的动作名来自 ``STATE_ACTIONS``（状态迁移白名单），
+    # 而验收改的是 artifacts.status、不迁入任何状态 —— 两者语义不同，
+    # 混进同一个白名单会让「合法迁入」这个词不再成立。
+    #
+    # POST-only 的理由与 delegate/projects 同一条：改状态的按钮不能挂在
+    # GET 上（浏览器预取、爬虫、`<img src>` 都会自动发 GET）。
+    if len(parts) == 4 and parts[:2] == ["api", "task"] and parts[3] == "accept":
+        return HTTPStatus.OK, endpoints_artifact.artifact_accept(app, parts[2])
+
+    if len(parts) == 4 and parts[:2] == ["api", "task"] and parts[3] == "reopen":
+        return HTTPStatus.OK, endpoints_artifact.artifact_reopen(app, parts[2])
 
     if len(parts) == 4 and parts[:2] == ["api", "task"]:
         action = parts[3]

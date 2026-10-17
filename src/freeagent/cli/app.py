@@ -59,6 +59,7 @@ KIND_ALIASES: dict[str, TaskKind] = {
 
 _USAGE: dict[str, str] = {
     "/today": "/today",
+    "/feedback": "/feedback   执行层履历：派了多少、成了多少、反复失败在哪",
     "/all": "/all [open|closed|all]   默认 open",
     "/roles": "/roles [all]",
     "/role": "/role <名字|id>",
@@ -123,6 +124,7 @@ _HELP = """\
 个人事务助手 · 命令
   ── 视图 ──
   /today              今天视图（含顺延标记与每条信号的理由）
+  /feedback           执行层履历：派了多少、成了多少、反复失败在哪（只摆事实）
   /all [open|closed|all]  全部事务（默认只列未结束）
   /roles [all]        角色脉络（默认只列活跃；all 含静置）
   /role <名字|id>      某个角色下的事务
@@ -1086,6 +1088,7 @@ class Repl:
             "/mode-plan": self._cmd_mode_plan,
             "/mode-build": self._cmd_mode_build,
             "/today": self._cmd_today,
+            "/feedback": self._cmd_feedback,
             "/all": self._cmd_all,
             "/roles": self._cmd_roles,
             "/role": self._cmd_role,
@@ -1143,6 +1146,59 @@ class Repl:
     def _cmd_today(self, args: list[str]) -> None:
         view = self.app.today.view()
         self._say(render.render_today(view, self._names()))
+
+    def _cmd_feedback(self, args: list[str]) -> None:
+        """执行层履历：派了多少、成了多少、反复失败在哪。
+
+        **刻意只摆事实，不给建议。** 与第七章「摆得更清楚 ≠ 替你决定」
+        同构，也与 11.10.5「绝不自动触发委派」同源 —— 一个「建议重派」
+        的按钮就是自动触发的前一步。所以输出里没有「建议你…」这种句子。
+        """
+        from ..services.feedback import feedback_report
+
+        tasks = [t for t in self.app.task_repo.list_all() if t.is_open]
+        if not tasks:
+            self._say("还没有未结束的事务 —— 没有可统计的委派。")
+            return
+        ids = [t.id for t in tasks]
+        titles = {t.id: t.title for t in tasks}
+        rep = feedback_report(
+            ids,
+            lambda tid: self.app.record_repo.list_for_task(tid),
+            lambda tid: titles.get(tid, ""),
+        )
+        rate = rep.success_rate
+        rate_text = "没真跑过" if rate is None else f"{rate:.0%}"
+        self._say(
+            f"未结束事务 {rep.total} 条 —— 其中派过的 "
+            f"{rep.total - rep.never} 条\n"
+            f"  成功 {rep.succeeded}　执行期失败 {rep.failed}　"
+            f"派发前被拒 {rep.refused}　没派过 {rep.never}\n"
+            f"  成功率 {rate_text}"
+            + (
+                "（分母只算真跑过的：派发前被拒不算失败）"
+                if rate is not None else ""
+            )
+        )
+        if rep.top_reasons:
+            self._say("\n反复出现的错因（原样引用，不归类）：")
+            for reason, n in rep.top_reasons:
+                self._say(f"  {n} 次　{reason}")
+        if rep.verdicts:
+            self._say("\n产出验收：")
+            for verdict, n in rep.verdicts:
+                label = {
+                    "accepted": "已验收",
+                    "revised": "圈改重做过（>=2 版）",
+                }.get(verdict, verdict)
+                self._say(f"  {label}　{n} 条")
+        if rep.revised_tasks:
+            self._say("\n返工过的：")
+            for task_id, title, _n in rep.revised_tasks:
+                self._say(f"  {title}（{task_id[:8]}）")
+        self._say(
+            "\n这些是**事实**，不是建议 —— 要不要重派、怎么改，由你决定。"
+        )
 
     def _cmd_all(self, args: list[str]) -> None:
         mode = args[0] if args else "open"

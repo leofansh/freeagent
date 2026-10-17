@@ -153,6 +153,7 @@ function renderTask(data) {
       '<span class="tag">version ' + data.artifact.version + "</span>" +
       '<span class="tag">' + label + "</span></div>" +
       '<pre class="artifact">' + esc(data.artifact.content) + "</pre>";
+    artifactBar(data, a);  // 验收按钮见 js_artifact.js
     root.appendChild(a);
   }
   if (data.progress_note) {
