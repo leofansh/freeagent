@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from .enums import (
+    CAPTURED_STATUS_LABELS,
     KIND_LABELS,
     SIGNAL_LABELS,
     SORT_SIGNAL_WEIGHTS,
     STATE_LABELS,
     ArtifactStatus,
+    CapturedStatus,
     RecordType,
     SortSignalCode,
     TaskKind,
@@ -27,6 +29,7 @@ from .models import (
     DEFAULT_ROLE_NAME,
     REMINDER_FIRED_WINDOW,
     Artifact,
+    CapturedItem,
     RestoreView,
     Role,
     ScoredTask,
@@ -40,6 +43,9 @@ from .models import (
 __all__ = [
     "Artifact",
     "ArtifactStatus",
+    "CAPTURED_STATUS_LABELS",
+    "CapturedItem",
+    "CapturedStatus",
     "ConflictError",
     "DEFAULT_ROLE_NAME",
     "FreeAgentError",

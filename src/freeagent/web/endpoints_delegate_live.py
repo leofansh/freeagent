@@ -34,24 +34,25 @@
 """
 from __future__ import annotations
 
-import datetime
 import os
 from typing import Any
 
 from ..app import App
 from ..services.approval import ApprovalStore, PendingApproval
+from ..services.delegate import PROJECTION_STALE_SECONDS, projection_age_seconds
 
 __all__ = ["delegate_live", "can_decide_in_web"]
 
-#: 进度多久没更新就算「疑似卡住」（秒）。
+#: 进度多久没更新就算「疑似卡住」（秒）。**定义在
+#: :mod:`..services.delegate`**（``PROJECTION_STALE_SECONDS``）：执行器
+#: 启动时的恢复扫描（12.11.1）必须与这里是**同一个**口径 —— 各写一份
+#: 必然漂移，漂移的方向是「执行器认领了、面板还当它在跑」。上面那份
+#: 模块说明解释了为什么取 60、以及为什么它不是「超时」判据。
 #:
-#: 取 60 的理由：执行器每 5 秒节流写一次（``MIN_PROGRESS_INTERVAL``），
-#: 而 opencode 一次工具调用可能静默更久 —— 30 秒那条线会把「正在想」
-#: 说成「卡住了」，那会让用户去重启一个正在正常跑的东西。
-#:
-#: **这不是「超时」判据**：它只改**显示**（加一个「疑似卡住」标记），
-#: 不影响任何决定。真正的超时判据在执行器那边（30 分钟总时长上限）。
-_STALE_AFTER_SECONDS = 60
+#: ⚠️ 阈值（``_STALE_AFTER_SECONDS``）**只在这里**算，别在存储层算：
+#: 执行器与 Web 是两个进程各有各的时钟，把「多少秒算旧」写进
+#: ``storage/repos.py`` 就等于让存储层知道有个 Web 在读它。
+_STALE_AFTER_SECONDS = PROJECTION_STALE_SECONDS
 
 #: 轮询间隔（秒）。默认 2 秒，与设计文档 12.8 的「~2s 轮询」一致。
 #:
@@ -173,14 +174,30 @@ def delegate_live(app: App) -> dict[str, Any]:
     for row in rows:
         task_id = str(row["task_id"])
         updated_at = str(row["updated_at"])
-        # 陈旧判定用**读方**的时钟（见模块说明）。解析失败就当陈旧 ——
-        # 一个坏时间戳的唯一后果就是「这条显示成卡住」，而那比
-        # 「显示成正在跑」安全得多。
-        try:
-            age = (now - datetime.datetime.fromisoformat(updated_at)).total_seconds()
-        except ValueError:
-            age = float("inf")
-        task = repo.get(task_id)
+        # 陈旧判定用**读方**的时钟（见模块说明）。判定与恢复扫描共用
+        # :func:`~services.delegate.projection_age_seconds` —— 解析失败
+        # 返回无穷大，即「这条显示成卡住」，而那比「显示成正在跑」安全。
+        age = projection_age_seconds(updated_at, now)
+        stale = age >= _STALE_AFTER_SECONDS
+        # 「事务已删但进度行还在」的坏行毒死整个面板（真机 2026-10-18：
+        # get() 对不存在的事务**抛** NotFoundError，面板整体 400）。
+        # find() 返回 None，兜底文案（"(事务已不存在)"）本来就在。
+        task = repo.find(task_id)
+        # 12.11.1（V1.39）：陈旧且**还没结束**的委派给两个恢复动作
+        # 「重新派发 / 放弃」，前端据此画按钮。
+        # * 非陈旧不给 —— 怕误触一条正在正常跑的东西；
+        # * 已结束（DONE / DROPPED）不给 —— 重派会被服务层以
+        #   「已经做完了」拒掉，放一个必然报错的按钮比不放更糟。
+        actions: list[str] = []
+        if stale and task is not None and task.state.is_open:
+            actions = ["redispatch", "drop"]
+        # 出路文案：指向下面的按钮（不再让人去终端敲命令 —— 那是
+        # 「按钮只给文案」的不友好根源）。它**只改显示、不下结论**：
+        # 是不是真没执行器在跑，只有人能确认。
+        outlet = ""
+        if stale:
+            outlet = ("若这条一直不动，多半是执行器中断了 —— "
+                      "可以在下面重新派发，或放弃。")
         items.append({
             "task_id": task_id,
             "title": task.title if task is not None else "(事务已不存在)",
@@ -190,9 +207,11 @@ def delegate_live(app: App) -> dict[str, Any]:
             "tool_calls": row["tool_calls"],
             "allowed": row["allowed"],
             "updated_at": updated_at,
-            "stale": age >= _STALE_AFTER_SECONDS,
+            "stale": stale,
             "age_seconds": None if age == float("inf") else int(age),
             "state": task.state.value if task is not None else "",
+            "outlet": outlet,
+            "actions": actions,
             "pending": [_pending_payload(i) for i in by_task.pop(task_id, [])],
         })
 
@@ -200,7 +219,7 @@ def delegate_live(app: App) -> dict[str, Any]:
     # 或者待批项是**别人**（飞书/终端）发起的、WEB 只是旁观。
     # 照样显示 —— 12.7.1 的「列出来 ≠ 已授权、但不藏」同一条道理。
     for task_id, group in by_task.items():
-        task = repo.get(task_id) if task_id else None
+        task = repo.find(task_id) if task_id else None
         items.append({
             "task_id": task_id,
             "title": task.title if task is not None else "",
@@ -213,6 +232,8 @@ def delegate_live(app: App) -> dict[str, Any]:
             "stale": False,
             "age_seconds": 0,
             "state": task.state.value if task is not None else "",
+            "outlet": "",
+            "actions": [],
             "pending": [_pending_payload(i) for i in group],
         })
 

@@ -60,15 +60,16 @@ def _records(app, task_id):
 def _attempt(app, task_id, clock, *, seconds, succeeded=False, reason=""):
     """落一次尝试。**时间戳必须严格递增 —— 一次尝试内部也是。**
 
-    ``list_for_task`` 是 ``ORDER BY ts ASC, id ASC``，而 id 是随机的 ——
-    所以同一条时间戳上的多条记录**顺序是随机的**。实测（2026-10-17）：
+    ``list_for_task`` 的旧排序是 ``ts ASC, id ASC``，而 id 是随机的 ——
+    同一条时间戳上的多条记录顺序曾是随机的。实测（2026-10-17）：
     把 ``delegation_dispatched`` 与 ``delegation_failed`` 落在同一微秒，
-    读回来可能是 ``failed`` 排在前面，于是 ``attempt_state`` 判成
+    读回来可能 ``failed`` 排在前面，于是 ``attempt_state`` 判成
     ``refused``（派发前被拒）而不是 ``failed``（执行期失败）——
     **结论整个反过来，而界面上两者长得一模一样。**
 
-    这条前提记在 ``feedback.read_outcome`` 的 docstring 里（含根治方案）。
-    这里从 NOW+60s 起跳、每次尝试内部再错开 1ms，两层都避开。
+    **V1.37 已根治**（``task_records.seq``，设计文档 12.10.6）：同刻顺序
+    现在是确定性的写入序。这条 ``_attempt`` 保留递增时间戳的写法不动 ——
+    它保的形状（一次尝试内部有先后）本来就是真实派发的形状。
     """
     base = NOW + datetime.timedelta(seconds=60 + seconds)
     app.record_repo.append(

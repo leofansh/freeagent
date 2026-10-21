@@ -707,6 +707,12 @@ class FakeSender:
     def send_text(self, chat_id, text):
         self.sent.append((chat_id, text))
 
+    def download_media(self, key, *, media_type, downloader=None):
+        """V1.48 捕获路径用：给假字节，形状与真 sender / 另一份替身一致
+        （``test_feishu_capture._FakeSender``）。缺这个方法时桥接走的是
+        「下载失败」分支，测不到成功收下那条路。"""
+        return b"img-bytes"
+
     def send_to_user(self, open_id, text):
         self.sent_to_user.append((open_id, text))
 
@@ -1075,13 +1081,18 @@ class TestUnsupportedMessageType:
 
     # -- 该回的 ------------------------------------------------------------- #
     def test_private_image_gets_a_hint(self, bridge):
-        """私聊里发图片（白名单内）→ 回一句提示，带上实际类型。"""
+        """私聊里发图片（白名单内）→ 回一句，说清**收下了**并带上实际类型。
+
+        V1.48 起契约从「只回一句我不处理文字」变成「收下而非丢弃」
+        （11.9.10）—— 断言跟着契约走，「别让用户对着沉默猜」的初衷不变。
+        「不建事务」由 test_hint_does_not_create_a_task 行为级守着。
+        """
         bridge.on_message(self._image_event())
         self._drain(bridge)
         assert bridge.sender.sent, "私聊发图片该回一句，别让用户对着沉默猜"
         text = bridge.sender.sent[0][1]
-        assert "image" in text, f"提示语要带上实际类型，用户才知道什么没被处理：{text!r}"
-        assert "文字" in text, f"要说明自己只处理文字：{text!r}"
+        assert "image" in text, f"提示语要带上实际类型，用户才知道收到的是什么：{text!r}"
+        assert "收下" in text, f"新契约是「收下而非丢弃」，回复要说清收下了：{text!r}"
 
     def test_hint_does_not_create_a_task(self, bridge):
         """**关键**：回提示只是告知，**不许建事务**。"""

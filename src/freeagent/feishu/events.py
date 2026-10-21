@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -91,6 +92,13 @@ class IncomingMessage:
     #: 发送者的 ``union_id``（开发者级）。飞书目前基本不给，留着是为了
     #: 「哪天开始给了」不用再改结构。
     sender_union_id: str = ""
+    #: 非文字消息里**可下载的附件引用**（图片/文件）。``text`` 消息为 ``None``。
+    #:
+    #: 收下它而不是丢弃 —— 见 :func:`parse_event` 与设计方案 11.9.10「捕获摩擦」。
+    #: 这里只存**引用**（image_key / file_key），**不建事务**：事务要等用户后处理
+    #: 时显式发起，保持「非文字消息不建事务」这个前提（见
+    #: ``tests/test_doc_contract.py`` 的用户文档断言）。
+    attachment: "AttachmentRef | None" = None
 
     @property
     def sender_ids(self) -> frozenset[str]:
@@ -286,9 +294,11 @@ def parse_event(
 
     message_type = message.get("message_type")
     if message_type != "text":
-        # 非文字**不回一句「暂只处理」就完事** —— 那是实现细节，用户不需要知道。
-        # 交给桥接去发那句「我只处理文字」（见 ``IncomingMessage.unsupported_type``）：
-        # 那条回复必须先过白名单再过门控，放在这里发就绕过了白名单。
+        # 非文字**不回一句「只处理文字」就完事** —— 那是实现细节，用户不需要知道。
+        # 交给桥接去发提示（见 ``IncomingMessage.unsupported_type``）：那条回复
+        # 必须先过白名单再过门控，放在这里发就绕过了白名单。
+        # 同时把可下载的附件引用抽出来，桥接会**收下而非丢弃**（捕获摩擦）。
+        attachment = _extract_attachment(message_type, message.get("content"))
         return IncomingMessage(
             event_id=str(header.get("event_id") or ""),
             chat_id=chat_id,
@@ -301,6 +311,7 @@ def parse_event(
             mention_note=note,
             unsupported_type=str(message_type or "未知"),
             message_id=message_id,
+            attachment=attachment,
         )
 
     raw_content = message.get("content")
@@ -532,3 +543,45 @@ def from_sdk_event(
         },
     }
     return parse_event(payload, bot_open_id=bot_open_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentRef:
+    """非文字消息里可下载的附件引用。
+
+    只存**引用**（image_key / file_key），不存字节 —— 字节由桥接按需下载落盘。
+    """
+
+    type: str           # "image" / "file" / ...
+    key: str            # image_key 或 file_key
+    name: str           # 文件名（image 无文件名时用 "image"）
+    size: int           # 字节数（未知为 0）
+
+
+def _extract_attachment(
+    message_type: object, raw_content: object,
+) -> "AttachmentRef | None":
+    """从非文字消息的 content 抽附件引用。抽不到返回 ``None``。
+
+    飞书 image 消息 content 形如 ``{"image_key": "..."}``；
+    file 消息形如 ``{"file_key": "...", "file_name": "...", "file_size": N}``。
+    """
+    if not isinstance(raw_content, str):
+        return None
+    try:
+        inner = json.loads(raw_content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(inner, dict):
+        return None
+    if "image_key" in inner:
+        return AttachmentRef(type="image", key=inner["image_key"], name="image", size=0)
+    if "file_key" in inner:
+        raw_size = inner.get("file_size") or 0
+        return AttachmentRef(
+            type="file",
+            key=inner["file_key"],
+            name=inner.get("file_name") or "file",
+            size=int(raw_size) if isinstance(raw_size, (int, float)) else 0,
+        )
+    return None

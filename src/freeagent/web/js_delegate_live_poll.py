@@ -46,7 +46,11 @@ function tickLiveAges(box) {
     if (isNaN(at)) return;
     const secs = Math.max(0, Math.round((Date.now() - at) / 1000));
     note.textContent = "已经 " + secs + " 秒没动静了 —— 疑似卡住。"
-      + "（可能只是这一步慢；要停就点上面那条委派的「停止这条委派」）";
+      + "（可能只是这一步慢；要停就点上面那条委派的「停止这条委派」）"
+      // 12.11.1：陈旧行附带出路文案（指向下面的「重新派发 / 放弃」按钮）。
+      // 服务端整句给好，这里**只拼不解读** —— 再拆一次就成两份实现，
+      // 漂移了就得改两处。
+      + (note.dataset.outlet ? " " + note.dataset.outlet : "");
   });
 }
 
@@ -57,7 +61,8 @@ function paintLivePanel(box, data, repaint) {
   // **签名刻意不含 age_seconds**（见模块说明）。
   const sig = JSON.stringify(items.map((it) => [
     it.task_id, it.status, it.recent, it.tool_calls, it.allowed,
-    it.updated_at, it.stale, it.title, it.state,
+    it.updated_at, it.stale, it.title, it.state, it.outlet || "",
+    (it.actions || []).join(","),
     (it.pending || []).map((p) => [
       p.credential, p.kind, p.subject, p.detail, p.question,
       p.can_decide, p.blocked_reason, p.answered_count, p.task_id,

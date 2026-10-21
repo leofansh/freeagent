@@ -284,6 +284,11 @@ class _FakeSender:
         # 于是下面 ``resolve(credential, self.auto, …)`` 报「str 不能赋给 Decision」。
         self.auto: Decision = auto
         self.cards: list[dict[str, Any]] = []
+        #: 每张卡唯一 id（``om_1``、``om_2``…）。V1.41 滚动瘦身要按
+        #: **消息 id** 撤卡 —— 全部同串的话，「撤的是哪张」就断言不出来了。
+        self._seq = 0
+        #: 收到过的撤回请求（录制）：V1.41 断言「旧卡在新卡发出前被撤」。
+        self.retired_ids: list[str] = []
         self._store: ApprovalStore | None = None
 
     def bind(self, store: ApprovalStore) -> None:
@@ -293,15 +298,23 @@ class _FakeSender:
         self, *, open_id: str, subject: str, detail: str,
         credential: str, ttl_seconds: int, reply_to: str = "",
     ) -> str:
+        self._seq += 1
+        message_id = f"om_{self._seq}"
         self.cards.append({"open_id": open_id, "subject": subject,
                            "detail": detail, "credential": credential,
                            "ttl": ttl_seconds,
+                           "message_id": message_id,
                            # 记下锚点，好让测试断言「授权卡挂到进度卡下」
                            #（设计文档 11.16）。默认空串 = 走原路径发到会话。
                            "reply_to": reply_to})
         if self._store is not None and self.auto:
             self._store.resolve(credential, self.auto, decided_by=open_id)
-        return "om_test"
+        return message_id
+
+    def delete_message(self, message_id: str) -> None:
+        # 生产语义是「真的飞书撤回」；替身只**录制**，什么也不删 ——
+        # 断言的恰恰是「哪张卡的 id 在什么时机被交给撤回」。
+        self.retired_ids.append(message_id)
 
 
 def _asked(rid: str, *, perm: str = "edit", diff: str = "+42") -> tuple[str, Any]:
@@ -319,7 +332,8 @@ class _StubTask:
 
 
 class TestToolGateLoop:
-    def _run(self, server, sender, store, approver="ou_owner", **policy_kw):
+    def _run(self, server, sender, store, approver="ou_owner",
+             requested_by="", **policy_kw):
         from freeagent.delegate import run_with_tool_gate
         from freeagent.services.delegate import DelegationPolicy
         sender.bind(store)
@@ -335,8 +349,15 @@ class TestToolGateLoop:
             _StubTask(), Path("C:/p"), "做点事",
             policy=policy,
             store=store, sender=sender, approver=approver,
+            requested_by=requested_by,
             server_factory=factory,
         )
+
+    def _tp_row(self, store):
+        cred = store._conn.execute(
+            "SELECT credential FROM pending_approvals "
+            "WHERE credential LIKE 'tp%'").fetchone()[0]
+        return store.get(cred)
 
     def test_chosen_agent_model_variant_reach_opencode(
             self, store: ApprovalStore) -> None:
@@ -390,6 +411,41 @@ class TestToolGateLoop:
         server = _FakeServer([_asked("per_1"), ("session.idle", {})])
         out = self._run(server, _FakeSender(auto="deny"), store)
         assert server.replies == [("per_1", "deny")]
+
+    def test_local_origin_row_is_web_decidable(self, store: ApprovalStore) -> None:
+        """WEB/终端发起（requested_by 空）→ tp 行 requested_by **留空**。
+
+        这是真机截图那个 bug 的执行器路径回归：12.8 靠「requested_by 为空」
+        判 WEB 面板可决。曾把兜底 approver 写进去，行被误判成「飞书发起」，
+        WEB 面板标灰不给按钮，只剩飞书一条路 —— 与 12.8「本机发起，本机
+        控制台即权威」矛盾。兜底身份只允许出现在**卡片收件人**上。
+        """
+        server = _FakeServer([_asked("per_1"), ("session.idle", {})])
+        sender = _FakeSender(auto="allow")
+        out = self._run(server, sender, store,
+                        approver="ou_owner", requested_by="")
+        assert out.ok is True, out.summary
+        row = self._tp_row(store)
+        assert not (row.requested_by or "").strip(), \
+            "本机发起的待批行不得写入任何 ou_ 身份"
+        assert sender.cards[0]["open_id"] == "ou_owner", \
+            "收件人仍落回 approver —— 卡必须有去处"
+
+    def test_remote_origin_row_records_requester(self, store: ApprovalStore) -> None:
+        """飞书发起（有真实发起人）→ 行记**那个人**，卡也发给他。
+
+        生产端调法是 ``approver=task_requester(task, approver)``、
+        ``requested_by=task_requester(task)``：收件人有真实发起人时
+        跟发起人走（V1.16 行为保持），requested_by 则只记真实身份。
+        """
+        server = _FakeServer([_asked("per_1"), ("session.idle", {})])
+        sender = _FakeSender(auto="allow")
+        out = self._run(server, sender, store,
+                        approver="ou_Xie", requested_by="ou_Xie")
+        assert out.ok is True, out.summary
+        row = self._tp_row(store)
+        assert row.requested_by == "ou_Xie"
+        assert sender.cards[0]["open_id"] == "ou_Xie"
 
     def test_card_shows_the_diff(self, store: ApprovalStore) -> None:
         """没有 diff，用户点的是「信任」不是「确认」。"""

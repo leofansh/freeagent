@@ -1,12 +1,15 @@
-"""委派实时交互的**写**端点（设计文档 12.8）：允许 / 拒绝 / 停止 / 答问。
+"""委派实时交互的**写**端点（设计文档 12.8）：允许 / 拒绝 / 停止 / 答问，
+以及陈旧委派的恢复动作（12.11.1）：重新派发 / 放弃。
 
-## 全部走 ``ApprovalStore`` 的既有写入口
+## 全部走既有写入口
 
 | 动作 | 落到哪个方法 |
 |---|---|
 | 允许 / 拒绝 | :meth:`ApprovalStore.resolve` |
 | 停止这条委派 | :meth:`ApprovalStore.request_stop` **＋** ``resolve(deny)`` |
 | 回答提问 | :meth:`ApprovalStore.put_answer` |
+| 重新派发（陈旧行） | :meth:`TaskService.reset_delegation` |
+| 放弃（陈旧行） | :meth:`TaskService.drop` |
 
 **不许自己写 SQL。** 闸门全在那三个方法里：只有发起人能批、过期即拒、
 已决定不可翻、提问一次一问、停止与回掉当前挂起必须**都做**。
@@ -36,7 +39,8 @@ from ..domain import FreeAgentError
 from ..services.approval import ApprovalStore
 from .endpoints_delegate_live import can_decide_in_web
 
-__all__ = ["approval_action", "approval_stop", "question_answer"]
+__all__ = ["approval_action", "approval_stop", "question_answer",
+           "delegate_redispatch", "delegate_drop"]
 
 
 def _store(app: App) -> ApprovalStore:
@@ -162,4 +166,50 @@ def question_answer(app: App, credential: str, body: dict[str, Any]) -> dict[str
             if done else f"收到了（第 {slot + 1}/{total} 问）。"
             f"还有 {total - slot - 1} 个问题，直接在这里答。"
         ),
+    }
+
+
+def delegate_redispatch(app: App, task_id: str) -> dict[str, Any]:
+    """``POST /api/delegate/tasks/<id>/redispatch`` —— 让一条卡住的委派重派。
+
+    与终端 ``/redispatch`` 走**同一个写入口**（``TaskService.reset_delegation``）：
+    三种「不许重派」的情形（正在跑 / 已做完 / 还没派过）各给一句准确的话，
+    全在服务层，这里只把结果翻成界面话。理由见 12.1.1「一份能力一份实现」。
+
+    ## 为什么这里**不**做 ``can_decide_in_web`` 那道判定
+
+    审批那条判据治的是「用一个空身份批掉**飞书发起**的卡」（11.9.7 规则 2）。
+    重派 / 放弃改的是**本机一条挂起委派自己的进度**，与「谁有飞书身份」
+    无关；Web 只监听回环，操作者就是本机那个人。所以这类恢复动作
+    **一律可决**，只在 ``reason`` 里记下「从网页面板点的」，与终端操作
+    在记录里可对账。对审批沿用同一判据是**对的**，对恢复动作则会把
+    Web 变成二等界面 —— 两件事不是同一条规则。
+    """
+    with app.lock:
+        task = app.tasks.reset_delegation(task_id, "网页面板重新派发")
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "action": "redispatch",
+        "message": (
+            f"已标记重派：{task.title}。执行器下次扫到就会再派一次"
+            "（它是独立进程，不会立刻跑）。"
+        ),
+    }
+
+
+def delegate_drop(app: App, task_id: str) -> dict[str, Any]:
+    """``POST /api/delegate/tasks/<id>/drop`` —— 从面板放弃一条卡住的委派。
+
+    走服务层 ``TaskService.drop``（与终端 ``/drop`` 同一条迁移与落账）。
+    放弃是终态、可逆（``DROPPED`` → ``INBOX`` 合法）；破坏性由前端
+    多加一次确认拦一道，服务端只做合法迁移，不重写规则。
+    """
+    with app.lock:
+        task = app.tasks.drop(task_id, reason="网页面板放弃")
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "action": "drop",
+        "message": f"已放弃：{task.title}。记录仍保留、可审计。",
     }

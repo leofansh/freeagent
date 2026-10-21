@@ -109,11 +109,19 @@ def urllib_transport(
     为了既有调用点不用改；新代码一律显式传 ``method``。
     """
     body = None if payload is None else json.dumps(payload).encode("utf-8")
+    # 「payload 为空 = GET」是旧调用约定（最初只有 GET/POST 两条路）。
+    # 但后来 method 参数放开了（CardKit 的 PUT/PATCH；V1.41 又来了 DELETE），
+    # 而这三种里 **DELETE 天生无载荷** —— 若继续让「无载荷」压过「显式
+    # method」，撤回会被改写成一个 GET：HTTP 200、业务码 0、返回那条消息
+    # 的内容，撤回**静默变成读取**。这是最阴险的一类失效（一切看起来都对）。
+    # 所以规则改成：method 是显式给的（非默认 POST）就以它为准，「空载荷
+    # 且 method 也还是默认」才落回 GET。
+    explicit_method = method != "POST"
     request = urllib.request.Request(
         url,
         data=body,
         headers={"Content-Type": "application/json", **dict(headers)},
-        method="GET" if body is None else method,
+        method="GET" if (body is None and not explicit_method) else method,
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -144,6 +152,26 @@ def urllib_transport(
         if isinstance(parsed, dict) and parsed.get("code") is not None:
             detail = f" code={parsed.get('code')} msg={parsed.get('msg')}"
         raise FeishuError(f"飞书接口 HTTP {exc.code}{detail}") from exc
+    except urllib.error.URLError as exc:
+        raise FeishuError(f"连不上飞书：{exc.reason}") from exc
+
+
+def _urllib_download(
+    url: str, headers: Mapping[str, str], timeout: float,
+) -> bytes:
+    """下载媒体二进制。**单独一个函数是为了可注入**（测试全程离线）。
+
+    与 :func:`urllib_transport` 分开：那个约定返回 JSON 文本，而媒体是字节流，
+    不能强行塞进同一套「解码 + 校验」逻辑里。
+    """
+    request = urllib.request.Request(
+        url, headers=dict(headers), method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise FeishuError(f"飞书媒体下载 HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise FeishuError(f"连不上飞书：{exc.reason}") from exc
 
@@ -251,6 +279,29 @@ class FeishuSender:
     def send_text(self, chat_id: str, text: str) -> None:
         """发到**会话**。``chat_id`` 是 ``oc_`` 开头的那种。"""
         self._send(chat_id, text, id_type="chat_id")
+
+    # -- 下载媒体（捕获摩擦） ---------------------------------------------- #
+    def download_media(
+        self, key: str, *, media_type: str, downloader=None,
+    ) -> bytes:
+        """下载图片/文件字节（**不解码 JSON**）。
+
+        飞书媒体接口：image 用 ``/open-apis/im/v1/images/{key}?download=1``，
+        file 用 ``/open-apis/im/v1/files/{key}``，都带
+        ``Authorization: Bearer <token>``。
+
+        ``downloader`` 可注入（测试离线用），默认是标准库 urllib 真下载。
+        返回原始字节，调用方负责落盘与失败兜底。
+        """
+        if downloader is None:
+            downloader = _urllib_download
+        path = "images" if media_type == "image" else "files"
+        url = f"{self.config.base_url}/open-apis/im/v1/{path}/{key}"
+        if media_type == "image":
+            url += "?download=1"
+        return downloader(
+            url, {"Authorization": f"Bearer {self.token()}"}, self.timeout,
+        )
 
     def send_to_user(self, open_id: str, text: str) -> None:
         """发到**某人私聊**。
@@ -454,6 +505,46 @@ class FeishuSender:
                 f"msg={body.get('msg')}{tail}"
             )
         return str(((body.get("data") or {}).get("message_id")) or "")
+
+    def delete_message(self, message_id: str) -> None:
+        """撤回一条 **bot 自己发的**消息（V1.41 授权回复串滚动瘦身）。
+
+        ## 这个能力是给「滚动瘦身」用的，不是通用的删消息口
+
+        授权卡挂在进度卡下面（11.16 聚拢），而飞书回复串**逐条占位**：
+        N 次工具调用 = N 张卡，把固定位置的进度卡一路顶出屏幕。撤已定案的
+        旧卡是唯一能把串收短的飞行书操作（消息只能撤，没有「收起」）。
+        谁调它、什么时候调，见 :func:`freeagent.delegate._retire_settled_cards`
+        —— 发送与撤回**同一份生命周期**，别在第二个地方自己调这个方法。
+
+        ## 两条边界，都是**只删自己的**
+
+        - 飞书只许 bot 撤 **自己发的**消息；`message_id` 一律来自
+          :meth:`send_tool_card` / `send_question_card` 的返回值（已落库
+          `pending_approvals.open_message_id`），不存在「撤别人的」这条路径。
+        - **进度卡永远不在撤回之列**：它是授权卡的回复锚点（reply 挂在
+          它下面），把它撤了，之后每次 reply 都会失败（99992354），整条
+          聚拢机制当场失效 —— 识别凭 `open_message_id` 只记授权/提问卡，
+          `card_id` 是另一码事（见 :class:`ProgressCard` 的两 id 说明）。
+
+        失败抛 :class:`FeishuError`（带 code/msg）。撤回失败是**外观损失**
+        （串没瘦下来），调用方必须接住、只记日志，**不许**把授权流程搞停
+        —— 判据与 11.16「reply 失败退回独立发送」同一条：分清外观损失与
+        功能损失。
+        """
+        if not message_id:
+            # 空串只有一个来源：发出时飞书没回 message_id（已有这条纪律：
+            # 卡「发出去了」却没有 id，本身就是异常）。拿着空串去 DELETE
+            # 只会得到一个指不出原因的 404，所以在入口就拦下。
+            raise ValueError("撤回消息必须给 message_id")
+        raw = self._transport(
+            f"{self.config.base_url}/open-apis/im/v1/messages/{message_id}",
+            None,
+            {"Authorization": f"Bearer {self.token()}"},
+            self.timeout,
+            method="DELETE",
+        )
+        _require_ok(raw, "撤回消息")
 
     # -- CardKit 2.0 流式进度卡片（设计文档 11.16） ---------------------- #
     #

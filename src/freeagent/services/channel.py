@@ -496,6 +496,11 @@ class ChannelService:
         with self.app.lock:
             digest = self.app.reminders.due()
             text = render.render_digest(digest)
+            if digest.is_quiet:
+                # 安静窗口（9.8）：把「已压后」说出来，但**不**把 digest 交出去
+                # 确认 —— 窗口内不落令牌，窗口过后这条提醒必须原样再来。
+                note = digest.quiet_note()
+                return ReminderBatch(text=note, digest=None)
         return ReminderBatch(text=text, digest=digest if text else None)
 
     def confirm_reminders(self, batch: ReminderBatch) -> None:

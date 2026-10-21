@@ -40,7 +40,13 @@ __all__ = [
 #:
 #: 反过来也成立：**改了这个数却没有对应的迁移条目**，同样会让最后一格
 #: 静默失效。``tests/test_question_pending.py::test_version`` 同时守两边。
-SCHEMA_VERSION = 15
+#:
+#: 16 → ``task_records.seq``（12.10.6 / V1.37）。曾经 13→14 有一次只改了
+#: ``SCHEMA_VERSION`` 没动迁移条目，最后一格静默失效、症状是「表不存在」
+#: ——这个数改动时必须同时自查两个方向。
+#: 17 → memory（3.7 / V1.47）。
+#: 18 → captured_items（待处理收集器，11.18 / V1.50）。
+SCHEMA_VERSION = 18
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -202,6 +208,58 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 判定按「空 = 不归属」处理（前端不显示归属，不猜）。
         "ALTER TABLE pending_approvals ADD COLUMN task_id TEXT",
     ),
+    # 16 → task_records.seq（12.10.6 / V1.37）：同刻记录不再随机排序。
+    #
+    # ts 是 ISO 文本，同刻记录分不出先后，而 id 是随机的 —— 旧排序
+    # `ts ASC, id ASC` 在同一条时间戳上等于掷硬币：dispatched/failed
+    # 同微秒落库后形状随时颠倒，attempt_state 可能把执行期失败整个判反。
+    # ALTER 走这里（_run_idempotent 认得出已加过列并跳过 —— 新库
+    # init_schema 时就有 seq）；**回填 UPDATE 在 _DOMAIN_STEPS 的 keyed-16**，
+    # 一步一版的拆法同 v15（ALTER+CREATE 拆两通道同版推进）一个道理。
+    (
+        "16 → task_records.seq（同刻记录定序；回填 UPDATE 见 _DOMAIN_STEPS keyed-16）",
+        "ALTER TABLE task_records ADD COLUMN seq INTEGER",
+    ),
+    # 16 → 17：占位 —— v17 的真实步骤是多语句（memory schema + FTS5 + 触发器），
+    # 走 _DOMAIN_STEPS keyed-17，与 v8 的占位同一个道理。
+    #
+    # 为什么必须有它：_MIGRATIONS 按「源版本 − 1」位置索引。v17 只有域步骤、
+    # 没有单语句步骤，所以这个位置原本是空的；不补占位的话，下面
+    # 「17 → 18」会整体前移一格到索引 15 —— 于是它会在 16 → 17 那一步
+    # 执行（和 memory schema 挤在同一步），而 17 → 18 那一步反而空跑。
+    # 表最终都建得出来，但「一步一版」的不变量没了，且标签与执行版本对不上，
+    # 后来人按标签排查会被带偏（同 v8 占位注释记录的病）。
+    # 而不能简单留空：_run_idempotent 会 conn.execute(sql)，空语句直接炸。
+    (
+        "16 → 17：占位 —— v17 的真实步骤是多语句（memory + FTS5），走 _DOMAIN_STEPS。",
+        "SELECT 1",
+    ),
+    # 17 → 18：captured_items（待处理收集器，11.18 / V1.50）。
+    #
+    # GTD 的 capture → clarify 之间那张桌子：飞书收下的图片/文件先落在这里，
+    # 等用户 /pending N 显式澄清成事务。**刻意不是 tasks 上的一列** ——
+    # 见 _SCHEMA 里同款建表的注释（三条理由：承诺语义、排序污染、迁移纪律）。
+    #
+    # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等；
+    # 新库走 init_schema 时已有同款建表，重复执行无害。
+    (
+        "17 → 18：captured_items（待处理收集器：收下了但还没澄清的原材料）",
+        """
+        CREATE TABLE IF NOT EXISTS captured_items (
+            id          TEXT PRIMARY KEY,
+            source      TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            media_key   TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            size        INTEGER NOT NULL DEFAULT 0,
+            path        TEXT NOT NULL DEFAULT '',
+            status      TEXT NOT NULL DEFAULT 'pending',
+            task_id     TEXT,
+            created_at  TEXT NOT NULL,
+            resolved_at TEXT
+        )
+        """,
+    ),
 )
 
 
@@ -280,6 +338,59 @@ CREATE TRIGGER IF NOT EXISTS role_knowledge_au BEFORE UPDATE ON role_knowledge B
 END;
 """
 
+#: 记忆（memory，3.7 / V1.47）的建表脚本。**与 `_KNOWLEDGE_SCHEMA` 同构**：
+#: FTS5 外部内容表 + 三个触发器，原文永远在 ``memory.content`` 列。
+#:
+#: 为什么不并进 `_KNOWLEDGE_SCHEMA`：那是**按角色**的脉络知识（`role_id` 外键
+#: 到 roles），这是**跨角色的 core 记忆**（作用域用 `scope` 文本表达：
+#: 'global' 或 'role:<id>'）。硬塞进一张表会让「这条属于哪个角色」这件事
+#: 从「外键保证存在」退化成「字符串里藏着 id」，而 3.6 的注释已经论证过：
+#: 孤儿知识（role 不存在）永远不会被检索到、也永远不会被看见。
+#:
+#: 为什么 `scope` 用文本而不是两张表（global 一张 + role 一张）：
+#: 检索要**一次查两面**（全局 + 当前角色），两张表就得 UNION 两遍 FTS
+#: 查询、两套排序合并 —— 复杂度远大于「一列区分、查询时 WHERE scope IN (...)」。
+#: 代价是 `role:<id>` 的存在性要靠**服务层**写时校验（`RoleRepo.get`），
+#: 这一点在 `MemoryService.add` 里做了。
+_MEMORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory (
+    id          TEXT PRIMARY KEY NOT NULL,
+    scope       TEXT NOT NULL,          -- 'global' 或 'role:<role_id>'
+    kind        TEXT NOT NULL,          -- 偏好 / 约定 / 修正，见 MEMORY_KINDS
+    content     TEXT NOT NULL,          -- 原文，唯一真源
+    search_text TEXT NOT NULL,          -- bigram 形态，由 Python 算好写入
+    source_ref  TEXT,                   -- 血缘：这条从哪来
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, created_at);
+
+-- FTS5 语法：索引列名写前面，content=/content_rowid= 选项写后面
+-- （见 `_KNOWLEDGE_SCHEMA` 的同一处教训）。
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+    USING fts5(search_text, content='memory', content_rowid='rowid');
+
+CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
+    INSERT INTO memory_fts(rowid, search_text)
+        VALUES (new.rowid, new.search_text);
+END;
+
+-- delete / update 用 BEFORE：外部内容表的 FTS5 不存正文，
+-- 「删掉这一行」要回内容表读该行的值才知道该移除哪些 token。
+CREATE TRIGGER IF NOT EXISTS memory_ad BEFORE DELETE ON memory BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, search_text)
+        VALUES ('delete', old.rowid, old.search_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_au BEFORE UPDATE ON memory BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, search_text)
+        VALUES ('delete', old.rowid, old.search_text);
+    INSERT INTO memory_fts(rowid, search_text)
+        VALUES (new.rowid, new.search_text);
+END;
+"""
+
 #: **多语句**的域变更，键是**目标**版本。
 #:
 #: 为什么不并进 :data:`_MIGRATIONS`：那个元组一步只跑一条 ``conn.execute``，
@@ -302,7 +413,6 @@ _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
     # 跑完就该消失；而 tasks 行是**长期真源**，在它身上挂「正在执行」，
     # 于是「跑完了没清干净」会变成事务身上一条永久的假状态。
     # 独立表的另一面好处：清掉就是 DELETE 一行，不碰任何真源列。
-    #
     # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等；
     # 新库走 init_schema 时已有同款建表，重复执行无害。
     (
@@ -319,6 +429,27 @@ _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
         )
         """,
     ),
+    # 16 → task_records.seq 回填（12.10.6 / V1.37）：同刻记录不再随机排序。
+    #
+    # **这条是 keyed-16 的回填语句**；配套的 ALTER 加列在同一条源版本的
+    # _MIGRATIONS 里（利用 _run_idempotent 对 ALTER 的幂等兜底 —— 新库
+    # init_schema 时已有 seq 列，那条 ALTER 必须能被认出来并跳过）。
+    # UPDATE 放这里走 executescript：`seq IS NULL` 才回填，本身就是幂等的
+    # —— 新库没有 NULL 行，等于空跑；v15 存量库恰好跑一次。
+    #
+    # ⚠️ 这条 UPDATE 是全仓迁移纪律「只 ADD COLUMN / CREATE TABLE」的
+    # **显式登记例外**（AGENTS.md 已登记）：它只补序号、不碰任何业务字段。
+    (
+        16,
+        "UPDATE task_records SET seq = rowid WHERE seq IS NULL",
+    ),
+    # 17 → memory（3.7 / V1.47）：跨角色的 core 记忆层 + FTS5 索引。
+    #
+    # 整表新建，走 CREATE TABLE IF NOT EXISTS，本身幂等；新库 init_schema
+    # 时已有同款建表，重复执行无害。为什么不并进 v8 的 _KNOWLEDGE_SCHEMA：
+    # 那是「按角色的脉络知识」，这是「跨角色的 core 记忆」，作用域模型不同
+    # （外键 vs scope 文本），理由见 _MEMORY_SCHEMA 的注释。
+    (17, _MEMORY_SCHEMA),
 )
 
 #: 覆盖默认数据目录的环境变量名。
@@ -389,7 +520,11 @@ CREATE TABLE IF NOT EXISTS task_records (
     task_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     ts       TEXT NOT NULL,
     type     TEXT NOT NULL,
-    content  TEXT NOT NULL
+    content  TEXT NOT NULL,
+    -- 每任务单调递增序号（12.10.6 / V1.37）。ts 是 ISO 文本，同刻记录
+    -- 分不出先后，而 id 是随机的 —— 没有它，同微秒的 dispatched/failed
+    -- 落库后形状随时颠倒，attempt_state 可能把执行期失败判成派发前被拒。
+    seq      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -501,6 +636,42 @@ CREATE TABLE IF NOT EXISTS plan_sessions (
     lines      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- 待处理收集器（设计文档 11.18 / V1.50）。GTD 五环里 capture 与 clarify
+-- 之间那张桌子：飞书收下的图片/文件先落在这里，等用户显式澄清。
+--
+-- ## 为什么**单独一张表**，而不是给 tasks 加一列（如 state='captured'）
+--
+-- 1. **语义不同**。tasks 行是「你承诺要做什么」，有完成标准、有排序信号、
+--    有顺延收口；而捕获只是「东西先进来了」—— 一张截图、一个文件、一条
+--    引用，「它到底是什么」只有用户知道。把未澄清的原材料混进 tasks，
+--    `/today` 会把它们算成承诺（与 plan_sessions 那条注释同源：零副作用）。
+-- 2. **排序会被污染**。7.2 的每条信号都假设对面是一条事务；给捕获行
+--    打分等于替用户决定「这张图比那张图紧急」。
+-- 3. **迁移纪律**。捕获行没有 title/role/state 这些 NOT NULL 列，
+--    硬塞进 tasks 要么给全表加一沓可空列，要么造假数据填坑。
+--
+-- ## media_key 为什么必须留
+--
+-- 它是飞书侧的 image_key / file_key —— **重新下载的唯一凭据**。
+-- 本地文件丢了（清理磁盘、换机器）还能凭它捞回来；只存本地路径的话，
+-- 路径一失效这条捕获就真的没了。
+--
+-- status 取值见 domain.CapturedStatus：pending → clarified / dismissed，
+-- 两个终态都只由用户显式动作产生，没有自动迁移。
+CREATE TABLE IF NOT EXISTS captured_items (
+    id          TEXT PRIMARY KEY,
+    source      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    media_key   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    size        INTEGER NOT NULL DEFAULT 0,
+    path        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending',
+    task_id     TEXT,
+    created_at  TEXT NOT NULL,
+    resolved_at TEXT
+);
 """
 
 
@@ -544,6 +715,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     """幂等建表。可重复调用。"""
     conn.executescript(_SCHEMA)
     conn.executescript(_KNOWLEDGE_SCHEMA)
+    conn.executescript(_MEMORY_SCHEMA)
     conn.commit()
 
 

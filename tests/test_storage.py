@@ -412,3 +412,121 @@ class TestSchemaMigration:
         for _ in range(3):
             app = build_app(db)
             app.close()
+
+    def _make_v15_db(self, path):
+        """还原 v15：``task_records`` 还没有 ``seq`` 列（V1.35 时代）。
+
+        照抄 ``_make_v1_db`` 的手法：用**真实** schema 过滤行 + 设版本号，
+        不写手写的简化表。过滤词是 ``seq`` —— 它只出现在 task_records
+        的 seq 列（含列定义与注释行），不会误伤其他表。
+        ⚠️ 滤掉 seq 列定义后，task_records 的 ``content TEXT NOT NULL,``
+        会留着**悬空逗号**且中间隔着注释行 —— executescript 直接语法错。
+        v1 那版没踩到是因为 project_path 不在列尾；这里滤 seq 时
+        **越过注释行回溯**找到行尾逗号摘掉（只影响这个位置）。
+        """
+        from freeagent.storage.db import _SCHEMA, connect
+
+        kept: list[str] = []
+        for line in _SCHEMA.splitlines():
+            if "seq" in line:
+                # 滤列定义时越过紧邻的注释行，把真正的上一行（含悬空逗号
+                # 的列定义）修好 —— 注释行留着无所谓。
+                for j in range(len(kept) - 1, -1, -1):
+                    if kept[j].lstrip().startswith("--"):
+                        continue
+                    if kept[j].rstrip().endswith(","):
+                        kept[j] = kept[j].rstrip()[:-1]
+                    break
+                continue
+            kept.append(line)
+        v15 = "\n".join(kept) + "\nPRAGMA user_version = 15;\n"
+        c = connect(path)
+        c.executescript(v15)
+        c.execute(
+            "INSERT INTO roles (id, name, active, created_at, updated_at)"
+            " VALUES (?, ?, 1, ?, ?)",
+            ("r15", "角色", NOW.isoformat(), NOW.isoformat()),
+        )
+        c.execute(
+            "INSERT INTO tasks (id, title, state, kind, entered_at,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("t15", "v15 时代的委派", "done", "action",
+             NOW.isoformat(), NOW.isoformat(), NOW.isoformat()),
+        )
+        c.execute(
+            "INSERT INTO task_roles (task_id, role_id, ord) VALUES (?, ?, 0)",
+            ("t15", "r15"),
+        )
+        # 两条**同一时间戳**的记录，插入序有先后（rowid 顺序有据可依）。
+        # 这正是 12.10.6 撞到的形状：同刻 dispatched → failed，
+        # 旧排序按随机 id 读回来时可能整个判反。
+        for i, (type_, content) in enumerate(
+            [("delegation_dispatched", "派出"), ("delegation_failed", "挂了")]
+        ):
+            c.execute(
+                "INSERT INTO task_records (id, task_id, ts, type, content)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (f"old-{i}", "t15", NOW.isoformat(), type_, content),
+            )
+        c.commit()
+        c.close()
+
+    def test_v15_db_backfills_seq_in_rowid_order(self, tmp_path):
+        """v15 → v16：加 ``seq``，存量行按写入序（rowid）回填。
+
+        回填用的那条 UPDATE 是迁移纪律「只 ADD/CREATE」的**显式登记例外**
+        （AGENTS.md / 设计文档 12.10.6）—— 这里守的就是这个例外没跑偏：
+        序号不反向、不重号，读侧同刻记录顺序变成确定性的。
+        """
+        from freeagent.app import build_app
+        from freeagent.storage.db import SCHEMA_VERSION, connect
+
+        db = tmp_path / "v15.db"
+        self._make_v15_db(db)
+        assert "seq" not in [
+            r[1] for r in connect(db).execute("PRAGMA table_info(task_records)")
+        ], "前置条件：还原出的 v15 库不该有这一列"
+
+        app = build_app(db)
+        try:
+            assert connect(db).execute(
+                "PRAGMA user_version"
+            ).fetchone()[0] == SCHEMA_VERSION
+            records = app.record_repo.list_for_task("t15")
+            # rowid 序与插入序一致 ⇒ 「先派后败」的形状被保住了。
+            assert [r.seq for r in records] == [1, 2]
+            assert [r.content for r in records] == ["派出", "挂了"]
+        finally:
+            app.close()
+
+    def test_v15_migration_is_idempotent(self, tmp_path):
+        """重复 build_app 同一个 v15 库不能炸，且且回填不重跑（幂等）。"""
+        from freeagent.app import build_app
+
+        db = tmp_path / "v15b.db"
+        self._make_v15_db(db)
+        for _ in range(3):
+            app = build_app(db)
+            app.close()
+        # 迁移只跑一次，重复打开不得把 seq 改成别的值。
+        app = build_app(db)
+        try:
+            records = app.record_repo.list_for_task("t15")
+            assert [r.seq for r in records] == [1, 2]
+        finally:
+            app.close()
+
+
+def test_seq_is_monotonic_per_task(repos):
+        """新写入：seq 每任务单调 +1；两个任务互不夺号（非全局序）。"""
+        conn = repos[0]._conn
+        role = RoleRepo(conn).add("甲", NOW)
+        _, tasks, records, _ = repos
+        tasks.add(_task(id="a", role_ids=(role.id,)))
+        tasks.add(_task(id="b", role_ids=(role.id,)))
+        r1 = records.append("a", RecordType.NOTE, "a1", NOW)
+        r2 = records.append("a", RecordType.NOTE, "a2", NOW)  # 同刻也必须有序
+        r3 = records.append("b", RecordType.NOTE, "b1", NOW)
+        assert (r1.seq, r2.seq, r3.seq) == (1, 2, 1)
+        # 同刻记录读回来的顺序 = 写入序，不再取决于随机 id。
+        assert [r.content for r in records.list_for_task("a")] == ["a1", "a2"]

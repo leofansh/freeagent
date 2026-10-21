@@ -97,10 +97,14 @@ async function load(next) {
     // 提醒先查：合并成一条摘要，不逐条弹（与终端同一条规则）
     try {
       const rem = await api("/api/reminders");
+      // 安静窗口（9.8）：窗口内 count=0 但 quiet 有文案 —— 也要说出来，
+      // 否则用户以为提醒功能坏了（跟终端 [提醒] 那一行同一份道理）。
       if (rem.count) {
         root.appendChild(
           el("div", "note", "🔔 " + esc(rem.text))
         );
+      } else if (rem.quiet) {
+        root.appendChild(el("div", "note", "🌙 " + esc(rem.quiet)));
       }
     } catch (e) { /* 提醒查不到不该挡住主视图 */ }
     if (view === "today") {

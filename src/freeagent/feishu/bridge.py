@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import queue
@@ -28,9 +29,14 @@ import socket
 import sys
 import threading
 import time
+import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:  # 仅类型标注用：运行时不需要 services 层（装配在 main 里做）
+    from ..services.pending import PendingService
 
 from .config import (
     ConfigError,
@@ -139,6 +145,17 @@ _CARD_COMMAND_ALLOWLIST: frozenset[str] = frozenset({
 _IDENTITY_RETRY_DELAYS: tuple[float, ...] = (60.0, 120.0, 300.0, 600.0, 900.0)
 
 
+def _safe_attachment_name(name: str) -> str:
+    """把附件名压成可安全做文件名的串。
+
+    飞书的 ``file_name`` 可能带路径分隔符、冒号等会污染落盘路径的字符，
+    必须剥掉。同时限制长度，免得一条长文件名把路径顶爆。
+    """
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", (name or "").strip())
+    cleaned = cleaned.strip(". ")
+    return cleaned[:120] if cleaned else ""
+
+
 class FeishuBridge:
     """把飞书消息接到本地助手上。**不直接持有 SDK 客户端**，只管路由。"""
 
@@ -150,6 +167,8 @@ class FeishuBridge:
         *,
         bot_open_id: str | None = None,
         reporter: StatusReporter | None = None,
+        home: "Path | None" = None,
+        pending: "PendingService | None" = None,
     ) -> None:
         """
         ``bot_open_id`` 是 bot 自己的 ``open_id``，**群聊 @ 门控的唯一依据**。
@@ -161,12 +180,21 @@ class FeishuBridge:
         ``reporter`` 用来把「最近见过谁」写进状态文件，供控制面显示 ——
         白名单最难的就是「不知道该填什么」，界面直接列出实际 ID 就绕过了。
         不传则不记（离线测试与 FakeBridge 都不需要）。
+
+        ``pending`` 是待处理收集器（11.18）。收下的附件除了落盘，还要
+        进这条队列等用户显式澄清 —— 不传（离线测试）时只落盘不入队，
+        行为与 V1.48 一致：**收下但不建事务**这条纪律两种情况下都成立。
         """
         self.channel = channel
         self.sender = sender
         self.config = config
         self.bot_open_id = bot_open_id or None
         self.reporter = reporter
+        #: 状态目录（config.json / 附件落盘都在这下面）。``None`` 时落盘用
+        #: ``state_home(None)`` 重新解析，与 ``build_app`` 同一条规则。
+        self._home = home
+        #: 待处理收集器。``None`` = 不落队（只落盘），见 __init__ 文档。
+        self._pending = pending
         self._seen_senders: dict[str, dict[str, object]] = {}
         #: 「最近给这个 open_id 发过配对卡」的时刻。**内存态、刻意不落盘**。
         #:
@@ -434,7 +462,7 @@ class FeishuBridge:
         2. **飞书重连重投同一事件时，菜单卡会再发一遍。** 去重表是在
            ``handle`` 里写的，菜单压根没走到那里。
 
-        所以这里显式补上，与 :meth:`_reply_unsupported` 同一把尺子 ——
+        所以这里显式补上，与 :meth:`_capture_unsupported` 同一把尺子 ——
         不能因为「这条路径不发敏感内容」就省掉闸门：泄露面不取决于内容，
         取决于「对方知道这里有个东西在回话」。
         """
@@ -455,7 +483,7 @@ class FeishuBridge:
                 self.channel.allowlist_mismatch(msg.sender_ids),
             )
             # 交回 ``channel.handle`` 走标准拒绝路径：它会拒，而且**不说话**
-            #（不在白名单的人连提示都不该收，见 :meth:`_reply_unsupported`）。
+            #（不在白名单的人连提示都不该收，见 :meth:`_capture_unsupported`）。
             return None
 
         key = msg.dedup_key
@@ -625,7 +653,7 @@ class FeishuBridge:
         if msg.unsupported_type:
             # 不支持的消息类型：回一句提示，但**绝不进派发逻辑**。
             # 见设计方案 11.9.1「不支持的消息类型要回一句提示，不能沉默」。
-            self._reply_unsupported(msg)
+            self._capture_unsupported(msg)
             return
         # 去重键用 ``msg.dedup_key``（``event_id`` → ``message_id`` 兜底），
         # **不是** ``msg.event_id or None``。
@@ -638,12 +666,12 @@ class FeishuBridge:
         # 证据：实测收到一条消息、处理成功、也回了话，但去重表条目数没动，
         # 说明那次的 ``event_id`` 是空的、去重压根没跑。
         #
-        # 这个坑在非文字那条路径上**已经修过一次**（见 :meth:`_reply_unsupported`
+        # 这个坑在非文字那条路径上**已经修过一次**（见 :meth:`_capture_unsupported`
         # 的注释），当时只改了那一处，文字这条漏了 —— 同一个坑要踩两次。
         # ``dedup_key`` 这个属性就是为此存在的（设计方案 11.9.2）。
         key = msg.dedup_key
         if not key:
-            # 绝不能静默跳过（和 :meth:`_reply_unsupported` 同一把尺）：
+            # 绝不能静默跳过（和 :meth:`_capture_unsupported` 同一把尺）：
             # 没有键就无法去重，重投会重复建事务，而用户只看到「怎么有两条」。
             log.warning(
                 "这条消息既无 event_id 也无 message_id，**无法去重**；"
@@ -907,8 +935,54 @@ class FeishuBridge:
         log.info("已给 %s 发一张配对卡（%d 分钟内有效）",
                  open_id, PAIRING_TTL_SECONDS // 60)
 
-    def _reply_unsupported(self, msg: IncomingMessage) -> None:
-        """回一句「我只处理文字」，然后就此打住。
+    def _db_lock(self):
+        """桥接侧写库用的进程级锁（``App.lock``）。
+
+        SQLite 连接不能被两个线程同时用（``check_same_thread=False`` 只解除
+        线程归属检查，不提供并发安全），而桥接进程里 worker、提醒线程、
+        卡片回调三条路都碰同一个 conn。持锁口径与
+        :meth:`ChannelService.handle` 一致 —— 那边整段服务调用都在
+        ``self.app.lock`` 里，这里不自己造第二套。
+
+        channel 上取不到 app（离线假件）时退回空上下文：那些场景本来就
+        不写库；为它们造一把锁，只会让「生产路径拿了把假锁」更难发现。
+        """
+        lock = getattr(getattr(self.channel, "app", None), "lock", None)
+        return lock if lock is not None else nullcontext()
+
+    def _enqueue_capture(self, *, source: str, kind: str, key: str,
+                         name: str, size: int,
+                         path: str) -> Literal["queued", "unwired", "failed"]:
+        """把一条收下的捕获写进待处理队列（11.18）。
+
+        返回三态，**调用方必须让回复与事实一致**：
+
+        - ``"queued"``：真入队了 —— 回复才许说「进了待处理队列」；
+        - ``"unwired"``：这条桥接没接待处理服务（离线/测试）—— 回复维持
+          V1.48 的口径（只说到存到哪），**不许提队列**：提了用户就会去
+          /pending 找个不存在的条目；
+        - ``"failed"``：入队抛异常（库锁/磁盘）—— 附件已落盘（东西没丢），
+          回复照发但说清「队列没记上（详见日志）」，并给下一步出路。
+
+        为什么不是 bool：第一版把 unwired 当时 True，于是没接队列的桥接
+        回复里写着「进了待处理队列」—— 而 /pending 里什么都没有。用户
+        拿到的是句假话，而测试只断言「已收下」三个字，抓不到它。
+        """
+        if self._pending is None:
+            return "unwired"
+        try:
+            with self._db_lock():
+                self._pending.add(
+                    source=source, kind=kind, media_key=key,
+                    name=name, size=size, path=path,
+                )
+            return "queued"
+        except Exception:  # noqa: BLE001 - 入队是辅助步骤，不许把回复搞崩
+            log.exception("入待处理队列失败（key=%s）；附件已落盘，不受影响", key)
+            return "failed"
+
+    def _capture_unsupported(self, msg: IncomingMessage) -> None:
+        """非文字消息：**收下而非丢弃**（捕获摩擦），仍发一句提示。
 
         群聊 @ 门控在 :meth:`on_message` 入队前就过了（没 @ 到 bot 的根本
         不会走到这里），所以这里只剩**白名单**这一道。
@@ -921,9 +995,20 @@ class FeishuBridge:
         踩过的坑（**实测发现的**，离线测试全绿）：去重发生在
         :meth:`ChannelService.handle` 里面，而这里刻意不走 ``handle``
         （它只处理可派发的正文）。于是非文字消息**从不写去重表** ——
-        飞书重连重投同一张图时，就会**再回一次**提示。
-        症状很隐蔽：文字消息不会重复，图片会，去重表里也查不到那条记录。
-        所以这里必须显式补记一次，否则「跨重启去重」这个承诺对图片是假的。
+        飞书重连重投同一张图时，就会**再收一次**。所以这里必须显式补记一次，
+        否则「跨重启去重」这个承诺对图片是假的。
+
+        **关键：收下附件但**不建事务**。事务要等用户后处理时显式发起 ——
+        保持设计文档 11.9.10「非文字消息不建事务」这个前提，否则
+        ``tests/test_doc_contract.py`` 的用户文档断言会红。收下的是**引用 +
+        下载的字节**（落到状态目录 ``attachments/``），下载失败也记引用，
+        总之不再「回一句就丢」。
+
+        V1.50 起多走一步：收下的同时**入待处理队列**（11.18）——
+        落盘只是「收下」，入队才是「等着被澄清」。没有队列，附件就是
+        write-only 的垃圾场：用户不知道它躺在那，GTD 的 capture → clarify
+        在中间断掉。队列写入失败**不改「已收下」的事实**（东西在盘上），
+        只让回复说实话（见 :meth:`_enqueue_capture`）。
         """
         # 先记去重再决定回不回：判定本身就是「处理」，处理过就该被记住。
         #
@@ -934,36 +1019,139 @@ class FeishuBridge:
         key = msg.dedup_key
         if key and self.channel.dedup.is_duplicate(key):
             log.info(
-                "重复事件（%r），不重复回提示（key=%s）",
+                "重复事件（%r），不重复收下（key=%s）",
                 msg.unsupported_type, key,
             )
             return
         if not key:
             # **绝不能静默跳过**（设计方案 11.9.2）。没有键就无法去重，
-            # 这条提示在重投时会重复发出 —— 用户只看到「同一张图被回了两次」。
+            # 这条消息在重投时会重复收下 —— 用户只看到「同一张图被收了两次」。
             # 明确报出来，至少能查。
             log.warning(
                 "这条 %r 消息既无 event_id 也无 message_id，**无法去重**；"
-                "若它被飞书重投，提示会重复发出（event_id=%r message_id=%r）",
+                "若它被飞书重投，会重复收下（event_id=%r message_id=%r）",
                 msg.unsupported_type, msg.event_id, msg.message_id,
             )
         if not self.channel.is_allowed(msg.sender_ids):
             log.info(
-                "发送者不在白名单，%r 消息不回提示：%s（event_id=%s）",
+                "发送者不在白名单，%r 消息不收下：%s（event_id=%s）",
                 msg.unsupported_type,
                 self.channel.allowlist_mismatch(msg.sender_ids),
                 msg.event_id,
             )
             return
+        att = msg.attachment
+        label = "图片" if (att is not None and att.type == "image") else "文件"
+        if att is None:
+            # 富文本等抽不出可下载附件：仍回提示，但**不丢**—— 没东西可收。
+            log.info(
+                "收到 %r 消息（发送者 %s），无可下载附件，回提示而不丢",
+                msg.unsupported_type, msg.sender_label,
+            )
+            self.sender.send_text(
+                msg.chat_id,
+                f"我只处理文字消息，这条收到的是 {msg.unsupported_type}。"
+                "图片、文件请直接用文字说，或发原图/原文件我会收下。",
+            )
+            return
+        # 收下：下载字节落盘；失败则记引用，都不丢。
+        home = self._home if self._home is not None else state_home(None)
+        attach_dir = home / "attachments"
+        try:
+            attach_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # 目录都建不出就不该往下走
+            log.exception("建附件目录失败（%s）", attach_dir)
+            self.sender.send_text(
+                msg.chat_id,
+                f"这条{label}（{att.name}）收不下：附件目录建不了（{exc}）。",
+            )
+            return
+        stamp = key or msg.message_id or uuid.uuid4().hex
+        safe = _safe_attachment_name(att.name) or att.type
+        try:
+            data = self.sender.download_media(att.key, media_type=att.type)
+        except Exception:
+            # 下载失败（多半没联网 / 没权限）：记引用不丢，真机里仍能看到原文件。
+            meta = attach_dir / f"{stamp}__{safe}.meta.json"
+            meta.write_text(
+                json.dumps(
+                    {"key": att.key, "type": att.type, "name": att.name,
+                     "size": att.size},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            log.exception("下载附件失败（key=%s），已记引用", att.key)
+            # 下载失败也入队：引用（media_key）就是重新下载的凭据，
+            # 用户 /pending 看到它，联网后照样能澄清 —— 「收下」不依赖
+            # 这一次下载成功，只依赖飞书还认这个 key。
+            state = self._enqueue_capture(
+                source="feishu", kind=att.type, key=att.key,
+                name=att.name, size=att.size, path=str(meta),
+            )
+            if state == "queued":
+                self.sender.send_text(
+                    msg.chat_id,
+                    f"这条{label}（{att.name}）暂时下载不下来"
+                    "（多半没联网或没权限），已记下引用 "
+                    f"{att.key} 并放进待处理队列；联网后在飞书里仍能看到原文件。"
+                    "要处理时告诉我。",
+                )
+            elif state == "unwired":
+                self.sender.send_text(
+                    msg.chat_id,
+                    f"这条{label}（{att.name}）暂时下载不下来"
+                    f"（多半没联网或没权限），已记下引用 {att.key}；"
+                    "原件在飞书里仍看得到，要处理时告诉我。",
+                )
+            else:
+                self.sender.send_text(
+                    msg.chat_id,
+                    f"这条{label}（{att.name}）暂时下载不下来"
+                    f"（多半没联网或没权限），已记下引用 {att.key}；"
+                    "但待处理队列没记上（详见日志）。原件在飞书里仍看得到，"
+                    "要处理时直接告诉我。",
+                )
+            return
+        dest = attach_dir / f"{stamp}__{safe}"
+        dest.write_bytes(data)
+        # 日志把「不建事务」钉在这里：排查时看得见收下了什么、以及为什么
+        # 它没变成事务（11.18.3：建事务只由用户显式澄清触发）。
         log.info(
-            "收到 %r 消息（发送者 %s），回一句「只处理文字」而不建事务",
-            msg.unsupported_type, msg.sender_label,
+            "收下 %r 附件（发送者 %s）：%s（%d 字节）—— 不建事务，等用户显式澄清",
+            att.type, msg.sender_label, dest, len(data),
         )
-        self.sender.send_text(
-            msg.chat_id,
-            f"我只处理文字消息，这条收到的是 {msg.unsupported_type}。"
-            "图片、文件、富文本请直接用文字说。",
+        # 入待处理队列（11.18）。落盘只是「收下」，入队才是「等着被澄清」——
+        # 少了这一步，attachments/ 就是 write-only 的垃圾场：用户根本
+        # 不知道那里躺着东西，而 GTD 的 capture → clarify 在中间断掉。
+        state = self._enqueue_capture(
+            source="feishu", kind=att.type, key=att.key,
+            name=att.name, size=len(data), path=str(dest),
         )
+        if state == "queued":
+            self.sender.send_text(
+                msg.chat_id,
+                f"已收下这条{label}（{att.name}，{len(data)} 字节），"
+                "进了待处理队列。\n"
+                "在终端 /pending 能看到它，/pending <序号> 一键澄清成事务。\n"
+                f"原件存到 {dest}",
+            )
+        elif state == "unwired":
+            # 没接队列：不提「待处理队列」四个字 —— 提了就是撒谎，
+            # 用户会去 /pending 找个不存在的条目（_enqueue_capture 文档）。
+            self.sender.send_text(
+                msg.chat_id,
+                f"已收下这条{label}（{att.name}，{len(data)} 字节），"
+                f"存到 {dest}。\n要基于它建事务，直接跟我说一声。",
+            )
+        else:
+            self.sender.send_text(
+                msg.chat_id,
+                f"已收下这条{label}（{att.name}，{len(data)} 字节），"
+                f"存到 {dest}。\n"
+                "但待处理队列没记上（详见日志）—— 要基于它建事务，"
+                "直接跟我说一声。",
+            )
 
     # -- 身份恢复 ------------------------------------------------------------ #
     def start_identity_recovery(self, sender, home=None) -> None:
@@ -1543,7 +1731,7 @@ def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     # 就收到了回话。
     #
     # 后果不只是体验差：回一句话就等于向白名单外确认「这里有个 bot 在跑」，
-    # 那正是白名单要挡的泄露面 —— 与 :meth:`_reply_unsupported` 同一把尺子。
+    # 那正是白名单要挡的泄露面 —— 与 :meth:`_capture_unsupported` 同一把尺子。
     #
     # ``role:`` 那支转手 :func:`_run_view_choice`，它内部会过 ``handle()``，
     # 所以本来就安全；这里**照样先问**：白名单只在一处判定，将来改分支才
@@ -2736,7 +2924,11 @@ def main(argv: list[str] | None = None) -> int:
 
         bridge = FeishuBridge(
             channel, sender, config,
-            bot_open_id=bot_open_id, reporter=reporter,
+            bot_open_id=bot_open_id, reporter=reporter, home=home,
+            # 待处理收集器（11.18）：捕获侧与澄清侧（/pending）共用同一个
+            # 服务实例与同一个库连接 —— 不新建第二个连接，那会绕开 app.lock
+            # （同 _card_conn 那条注释的理由）。
+            pending=app.pending,
         )
         if bot_open_id is None:
             # 探到了就不起这个线程：没得可重试，白白挂个线程只增加出错面。

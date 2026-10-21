@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, replace
+from datetime import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +27,7 @@ from .domain import ValidationError
 from .paths import state_file
 from .secrets import SecretStr
 from .services.llm.deepseek_vision import DEFAULT_VISION_MODEL
+from .services.reminders import QuietHours
 from .services.sorting import EnergyWindows
 
 __all__ = [
@@ -192,6 +194,59 @@ def _energy_from(payload: Mapping[str, Any]) -> EnergyWindows | None:
     return EnergyWindows(**fields) if fields else EnergyWindows()
 
 
+def _quiet_from(payload: Mapping[str, Any]) -> QuietHours | None:
+    """解析安静窗口（9.8）。
+
+    ``null`` / 缺省 / ``[]`` / ``["", ""]`` 一律 = **不启用**（不报错）——
+    与 ``energy_windows`` 的空档约定一致：清空一个可选窗口是合理动作，
+    不该逼用户去删键。**但写了半个（只有一个时间、或时间格式错）要报错**：
+    那只可能是配错了，静默忽略等于「我设了安静窗口却没生效」。
+    """
+    raw = payload.get("quiet_hours")
+    if raw is None or raw is False or raw == []:
+        return None
+    if raw is True or not isinstance(raw, list) or len(raw) != 2:
+        raise ValidationError(
+            "config.quiet_hours 必须是 [起始时间, 结束时间]（如 [\"22:00\", \"08:00\"]）"
+        )
+    start_text, end_text = raw[0], raw[1]
+    # 两个都空 = 「清空」；只有一个空 = 配错了。
+    if not str(start_text).strip() and not str(end_text).strip():
+        return None
+    if not str(start_text).strip() or not str(end_text).strip():
+        raise ValidationError("config.quiet_hours 的起止时间要么都填、要么都不填")
+    return QuietHours(
+        start=_parse_hhmm(start_text, "开始"),
+        end=_parse_hhmm(end_text, "结束"),
+    )
+
+
+def _parse_hhmm(value: Any, which: str) -> time:
+    """``"22:00"`` → :class:`datetime.time`。**只认 24 小时制 HH:MM**。
+
+    刻意不接受 ``"8"`` / ``"8am"`` 这类宽松写法：安静窗口是**边界**，
+    边界上的猜错（把 8 点猜成 20 点 = 白天全网静音）代价不对称，
+    所以要的是「明确写清」而不是「尽力猜」。
+    """
+    text = str(value).strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValidationError(
+            f"config.quiet_hours 的{which}时间必须是 24 小时制 HH:MM（如 22:00），收到：{text!r}"
+        )
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValidationError(
+            f"config.quiet_hours 的{which}时间必须是 24 小时制 HH:MM（如 22:00），收到：{text!r}"
+        ) from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValidationError(
+            f"config.quiet_hours 的{which}时间超出范围（00:00–23:59）：{text!r}"
+        )
+    return time(hour, minute)
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """非秘密配置。``api_key`` 单独持有，且**不会被序列化**。"""
@@ -203,6 +258,12 @@ class Config:
     #: 用哪家的模型。见 :mod:`freeagent.services.llm.providers`。
     provider: str = DEFAULT_PROVIDER
     energy_windows: EnergyWindows | None = None
+    #: 安静窗口（9.8）：本地墙钟起止、可跨天。``None`` = 不启用（默认朝关）。
+    #:
+    #: **不是 `energy_windows` 的一部分**（重写版 ③ 的旧建议错了）：
+    #: 后者是**排序分类桶**（回答「现在适合做什么」），这里是**通知开关**
+    #: （回答「能不能打扰」）。合并会让 18 点起全网静音 —— 理由见 9.8。
+    quiet_hours: QuietHours | None = None
     llm_enabled: bool = True
     allow_fallback: bool = True
     #: 让**模型**挑只读视图（``LLMProvider.select_view``）。**默认关。**
@@ -234,6 +295,14 @@ class Config:
     #: 委派实例要不要加载用户的 opencode 插件。**只认两个值**（见
     #: :data:`PLUGIN_MODES` 与 :meth:`delegate_policy` 的字段注释）。
     delegate_plugins: str = DEFAULT_PLUGIN_MODE
+    #: 「可授权根」—— 浏览选目录的范围（绝对路径数组）。**空 = 关闭浏览**。
+    #:
+    #: 默认朝关不是因为这条路没实现，而是**开浏览 = 打开新口子**（能在
+    #: 磁盘上翻目录），这种事默认必须是关的，由用户显式圈范围（12.7.1.1）。
+    #: 与 :data:`delegate_projects` 的分工：这里只决定**能翻到哪**；翻出来
+    #: 的目录仍要用户按「允许」写进 delegate_projects 才算授权 —— 浏览
+    #: 本身不产生任何准入。
+    delegate_browse_roots: tuple[str, ...] = ()
     home: str | None = None
 
     @property
@@ -336,6 +405,29 @@ class Config:
         )
 
 
+def _abs_path_list(raw: Any, key: str) -> list[str]:
+    """读「绝对路径数组」型配置项（``delegate.projects`` / ``delegate.browse_roots``）。
+
+    相对路径在这里就拒掉 —— 不给「以后再补全」留口子：这两个清单的语义
+    都是「磁盘上的固定范围」，相对路径会随进程工作目录漂移，等于把安全
+    边界交给 cwd。两个清单共用这一段校验，是因为它们被拒的理由**相同**，
+    分开写只会让文案在下一次改动里分叉。
+    """
+    if not isinstance(raw, list):
+        raise ValidationError(f"config.delegate.{key} 必须是数组")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValidationError(f"config.delegate.{key} 只能是非空字符串")
+        text = item.strip()
+        if not Path(text).expanduser().is_absolute():
+            raise ValidationError(
+                f"config.delegate.{key} 里必须是绝对路径：{text}"
+            )
+        out.append(str(Path(text).expanduser()))
+    return out
+
+
 def load_config(home: str | Path | None = None) -> Config:
     """按「默认 → 文件 → 环境变量」的顺序合并配置。
 
@@ -353,23 +445,17 @@ def load_config(home: str | Path | None = None) -> Config:
     energy_raw: Any = payload.get("energy_windows")
     energy_windows = _energy_from({"energy_windows": energy_raw})
 
+    quiet_hours = _quiet_from(payload)
+
     delegate_raw = payload.get("delegate") or {}
     if not isinstance(delegate_raw, dict):
         raise ValidationError("config.delegate 必须是对象")
-    projects_raw = delegate_raw.get("projects") or []
-    if not isinstance(projects_raw, list):
-        raise ValidationError("config.delegate.projects 必须是数组")
-    # 相对路径在这里就拒掉 —— 不给「以后再补全」留口子
-    delegate_projects: list[str] = []
-    for item in projects_raw:
-        if not isinstance(item, str) or not item.strip():
-            raise ValidationError("config.delegate.projects 只能是非空字符串")
-        text = item.strip()
-        if not Path(text).expanduser().is_absolute():
-            raise ValidationError(
-                f"config.delegate.projects 里必须是绝对路径：{text}"
-            )
-        delegate_projects.append(str(Path(text).expanduser()))
+    # projects 与 browse_roots 同走 _abs_path_list：绝对路径数组的校验
+    # 理由相同（见该函数 docstring），文案格式也因此保持一致。
+    delegate_projects = _abs_path_list(delegate_raw.get("projects") or [], "projects")
+    delegate_browse_roots = _abs_path_list(
+        delegate_raw.get("browse_roots") or [], "browse_roots"
+    )
 
     delegate_model = str(delegate_raw.get("model") or "").strip()
 
@@ -419,11 +505,13 @@ def load_config(home: str | Path | None = None) -> Config:
         timeout=timeout,
         provider=provider,
         energy_windows=energy_windows,
+        quiet_hours=quiet_hours,
         llm_enabled=llm_enabled,
         allow_fallback=allow_fallback,
         # 缺省 False：这条路上实测没赢（见字段注释），所以「没配」= 不开。
         llm_view_routing=bool(llm.get("view_routing", False)),
         delegate_projects=tuple(delegate_projects),
+        delegate_browse_roots=tuple(delegate_browse_roots),
         delegate_model=delegate_model,
         delegate_plugins=delegate_plugins,
         home=resolved_home,
@@ -498,7 +586,7 @@ def config_from_settings(
     """
     unknown = set(settings) - {
         "model", "vision_model", "base_url", "timeout", "llm_enabled",
-        "allow_fallback", "energy_windows", "provider",
+        "allow_fallback", "energy_windows", "quiet_hours", "provider",
     }
     if unknown:
         if "api_key" in unknown:
@@ -538,6 +626,10 @@ def config_from_settings(
         raise ValidationError("超时必须大于 0 且不超过 600 秒")
 
     energy_raw = settings.get("energy_windows", _ENERGY_TO_RAW(base.energy_windows))
+    # 安静窗口：设置页**可以改**（与 delegate 字段相反 —— 它不是安全边界，
+    # 只是个通知偏好）。没给就沿用 base，漏掉它的后果是「存一次设置就把
+    # 安静窗口清了」，同 _abs_path_list 那类字段的失败模式。
+    quiet_raw = settings.get("quiet_hours", _QUIET_TO_RAW(base.quiet_hours))
 
     return Config(
         model=model,
@@ -546,6 +638,7 @@ def config_from_settings(
         timeout=timeout,
         provider=provider,
         energy_windows=_settings_energy(energy_raw),
+        quiet_hours=_quiet_from({"quiet_hours": quiet_raw}),
         llm_enabled=bool(settings.get("llm_enabled", base.llm_enabled)),
         allow_fallback=bool(settings.get("allow_fallback", base.allow_fallback)),
         # 实验开关，**刻意不进设置页**：实测它不如关键词表（见字段注释），
@@ -557,6 +650,9 @@ def config_from_settings(
         # 「允许改哪些目录」的白名单**清空**，而它被文档称作整条委派链路
         # 最硬的安全约束。设置页本来就不该碰它，所以照搬、不接受输入。
         delegate_projects=base.delegate_projects,
+        # 同样照搬：可授权根是「能翻到哪」的范围圈定，设置页不接受输入，
+        # 漏掉的后果是存一次设置就把圈好的范围清空（= 浏览被静默关掉）。
+        delegate_browse_roots=base.delegate_browse_roots,
         delegate_model=base.delegate_model,
         # 同样照搬：插件模式决定委派实例加载什么，属于执行期行为，
         # 不该被「在设置页存一次设置」顺手改掉。
@@ -573,6 +669,13 @@ def _ENERGY_TO_RAW(windows: EnergyWindows | None) -> Any:
         band: list(getattr(windows, band))
         for band in ("morning", "afternoon", "evening")
     }
+
+
+def _QUIET_TO_RAW(hours: QuietHours | None) -> Any:
+    """``QuietHours`` → ``["22:00", "08:00"]``（或 ``null``）。"""
+    if hours is None:
+        return None
+    return [f"{hours.start:%H:%M}", f"{hours.end:%H:%M}"]
 
 
 def save_config(config: Config, home: str | Path | None = None) -> Path:
@@ -597,8 +700,10 @@ def save_config(config: Config, home: str | Path | None = None) -> Path:
             "view_routing": config.llm_view_routing,
         },
         "energy_windows": _ENERGY_TO_RAW(config.energy_windows),
+        "quiet_hours": _QUIET_TO_RAW(config.quiet_hours),
         "delegate": {
             "projects": list(config.delegate_projects),
+            "browse_roots": list(config.delegate_browse_roots),
             "model": config.delegate_model,
             "plugins": config.delegate_plugins,
         },

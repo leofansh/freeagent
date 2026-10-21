@@ -26,6 +26,7 @@ from ..domain import (
     WaitingOn,
 )
 from ..services.chat import ChatReplyKind
+from ..services.memory import GLOBAL_SCOPE, role_scope
 from ..services.llm import (
     CANNOT_MUTATE_HINT,
     NOT_A_TASK_HINT,
@@ -59,7 +60,10 @@ KIND_ALIASES: dict[str, TaskKind] = {
 
 _USAGE: dict[str, str] = {
     "/today": "/today",
+    "/week": "/week      本周回顾：完成了什么、卡在哪、下周承诺了什么",
     "/feedback": "/feedback   执行层履历：派了多少、成了多少、反复失败在哪",
+    "/model": "/model      连续性个人模型：从你的记录里现推的规律（完成时段/常顺延/卡住的等候/角色活跃度），只摆事实",
+    "/pending": "/pending [N [标题]|drop N]   待处理收集器：收下的图片/文件；N 澄清成事务，drop N 明确忽略",
     "/all": "/all [open|closed|all]   默认 open",
     "/roles": "/roles [all]",
     "/role": "/role <名字|id>",
@@ -68,6 +72,7 @@ _USAGE: dict[str, str] = {
     "/role-silence": "/role-silence <名字> [on|off]   省略=静置，on=恢复活跃",
     "/role-dod": "/role-dod <名字> <完成标准|off>",
     "/role-del": "/role-del <名字>",
+    "/task-del": "/task-del <id> confirm   删事务（不可恢复；先输一次只看后果）",
     "/merge": "/merge <源角色> <目标角色>",
     "/new": "/new <角色> | <描述>",
     "/delegate": "/delegate <项目绝对路径> | <角色> | <需求>",
@@ -84,6 +89,12 @@ _USAGE: dict[str, str] = {
     "/dod": "/dod <id> <完成标准|off>",
     "/today-pin": "/today-pin <id> [YYYY-MM-DD|off]",
     "/note": "/note <id> <内容>",
+    # 记忆（设计文档 3.7）。用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
+    "/remember": "/remember <内容>    记一条全局偏好（= /memory add 偏好）",
+    "/memory": (
+        "/memory [list [global|角色]|add <偏好|约定|修正> <内容>|"
+        "add-role <角色> <类别> <内容>|search <关键词>|edit <id> <新内容>|del <id>]"
+    ),
     # 刻意与 /note 分开成两条：/note 无校验，而这条要挡三种不许重派的情形。
     # 合成一条就等于把「用错入口静默无效」又请回来（见 _cmd_redispatch）。
     "/redispatch": "/redispatch <id> [原因]",
@@ -124,7 +135,10 @@ _HELP = """\
 个人事务助手 · 命令
   ── 视图 ──
   /today              今天视图（含顺延标记与每条信号的理由）
+  /week               本周回顾（完成了什么 / 卡在哪 / 下周承诺了什么，只摆事实）
   /feedback           执行层履历：派了多少、成了多少、反复失败在哪（只摆事实）
+  /model              连续性个人模型：从记录现推的规律（完成时段 / 常顺延 / 卡住的等候 / 角色活跃度，只摆事实）
+  /pending [N|drop N]  待处理收集器：飞书收下的图片/文件，列出来、一键澄清成事务
   /all [open|closed|all]  全部事务（默认只列未结束）
   /roles [all]        角色脉络（默认只列活跃；all 含静置）
   /role <名字|id>      某个角色下的事务
@@ -165,14 +179,23 @@ _HELP = """\
         不会自动重试 —— 改配置前重试多少次都是同一个结果。
         改好配置后跑这条，执行器下次扫到就会再派一次。
 
+  ── 记忆（设计文档 3.7）──
+  /remember <内容>          记一条全局偏好（= /memory add 偏好 <内容>）
+  /memory list [global|角色] 列出记过什么（全貌）
+  /memory add <类别> <内容>  记一条：类别是 偏好 / 约定 / 修正
+  /memory add-role <角色> <类别> <内容>   记到某个角色名下
+  /memory search <关键词>    检索记忆（返回「怎么找到的」，可反驳）
+  /memory edit <id> <新内容> 改内容（类别与范围不可改）
+  /memory del <id>          删掉这条
+
   ── 角色归属 ──
-  /move <id> <角色>   只挂到这个角色
-  /unrole <id> <角色> 摘掉这个角色标签
+  /move <id> <角色>   只挂到这个角色  /unrole <id> <角色> 摘掉这个角色标签
   /role-add <名字> [备注]              新建/更新角色（备注用于角色推断）
   /role-rename <名字> <新名字>
   /role-silence <名字> [on|off]        折叠/静置（数据保留）；on 恢复
   /role-dod <名字> <完成标准|off>      设该脉络默认完成标准
   /role-del <名字>                     删除（要求该角色下无事务）
+  /task-del <id> confirm               删除事务（不可恢复；先输一次只看后果）
   /merge <源> <目标>    合并角色（原子重定向，不丢历史）
 
   ── 其它 ──
@@ -344,6 +367,15 @@ class Repl:
         self._mode: str = MODE_BUILD
         #: Plan 模式下累积的计划行。**只进不出，直到退出 Plan**。
         self._plan: list[str] = []
+        #: 从盘上恢复 Plan 后、**还没说给用户听**的那句话（12.7.2 恢复时要说清）。
+        #:
+        #: 为什么不在 ``restore_plan`` 里直接 ``_say`` 完事：恢复发生在**新建
+        #: Repl 的那一刻**，而那一刻的输出目标（``out``）要么还没绑到本条
+        #: 消息的 buffer（飞书：``channel.py`` 在建好之后才重绑 ``repl.out``），
+        #: 要么是一个**用完就丢**的临时 buffer（Web：``_web_repl`` 里那个
+        #: ``io.StringIO()``）。写进去=写给了没人看的地方，与静默丢失同效。
+        #: 所以改成**先记下、等真有话要回时随第一句讲出来**。
+        self._resume_notice: str | None = None
         #: 已发出、**等待用户点确认**的计划快照（设计文档 12.7.2）。
         #:
         #: 非空 = 有一张确认卡在飞书里等着。刻意存**快照**而不是直接用
@@ -413,9 +445,17 @@ class Repl:
                 # 说出去才记账。_say 抛异常（管道断裂、编码失败）时令牌不落库，
                 # 下一轮还会提醒 —— 宁可重复也不静默丢弃（设计文档 9.2）。
                 self.app.reminders.acknowledge(digest)
+            # 安静窗口内 due() 返回空摘要但带 quiet_until —— 这里**也说出来**：
+            # 否则终端每轮都「什么都没发生」，用户无从知道窗口把它压后了（9.8）。
+            elif digest.is_quiet:
+                self._say(f"[提醒] {digest.quiet_note()}")
         if line in ("/quit", "/exit", "/q"):
             self._say("再见。")
             return False
+        # 恢复告知排在本条回复之前，且**只说一次**（12.7.2 恢复时要说清）。
+        # 放这里而不是 handle 开头：/quit 不该附带这句话 —— 用户都要走了，
+        # 告诉他「上次的规划还在」只是噪声。
+        self._flush_resume_notice()
         return self._dispatch(line)
 
     # -- 降级告知 ----------------------------------------------------------- #
@@ -525,6 +565,10 @@ class Repl:
         由 :class:`~freeagent.services.channel.ChannelService` 在**新建**
         Repl 时调用 —— 那正是 LRU 淘汰掉旧实例之后、新会话进来的时候。
         没有这一步，淘汰即静默丢失（实测过，见 ``_mode`` 的注释）。
+
+        恢复成功时**记下**一句待说的话（``_resume_notice``），而不是在这里
+        直接输出 —— 此刻的 ``out`` 还没绑到本条消息（见 ``_resume_notice``
+        的注释）。真正说出来由 :meth:`handle` 在下一句回复前完成。
         """
         chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
         if not chat_id:
@@ -537,7 +581,29 @@ class Repl:
             return False
         self._mode = saved.mode
         self._plan = list(saved.lines)
+        self._resume_notice = self._resume_text(saved)
         return True
+
+    def _resume_text(self, saved) -> str:
+        """恢复 Plan 时的那句告知（12.7.2「恢复时要说清」）。
+
+        措辞刻意**不做假设**：只陈述盘上有什么、还处于什么模式，把「要不要
+        接着规划」交回用户。说不清就等于又静默接续了一次。
+        """
+        if saved.mode == MODE_PLAN:
+            n = len(saved.lines)
+            tail = f"，已记下 {n} 条" if n else "，还没记下任何内容"
+            return (f"（上次的规划还在{tail}。现在是 Plan 模式：只沟通、不落库；"
+                    f"要动手时说 /mode-build，不想继续就 /mode-build 或直接重说。）")
+        # 落在盘上的也可能是 build 模式（例如写盘后用户又退出了规划）。
+        # 这时**不谎称**「在规划」——照样说清、让用户知道系统记得他。
+        return "（上次的会话状态已恢复。）"
+
+    def _flush_resume_notice(self) -> None:
+        """把待说的恢复告知说出去，**只说一次**。"""
+        if self._resume_notice:
+            self._say(self._resume_notice)
+            self._resume_notice = None
 
     # ⚠️ 刻意**不叫** ``_cmd_plan``：本文件第 1169 行已有那个名字（拆步骤，
     # ``/plan <id>``）。Python 类体里**后定义覆盖先定义**，而我在上文先写了
@@ -1088,7 +1154,10 @@ class Repl:
             "/mode-plan": self._cmd_mode_plan,
             "/mode-build": self._cmd_mode_build,
             "/today": self._cmd_today,
+            "/week": self._cmd_week,
             "/feedback": self._cmd_feedback,
+            "/model": self._cmd_model,
+            "/pending": self._cmd_pending,
             "/all": self._cmd_all,
             "/roles": self._cmd_roles,
             "/role": self._cmd_role,
@@ -1097,6 +1166,7 @@ class Repl:
             "/role-silence": self._cmd_role_silence,
             "/role-dod": self._cmd_role_dod,
             "/role-del": self._cmd_role_del,
+            "/task-del": self._cmd_task_del,
             "/merge": self._cmd_merge,
             "/new": self._cmd_new,
             "/delegate": self._cmd_delegate,
@@ -1113,6 +1183,9 @@ class Repl:
             "/dod": self._cmd_dod,
             "/today-pin": self._cmd_pin,
             "/note": self._cmd_note,
+            # 记忆（设计文档 3.7）。/remember 是 /memory add 偏好 的快捷方式。
+            "/remember": self._cmd_remember,
+            "/memory": self._cmd_memory,
             # 委派恢复入口。与 /note 分开：那条无校验，这条要挡三种不许重派。
             "/redispatch": self._cmd_redispatch,
             # 飞书配对（设计文档 11.9.8）。码由桥接侧签发，终端只核销。
@@ -1145,7 +1218,93 @@ class Repl:
 
     def _cmd_today(self, args: list[str]) -> None:
         view = self.app.today.view()
-        self._say(render.render_today(view, self._names()))
+        # 待处理条数一并传给今天视图（11.18）：捕获了没澄清的事，
+        # 应该在你每天看的那块屏幕上露个面，而不是躺在目录里等你想起。
+        self._say(
+            render.render_today(
+                view, self._names(), pending_count=self.app.pending.count()
+            )
+        )
+
+    def _cmd_week(self, args: list[str]) -> None:
+        """周回顾（设计文档 6.5）。
+
+        **刻意只摆事实**：不按分数排序，也不给「下周该怎么排」的建议 ——
+        与 ``/feedback`` 同一条纪律，与第七章「不替用户做取舍」同源。
+        """
+        view = self.app.week.view()
+        self._say(render.render_week(view, self._names()))
+
+    def _cmd_model(self, args: list[str]) -> None:
+        """连续性个人模型（设计文档 11.17 / 20.1.1）。
+
+        纯只读聚合：从 ``TaskRecord`` 与 ``Task`` 现推关于你自己的轻量规律，
+        **不写库、不排序打分、不给建议**（与 /week、/feedback 同一条纪律），
+        也正好契合「不自带 RAG」的定位——规则统计即可，零新依赖。
+        """
+        view = self.app.personal_model.view()
+        self._say(render.render_model(view, self._names()))
+
+    def _cmd_pending(self, args: list[str]) -> None:
+        """待处理收集器（设计文档 11.18）。
+
+        三种形态：无参列出；``/pending N [标题]`` 澄清成事务；
+        ``/pending drop N`` 明确忽略。
+
+        **澄清是用户显式动作**：捕获侧（飞书 ``_capture_unsupported``）只收
+        不建（11.9.10），变成事务的扳机只在这里。所以序号指向的永远是
+        「当前待处理列表」里那一条 —— 列表会随澄清/忽略变动，超界时
+        说清当前有几位，不让用户对空气操作。
+        """
+        items = self.app.pending.pending()
+        if args and args[0] == "drop":
+            rest = args[1:]
+            if len(rest) != 1 or not rest[0].isdigit():
+                self._usage("/pending")
+                return
+            index = int(rest[0])
+            if not 1 <= index <= len(items):
+                self._say(
+                    f"没有第 {index} 条待处理项（当前 {len(items)} 条）。"
+                    "/pending 看列表。"
+                )
+                return
+            item = items[index - 1]
+            try:
+                self.app.pending.dismiss(item.id)
+            except FreeAgentError as exc:
+                self._say(f"忽略失败：{exc}")
+                return
+            self._say(
+                f"已忽略第 {index} 条。待处理还剩 {self.app.pending.count()} 条。"
+            )
+            return
+        if args and args[0].isdigit():
+            index = int(args[0])
+            title = " ".join(args[1:]).strip() or None
+            if not 1 <= index <= len(items):
+                self._say(
+                    f"没有第 {index} 条待处理项（当前 {len(items)} 条）。"
+                    "/pending 看列表。"
+                )
+                return
+            item = items[index - 1]
+            try:
+                task = self.app.pending.clarify(item.id, title=title)
+            except FreeAgentError as exc:
+                self._say(f"澄清失败：{exc}")
+                return
+            self._say(
+                f"已澄清成事务 {task.id[:8]}：{task.title}\n"
+                f"归在「{DEFAULT_ROLE_NAME}」—— 要归位用 "
+                f"/move {task.id[:8]} <角色>。\n"
+                f"待处理还剩 {self.app.pending.count()} 条。"
+            )
+            return
+        if args:
+            self._usage("/pending")
+            return
+        self._say(render.render_pending(items))
 
     def _cmd_feedback(self, args: list[str]) -> None:
         """执行层履历：派了多少、成了多少、反复失败在哪。
@@ -1323,7 +1482,10 @@ class Repl:
         digest = self.app.reminders.due()
         text = render.render_digest(digest)
         if not text:
-            self._say("没有到点的提醒")
+            # 安静窗口内「有提醒但不推」与「真没有提醒」必须分得开（9.8）：
+            # 都回一句「没有到点的提醒」会让用户以为窗口没生效。
+            note = digest.quiet_note()
+            self._say(note if note else "没有到点的提醒")
             return
         self._say(text)
         # 确认放在 _say 之后 —— 先说再认领。反过来会先改状态后播报，
@@ -1436,6 +1598,32 @@ class Repl:
             )
         self.app.roles.delete(role.id)
         self._say(f"已删除角色「{role.name}」")
+
+    def _cmd_task_del(self, args: list[str]) -> None:
+        """硬删一条事务（记录/产物/角色归属一起没，找不回来）。
+
+        **两道确认做成「同一命令敲两次」而不是 input() 再问一句**：命令层
+        有三个通道（终端、WEB 对话、飞书），只有终端有 stdin——在命令里
+        嵌 input() 会把 WEB 的请求线程挂死在等输入上。第一次调用只说后果
+        与出路、不碰库，任何通道都跑得动；而「手滑连敲两次同样带 confirm
+        的命令」比「顺手点掉一个弹窗」难得多。
+
+        第一调就解析 id：id 都不存在时，说明书话术没有意义——直接说找不到。
+        """
+        if not args:
+            self._usage("/task-del")
+            return
+        task_id = self._resolve_id(args[0])
+        if len(args) >= 2 and args[1] == "confirm":
+            task = self.app.tasks.delete_task(task_id)
+            self._say(f"已删除事务「{task.title}」（记录与产物一并消失）")
+            return
+        task = self.app.tasks.get(task_id)
+        self._say(
+            f"这将**彻底删除**「{task.title}」：事务、记录、产物、角色归属"
+            "一起消失，找不回来。\n"
+            f"确认请再输一次：/task-del {args[0]} confirm"
+        )
 
     def _cmd_merge(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -1764,6 +1952,121 @@ class Repl:
         task = self.app.tasks.note(self._resolve_id(args[0]), " ".join(args[1:]))
         self._say(f"已记：{task.title}")
 
+    # ---- 记忆（设计文档 3.7）---- #
+    def _cmd_remember(self, args: list[str]) -> None:
+        """``/remember <内容>`` —— 记一条全局偏好。
+
+        刻意是 ``/memory add 偏好`` 的**快捷方式**而不是第二套实现：
+        两者都调同一个 :meth:`MemoryService.add`（12.1.1 一份能力一份实现）。
+        """
+        if not args:
+            self._usage("/remember")
+            return
+        entry = self.app.memory.add(" ".join(args), kind="偏好", source_ref="user")
+        self._say(f"记住了（偏好）：{entry.content}")
+
+    def _cmd_memory(self, args: list[str]) -> None:
+        """``/memory`` 命令族。子命令：list / add / add-role / search / edit / del。
+
+        与 ``/remember`` 共用同一个 :class:`MemoryService` —— 这里只做参数解析
+        与呈现，不重复任何写入逻辑。
+        """
+        sub = args[0] if args else "list"
+        rest = args[1:]
+
+        if sub == "list":
+            return self._memory_list(rest)
+        if sub == "add":
+            return self._memory_add(rest)
+        if sub == "add-role":
+            return self._memory_add_role(rest)
+        if sub == "search":
+            return self._memory_search(rest)
+        if sub == "edit":
+            return self._memory_edit(rest)
+        if sub == "del":
+            return self._memory_del(rest)
+        self._usage("/memory")
+
+    def _memory_list(self, args: list[str]) -> None:
+        scope = None
+        if args:
+            want = args[0]
+            if want == "global":
+                scope = GLOBAL_SCOPE
+            else:
+                role = self.app.roles.get_by_name(want)
+                scope = role_scope(role.id)
+        entries = self.app.memory.list_all(scope=scope)
+        if not entries:
+            # 空也要明说 —— 与 /week 空分区同一条纪律。
+            self._say("还没记过任何东西。用 /remember <内容> 记一条。")
+            return
+        self._say(f"记过 {len(entries)} 条：")
+        for e in entries:
+            self._say(f"  [{e.kind}·{self._memory_scope_name(e.scope)}] {e.content}"
+                      f"  ({e.id[:8]})")
+
+    def _memory_add(self, args: list[str]) -> None:
+        if len(args) < 2:
+            self._usage("/memory")
+            return
+        kind = args[0]
+        entry = self.app.memory.add(
+            " ".join(args[1:]), kind=kind, source_ref="user"
+        )
+        self._say(f"记住了（{entry.kind}）：{entry.content}")
+
+    def _memory_add_role(self, args: list[str]) -> None:
+        if len(args) < 3:
+            self._usage("/memory")
+            return
+        role = self.app.roles.get_by_name(args[0])
+        entry = self.app.memory.add(
+            " ".join(args[2:]),
+            kind=args[1],
+            scope=role_scope(role.id),
+            source_ref="user",
+        )
+        self._say(f"记住了（{role.name}·{entry.kind}）：{entry.content}")
+
+    def _memory_search(self, args: list[str]) -> None:
+        if not args:
+            self._usage("/memory")
+            return
+        result = self.app.memory.retrieve(" ".join(args))
+        # 来源说明**永远**打出来（含空结果）—— 与知识检索同一条：不只列结果。
+        self._say(f"检索：{result.describe_sources()}")
+        for h in result.hits:
+            e = h.entry
+            self._say(f"  [{e.kind}·{self._memory_scope_name(e.scope)}] {e.content}"
+                      f"  （{h.via_label}）")
+
+    def _memory_edit(self, args: list[str]) -> None:
+        if len(args) < 2:
+            self._usage("/memory")
+            return
+        entry = self.app.memory.edit(args[0], " ".join(args[1:]))
+        if entry is None:
+            raise FreeAgentError(f"没找到这条记忆：{args[0]}")
+        self._say(f"改好了：{entry.content}")
+
+    def _memory_del(self, args: list[str]) -> None:
+        if not args:
+            self._usage("/memory")
+            return
+        if not self.app.memory.delete(args[0]):
+            raise FreeAgentError(f"没找到这条记忆：{args[0]}")
+        self._say("删掉了。")
+
+    def _memory_scope_name(self, scope: str) -> str:
+        """把 ``role:<id>`` 换成角色名，呈现时更好读。"""
+        if scope == GLOBAL_SCOPE:
+            return "全局"
+        rid = scope.split(":", 1)[1]
+        return self._names().get(rid, rid)
+
+
     def _cmd_redispatch(self, args: list[str]) -> None:
         """``/redispatch <id> [原因]`` —— 让一条委派可以重新派发。
 
@@ -1952,6 +2255,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         db_path = Path(args[index + 1])
     repl = Repl(build_app(db_path))
+    # 12.11.2 / V1.39：每日滚动备份。三个进程入口各调**一行**，逻辑只在
+    # services 层一份（:func:`daily_backup`：当日一次、留 7 份、失败自己
+    # 记日志不抛）。从**活连接**问路径（``db_path_of``）而不是重新解析 --
+    # -- 显式 --db 时重新解析可能得到另一个文件，备份就备到别的库上了。
+    from ..services.reset import daily_backup, db_path_of
+    try:
+        daily_backup(db_path_of(repl.app.conn))
+    except Exception as exc:  # noqa: BLE001 - 备份失败绝不挡住主流程
+        print(f"⚠ 今日备份没能执行（{exc}）；功能不受影响，明天会再试。")
     try:
         repl.run()
     finally:

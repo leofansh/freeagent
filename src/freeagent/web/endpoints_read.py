@@ -129,7 +129,15 @@ def _config(app: App):
 
 
 def settings(app: App) -> dict:
-    return serialize_api.settings_payload(_config(app), app.llm_name)
+    from ..services.reset import db_path_of, last_daily_backup
+
+    payload = serialize_api.settings_payload(_config(app), app.llm_name)
+    try:
+        last = last_daily_backup(db_path_of(app.conn))
+    except Exception:
+        last = None
+    payload["last_backup"] = last.isoformat() if last is not None else None
+    return payload
 
 
 def save_settings(app: App, body: dict) -> dict:

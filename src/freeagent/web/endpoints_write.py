@@ -19,12 +19,16 @@ from ..services.llm import InputIntent, read_intent
 from . import serialize_api
 from .endpoints_read import resolve_task, role_names, task_state
 
-__all__ = ["create_task", "mutate", "drop_tasks"]
+__all__ = ["create_task", "mutate", "drop_tasks", "delete_tasks"]
 
 #: 单次批量「算了」的上限。不是性能考量（服务层逐条很快），而是**界面
 #: 语义**：一次勾几十条然后一把全算了，手滑的成本太高；真有大扫除需求
 #: 的人可以分几次点。上限数字本身没有技术含义。
 MAX_BATCH_DROP = 100
+
+#: 单次批量**删除**的上限。与 ``MAX_BATCH_DROP`` 同一条理由：批量删掉
+#: 手滑的成本更高（还不可恢复），所以上限更该有。
+MAX_BATCH_DELETE = 100
 
 
 def create_task(app: App, payload: dict) -> dict:
@@ -128,6 +132,64 @@ def drop_tasks(app: App, payload: dict) -> dict:
         ],
         "summary": (
             f"已算了 {len(done)} 条"
+            + (f"，{len(failed)} 条没成" if failed else "")
+            + (
+                "：" + "；".join(
+                    f"{(it.title or it.id[:8])}（{it.reason}）"
+                    for it in failed[:3]
+                )
+                if failed
+                else ""
+            )
+        ),
+    }
+
+
+def delete_tasks(app: App, payload: dict) -> dict:
+    """批量硬删。**规则全部在服务层**，这里只做参数与汇总。
+
+    与 ``drop_tasks`` 的分工同构：整体上限在这里（界面语义），逐条结果
+    在服务层（``TaskService.delete_many``），汇总在这里说成人话。
+
+    ## 为什么端点还认一个 ``confirmed`` 布尔
+
+    前端已经两道 confirm，这里是第二道防线：端点只认 ``confirmed`` 为
+    真布尔才动手（与 ``services/reset.py`` 同一先例）。**前端确认不能替代
+    服务端闸门** —— 浏览器可以被绕过、按钮可以被手滑，而「删数据」的
+    入口如果信任调用方自述的「我确认过」，那两道 confirm 就只是仪式。
+    """
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise FreeAgentError("ids 必须是非空列表")
+    cleaned: list[str] = []
+    for raw in raw_ids:
+        rid = str(raw).strip()
+        if rid:
+            cleaned.append(rid)
+    if not cleaned:
+        raise FreeAgentError("ids 里没有有效的事务 id")
+    if len(cleaned) > MAX_BATCH_DELETE:
+        raise FreeAgentError(
+            f"一次最多 {MAX_BATCH_DELETE} 条，收到 {len(cleaned)} 条"
+        )
+    if payload.get("confirmed") is not True:
+        # 不替「忘了传 confirmed」找理由放行：调用方必须显式说「已确认」。
+        # 前端两道 confirm 都过才发这个 true（见 js_core.batchDelete）。
+        raise FreeAgentError("缺少 confirmed 标记，已拒绝删除")
+
+    with app.lock:
+        items = app.tasks.delete_many(cleaned)
+    done = [it for it in items if it.ok]
+    failed = [it for it in items if not it.ok]
+    return {
+        "kind": "batch_delete",
+        "deleted": len(done),
+        "failed": [
+            {"id": it.id, "title": it.title, "reason": it.reason}
+            for it in failed
+        ],
+        "summary": (
+            f"已删除 {len(done)} 条"
             + (f"，{len(failed)} 条没成" if failed else "")
             + (
                 "：" + "；".join(

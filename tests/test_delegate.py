@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from freeagent.app import build_app
-from freeagent.delegate import run_once
+from freeagent.delegate import reclaim_abandoned, run_once
 from freeagent.domain import FreeAgentError, RecordType, TaskState
 from freeagent.services.clock import FrozenClock
 from freeagent.services.delegate import (
@@ -336,6 +336,160 @@ class TestBrief:
         )
         assert "\n" not in brief, "用户输入里的换行也会触发升级"
         assert "第二行" in brief and "标准二" in brief, "内容不能被弄丢"
+
+
+# =============================================================================
+# 简报注入错因历史段（12.10.7 / V1.38）
+# =============================================================================
+class TestBriefCarriesFailureHistory:
+    """简报是反馈回流的最短路径：执行者第三次踩同一个坑前就该知道前两次败在哪。"""
+
+    def test_no_history_means_no_history_segment(self, app, work, tmp_path):
+        """没失败过就整段缺席，一个字不占 ——「没踩过坑」不是要说的事。"""
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        records = app.record_repo.list_for_task(tid)
+        brief = build_brief(task, task.intent, None, records=records)
+        assert "历史记录" not in brief
+        assert "重派" not in brief
+
+    def test_failure_reason_land_in_brief_as_facts(self, app, work, tmp_path):
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        now = app.clock.now()
+        app.record_repo.append(tid, RecordType.DELEGATION_DISPATCHED, "派出", now)
+        app.record_repo.append(
+            tid, RecordType.DELEGATION_FAILED, "闸门缺口", now
+        )
+        brief = build_brief(
+            task, task.intent, None,
+            records=app.record_repo.list_for_task(tid),
+        )
+        assert "\n" not in brief, "历史段同样必须单行"
+        assert "历史记录" in brief
+        assert "闸门缺口" in brief
+        # 只摆事实：不允许出现指令类语（12.10.2 末条）。
+        for banned in ("建议", "务必", "注意", "请务必"):
+            assert banned not in brief.split("历史记录")[-1], (
+                f"历史段里不该有指令类语「{banned}」"
+            )
+
+    def test_repeated_failures_carry_the_count(self, app, work, tmp_path):
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        for i in range(2):
+            base = app.clock.now()
+            app.record_repo.append(
+                tid, RecordType.DELEGATION_DISPATCHED, f"第{i}次派出", base
+            )
+            app.record_repo.append(
+                tid, RecordType.DELEGATION_FAILED, "又挂了", base
+            )
+        brief = build_brief(
+            task, task.intent, None,
+            records=app.record_repo.list_for_task(tid),
+        )
+        assert "累计失败 2 次" in brief
+
+    def test_refused_history_is_not_injected(self, app, work, tmp_path):
+        """refused（派发前被拒）不进历史段 —— 连执行都没进过。"""
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        now = app.clock.now()
+        app.record_repo.append(tid, RecordType.DELEGATION_DISPATCHED, "派出", now)
+        app.record_repo.append(
+            tid, RecordType.DELEGATION_FAILED, "闸门缺口", now
+        )
+        # 再来一次 succeeded 前置的 failed：形状上 in_flight 已结、
+        # 结局判定按 attempt_state 计算 —— 这里直接控制在 refused 形状：
+        # failed 排在 dispatched 之后同刻等场景过于精细，用最直白的
+        # 「只有一条失败、无 dispatched」形状即可判 refused。
+        app2_records = [
+            r for r in app.record_repo.list_for_task(tid)
+            if r.type is not RecordType.DELEGATION_DISPATCHED
+        ]
+        brief = build_brief(task, task.intent, None, records=list(app2_records))
+        assert "历史记录" not in brief
+
+    def test_derivation_must_come_from_feedback_module(self):
+        """**不许复制推导**（12.1.1）：failure_history 的判定必须复用
+        feedback.read_outcome —— 两份判定一漂移，简报和履历就打架。"""
+        import inspect
+
+        from freeagent.services import delegate as svc
+
+        src = inspect.getsource(svc.failure_history_line)
+        assert "read_outcome" in src, "必须调用 feedback.read_outcome"
+        assert "def determine" not in src and "attempt_state(" not in src
+        # feedback 模块头也没从简报侧反向引用（防循环、防双实现）。
+        from freeagent.services import feedback as fb
+
+        assert "build_brief" not in inspect.getsource(fb)
+
+# =============================================================================
+# 启动恢复（12.11.1 / V1.39）
+# =============================================================================
+class TestReclaimAbandoned:
+    """进程死了不是终点：悬置的委派要被认领成「执行期失败」，然后交还给人。"""
+
+    def test_stale_pending_is_claimed_as_failure(self, app, work, db_path):
+        """挂起待批 + 无投影 ⇒ 认领：落一条执行期失败记录，给出两条出路。"""
+        from freeagent.services.approval import ApprovalStore
+
+        store = ApprovalStore(app.conn, clock=app.clock.now)
+        tid = make_delegation(app, work, str(db_path))
+        store.request_delegation(
+            project=str(db_path), brief="做不到也行，只为测试", task_id=tid
+        )
+        # 没有投影行 → 按陈旧处理。db_path 必须与夹具同一个库。
+        notes = reclaim_abandoned(db_path=str(db_path), clock=app.clock)
+        assert len(notes) == 1
+        records = app.record_repo.list_for_task(tid)
+        # 创建时追加了 CREATED，认领追加 FAILED —— 两条，最后一条是认领。
+        assert len(records) == 2
+        assert records[-1].type is RecordType.DELEGATION_FAILED
+        content = records[-1].content or ""
+        assert "执行器中断后无人续上" in content
+        assert "/redispatch" in content
+        assert "/drop" in content
+
+    def test_second_run_does_not_duplicate(self, app, work, db_path):
+        """执行器反复重启不该把失败记录刷成瀑布 —— 幂等认领。"""
+        from freeagent.services.approval import ApprovalStore
+
+        store = ApprovalStore(app.conn, clock=app.clock.now)
+        tid = make_delegation(app, work, str(db_path))
+        store.request_delegation(project=str(db_path), brief="x", task_id=tid)
+        assert len(reclaim_abandoned(db_path=str(db_path), clock=app.clock)) == 1
+        assert reclaim_abandoned(db_path=str(db_path), clock=app.clock) == ()
+        # CREATED + 一条认领 FAILED —— 幂等，不能有第三条。
+        assert len(app.record_repo.list_for_task(tid)) == 2
+
+    def test_fresh_progress_leaves_the_delegation_alone(self, app, work, db_path):
+        """投影新鲜 ⇒ 执行器多半还活着 —— 宁可漏认领，不许把活的记成死的。"""
+        from freeagent.services.approval import ApprovalStore
+
+        store = ApprovalStore(app.conn, clock=app.clock.now)
+        tid = make_delegation(app, work, str(db_path))
+        app.task_repo.set_delegate_progress(
+            task_id=tid, status="跑", recent="", tool_calls=0, allowed=0,
+            project=str(db_path), now=app.clock.now(),
+        )
+        store.request_delegation(project=str(db_path), brief="x", task_id=tid)
+        notes = reclaim_abandoned(db_path=str(db_path), clock=app.clock)
+        assert notes == ()
+        # 只有创建时的 CREATED —— 没追加认领记录。
+        records = app.record_repo.list_for_task(tid)
+        assert all(r.type is not RecordType.DELEGATION_FAILED for r in records)
+
+    def test_pending_without_task_id_is_untouched(self, app, db_path):
+        """没归属的待决项不是委派 —— 恢复清单不该把手伸向本地操作。"""
+        from freeagent.services.approval import ApprovalStore
+
+        store = ApprovalStore(app.conn, clock=app.clock.now)
+        store.request_tool_call(permission="写文件", paths=("a.txt",))
+        notes = reclaim_abandoned(db_path=str(db_path), clock=app.clock)
+        assert notes == ()
 
 
 # =============================================================================

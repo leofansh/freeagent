@@ -106,27 +106,22 @@ def read_outcome(records: Sequence[TaskRecord]) -> DelegationOutcome:
     * 验收结论从产物记录里读：``artifact_accepted`` 是采纳，
       ``artifact_created`` **多于**一次是返工（用户圈改重做过）。
 
-    ## 一条实测出来的前提：记录顺序依赖时间戳（不是依赖 id）
+    ## 同刻记录的顺序前提（V1.37 起由 seq 兜底）
 
-    ``RecordRepo.list_for_task`` 是 ``ORDER BY ts ASC, id ASC``，而 ``id``
-    是 ``new_id()`` 随机生成的。所以**同一条时间戳上的多条记录，顺序是
-    随机的**。实测（2026-10-17 写这组测试时撞到）：把
-    ``delegation_dispatched`` 与 ``delegation_failed`` 落在同一微秒，
-    读回来可能是 ``failed`` 在前 —— 于是 :func:`attempt_state` 看到
-    failed 时 ``in_flight`` 还是 False，判成 ``refused``（派发前被拒）
-    而不是 ``failed``（执行期失败）。**结论会整个反过来，而界面上两者
-    长得一模一样**（都是「没成功」）。
+    ``RecordRepo.list_for_task`` 曾是 ``ORDER BY ts ASC, id ASC``，而
+    ``id`` 是 ``new_id()`` 随机生成的 —— 同一条时间戳上的多条记录顺序随机
+    （实测 2026-10-17：``delegation_dispatched`` 与 ``delegation_failed``
+    同微秒落库后，:func:`attempt_state` 可能判成 ``refused`` 而不是
+    ``failed``，**结论整个反过来**）。
 
-    真实委派里两条记录由同一进程连续写入，落在同一微秒是可能的但罕见；
-    写测试用 ``FrozenClock`` 时则是**必然**。所以：
+    **V1.37 已根治**：``task_records.seq``（每任务单调）落列，读侧
+    ``list_for_task`` 改 ``ts ASC, seq ASC``，同刻顺序 = 写入顺序，
+    确定性。本模块的输入合同不变：传进来的记录**必须已按读取顺序排好**
+    （调用方都会用 ``list_for_task``）—— 判据从记录形状推导这一纪律
+    不变，变的只是形状本身不再随机。
 
-    * 本模块与 :func:`attempt_state` 一样**继承**这个前提，不掩盖它 ——
-      另写一份按 id 或按落库顺序的推导，只会让两个「结局」定义并存。
-    * 写这组测试时必须给每条记录**递增**时间戳，否则测的是一个
-      现实中罕见、且结论相反的顺序。
-    * 真要根治，得改 ``RecordRepo.list_for_task`` 的排序（例如加一个
-      单调递增的序号列）。那是**改既有契约**，影响派发守卫与幂等判定，
-      不属于本次改动范围 —— 记在这里，等它值得单独做时再动。
+    写测试仍须给每条记录**递增**时间戳或用 ``RecordRepo.append`` 取真序号；
+    手工拼记录列表时同刻多条的顺序由你自己的列表序决定。
     """
     _in_flight, last = attempt_state(records)
 

@@ -60,8 +60,11 @@ def store(conn):
 
 class TestMigration:
     def test_version(self):
-        # 15 = delegate_progress + pending_approvals.task_id
-        #（WEB 委派实时面板，设计文档 12.8 / V1.35）。
+        # 18 = captured_items（待处理收集器，设计文档 11.18 / V1.50）。
+        # （上一版 17 = memory（跨角色 core 记忆 + FTS5，设计文档 3.7 / V1.47）；
+        # 再上 16 = task_records.seq，同刻记录定序，设计文档 12.10.6 / V1.37；
+        # 再上 15 = delegate_progress + pending_approvals.task_id，
+        # WEB 委派实时面板，设计文档 12.8 / V1.35。）
         #
         # 改 SCHEMA_VERSION 时**必须**同步改这里。踩过的坑（2026-10-12）：
         # 13 → 14 那一步迁移**加了**、版本号**也加了**，唯独这条断言忘了改，
@@ -71,7 +74,15 @@ class TestMigration:
         # 这条断言存在的意义：迁移循环是 ``range(current, SCHEMA_VERSION)``，
         # 版本号与迁移条目任何一边对不上，最后一格就**安静地**被跳过 ——
         # 症状是「新表不存在」，而没有任何报错指向版本号。
-        assert SCHEMA_VERSION == 15
+        #
+        # V1.50 补这条时还踩了第二个坑（同一天，记下来）：captured_items 的
+        # 条目一开始紧跟在 seq 后面，落在**索引 15**（源版本 16）—— 而 v17
+        # 那个位置本该是占位（memory 走 _DOMAIN_STEPS，没有单语句条目）。
+        # 症状是「表建得出来、测试全绿」，但一步一版的对齐断了：它在
+        # 16 → 17 那一步执行，17 → 18 反而空跑。**len(_MIGRATIONS) 与
+        # SCHEMA_VERSION 的差值不是常量**（取决于有几版走了域步骤），
+        # 所以这里只能逐版核对标签与索引，不能拿一个算式概括。
+        assert SCHEMA_VERSION == 18
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

@@ -25,7 +25,7 @@ import urllib.request
 import pytest
 
 from freeagent.app import build_app
-from freeagent.domain import FreeAgentError
+from freeagent.domain import FreeAgentError, RecordType
 from freeagent.services.approval import ApprovalStore
 from freeagent.services.clock import FrozenClock
 from freeagent.web import endpoints_delegate_action as act
@@ -130,6 +130,33 @@ class TestLiveSnapshot:
             live.delegate_live(app)
         assert store.decide(p.credential) is None, "读端点把待批项答复掉了"
 
+    def test_stale_open_row_offers_recovery_actions(self, env):
+        """12.11.1（V1.39）：陈旧且未结束的委派给「重新派发 / 放弃」按钮。
+        这是从「只给文案」改过来的 —— 文案要人去终端，不友好。"""
+        app, task, clock = env
+        _write_progress(app, clock, task.id)
+        clock.advance(seconds=61)
+        item = live.delegate_live(app)["items"][0]
+        assert item["stale"] is True
+        assert item["actions"] == ["redispatch", "drop"]
+
+    def test_fresh_row_has_no_recovery_actions(self, env):
+        """正在正常跑的不给按钮 —— 怕误触把一条活着的东西重派/放弃。"""
+        app, task, clock = env
+        _write_progress(app, clock, task.id)
+        assert live.delegate_live(app)["items"][0]["actions"] == []
+
+    def test_finished_row_has_no_recovery_actions(self, env):
+        """已结束（DONE/DROPPED）不给按钮：重派会被服务层以「已经做完了」
+        拒掉，放一个必然报错的按钮比不放更糟。"""
+        app, task, clock = env
+        _write_progress(app, clock, task.id)
+        app.tasks.drop(task.id, reason="测试")
+        clock.advance(seconds=61)
+        item = live.delegate_live(app)["items"][0]
+        assert item["stale"] is True
+        assert item["actions"] == []
+
 
 # ── 待决项载荷 ────────────────────────────────────────────────────────── #
 
@@ -208,6 +235,24 @@ class TestPendingPayload:
         store.put_answer(q.credential, "答了", answered_by="")
         _write_progress(app, clock, task.id)
         assert live.delegate_live(app)["items"][0]["pending"] == []
+
+    def test_zombie_row_for_a_deleted_task_does_not_poison_the_panel(self, env):
+        """真机 2026-10-18：进度行还在、事务已删 → 面板整体 400。
+
+        根因是端点按「``repo.get`` 返回 None」写的兜底，而 ``get()`` 的
+        契约是**抛** ``NotFoundError``（返回 None 的是 ``find()``）。一条
+        坏行毒死整个实时面板 —— 好委派的进度也跟着看不见。修法：改用
+        ``find()``，坏行降级显示「(事务已不存在)」。
+        """
+        app, task, clock = env
+        # 一行**正常**的 + 一行事务已删的：坏行不许影响好行的显示。
+        ghost_id = "task_deleted_with_progress_row_still_there"
+        _write_progress(app, clock, task.id, tool_calls=2, allowed=2)
+        _write_progress(app, clock, ghost_id, status="正在执行")
+        items = live.delegate_live(app)["items"]
+        by_id = {i["task_id"]: i for i in items}
+        assert by_id[task.id]["title"], "好行必须照常显示"
+        assert by_id[ghost_id]["title"] == "(事务已不存在)"
 
     def test_orphan_pending_is_still_shown(self, env):
         """没有归属的待批项（本地操作类）照样显示 —— 藏起来用户就以为
@@ -359,6 +404,80 @@ class TestQuestionAnswer:
             act.question_answer(app, q.credential, {"text": "答"})
 
 
+# ── 陈旧行的恢复动作（12.11.1 / V1.39）────────────────────────────────── #
+
+def _make_failed(app, task, clock):
+    """把一条委派造成「执行期失败」形状（dispatched → failed）——
+    这正是 `reset_delegation` 允许重派的三种前提交集之一。"""
+    app.record_repo.append(task.id, RecordType.DELEGATION_DISPATCHED,
+                           "派出去了", clock.now())
+    app.record_repo.append(task.id, RecordType.DELEGATION_FAILED,
+                           "挂了", clock.now())
+
+
+class TestRecoveryActions:
+    """陈旧委派的「重新派发 / 放弃」—— 与终端 ``/redispatch``、``/drop``
+    共用服务层写入口，所以这里验「端点翻对了话」。"""
+
+    def test_redispatch_marks_a_failed_delegation(self, env):
+        app, task, clock = env
+        _make_failed(app, task, clock)
+        got = act.delegate_redispatch(app, task.id)
+        assert got["ok"] is True and got["action"] == "redispatch"
+        types = [r.type for r in app.record_repo.list_for_task(task.id)]
+        assert RecordType.DELEGATION_RESET in types
+
+    def test_redispatch_of_a_running_delegation_is_refused(self, env):
+        """正在跑不能重派 —— 服务层挡（派第二个进程改同一目录会互相覆盖），
+        端点如实回话而不是静默成功。"""
+        app, task, clock = env
+        app.record_repo.append(task.id, RecordType.DELEGATION_DISPATCHED,
+                               "派出去了", clock.now())
+        with pytest.raises(FreeAgentError, match="正在跑"):
+            act.delegate_redispatch(app, task.id)
+
+    def test_drop_lands_as_dropped(self, env):
+        app, task, _clock = env
+        got = act.delegate_drop(app, task.id)
+        assert got["ok"] is True and got["action"] == "drop"
+        assert app.tasks.get(task.id).state.value == "dropped"
+
+    def test_recovery_reason_records_web_origin(self, env):
+        """审计：记录里要能看出是「从网页面板点的」，与终端操作对账。"""
+        app, task, clock = env
+        _make_failed(app, task, clock)
+        act.delegate_redispatch(app, task.id)
+        contents = [r.content for r in app.record_repo.list_for_task(task.id)
+                    if r.type is RecordType.DELEGATION_RESET]
+        assert any("网页面板" in c for c in contents)
+
+
+class TestRecoveryRoutes:
+    """过路由表 —— 路径写错就是 404（返回 None），而 404 不报错。"""
+
+    def test_redispatch_route_reaches_the_endpoint(self, env):
+        app, task, clock = env
+        _make_failed(app, task, clock)
+        got = dispatch_post(
+            app, ["api", "delegate", "tasks", task.id, "redispatch"],
+            lambda **kw: {})
+        assert got is not None, "路径没接上（None = 404，界面上是点了没反应）"
+        assert got[0] == 200 and got[1]["action"] == "redispatch"
+
+    def test_drop_route_reaches_the_endpoint(self, env):
+        app, task, clock = env
+        _make_failed(app, task, clock)
+        got = dispatch_post(
+            app, ["api", "delegate", "tasks", task.id, "drop"], lambda **kw: {})
+        assert got is not None and got[1]["action"] == "drop"
+
+    def test_unknown_action_would_be_404(self, env):
+        app, task, _clock = env
+        assert dispatch_post(
+            app, ["api", "delegate", "tasks", task.id, "restart"],
+            lambda **kw: {}) is None, "未知动作不该被路由层假装接住"
+
+
 # ── 路由表（路径写错就是 404，而 404 不报错）──────────────────────────── #
 
 class TestRoutes:
@@ -447,6 +566,13 @@ class TestOverHttp:
         assert body["kind"] == "delegate_live"
         assert body["poll_seconds"] == 0.0
         assert body["items"][0]["recent"] == "read"
+
+    def test_recovery_drop_over_http(self, served):
+        """真起 HTTP：陈旧行的「放弃」按钮走的就是这条路径。"""
+        call, app, task, _clock = served
+        status, body = call("/api/delegate/tasks/" + task.id + "/drop", {})
+        assert status == 200 and body["ok"] is True
+        assert app.tasks.get(task.id).state.value == "dropped"
 
     def test_allow_over_http_lands_in_the_db(self, served):
         call, app, task, clock = served

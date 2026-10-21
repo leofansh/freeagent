@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import date, datetime
 from typing import TypeVar, cast
 
@@ -29,6 +29,7 @@ __all__ = [
     "TaskService",
     "ALLOWED_TRANSITIONS",
     "BatchDropItem",
+    "BatchDeleteItem",
     "validate_task",
 ]
 
@@ -96,6 +97,23 @@ class BatchDropItem:
     reason: str = ""
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class BatchDeleteItem:
+    """批量**硬删**里一条的结果。形状与 :class:`BatchDropItem` 相同。
+
+    为什么不直接复用 ``BatchDropItem``：两个字面同形但语义相反——
+    「算了」是可逆的终态迁移（行全在、随时 reopen），硬删是**行没了**。
+    复用会让 ``dropped=3`` 这种响应字段与真删数据的接口混名，
+    下一个读响应的人分不清是「放进 DROPPED」还是「物理消失」。
+    分开命名，读的人不用翻实现就知道发生了什么。
+    """
+
+    id: str
+    ok: bool
+    title: str
+    reason: str = ""
+
+
 def validate_task(task: Task) -> None:
     """校验设计文档 4.3 的全部不变式。"""
     if not task.title.strip():
@@ -124,10 +142,23 @@ def validate_task(task: Task) -> None:
 
 
 class TaskService:
-    def __init__(self, tasks: TaskRepo, records: RecordRepo, clock: Clock) -> None:
+    def __init__(
+        self,
+        tasks: TaskRepo,
+        records: RecordRepo,
+        clock: Clock,
+        *,
+        has_pending: Callable[[str], bool] | None = None,
+    ) -> None:
         self._tasks = tasks
         self._records = records
         self._clock = clock
+        #: 「这条事务桌上有没有未决待批项」。**注入而非自建**：待批项住在
+        #: :class:`~freeagent.services.approval.ApprovalStore` 里，直接拿那
+        #: 个 store 会让 tasks ↔ approval 互相依赖（approval 已依赖任务侧
+        #: 读仓库），所以这里只要一个最窄的布尔问题。装配处（app.py）用
+        #: ``ApprovalStore.pending_for_web`` 过滤出答案。
+        self._has_pending = has_pending
 
     # -- 创建 --------------------------------------------------------------- #
     def create(
@@ -315,6 +346,90 @@ class TaskService:
                     BatchDropItem(id=task_id, ok=True, title=task.title)
                 )
         return results
+
+    # -- 删除（不可恢复的硬删） ------------------------------------------------- #
+    def delete_task(self, task_id: str) -> Task:
+        """把一条事务**连侧行带历史**从库里抹掉，返回删除前的快照。
+
+        ## 为什么硬删而不是再立一个「已删除」状态
+
+        设计文档已背书这个方向（12.x）：「任务被删除时，其 TaskRecord 一并
+        级联删除（原型不提供软删除任务，避免历史歧义）」。再立一个终态，
+        就得给每次读都加「已删除要不要显示」的分支，而它永远只会是 False
+        —— 一个只有 False 的开关不是开关，是特例。
+
+        ## 为什么闸门在服务层而不是端点里
+
+        「能不能删」是业务规则（正在跑、有待批项），不是某个通道的口味。
+        端点里查一遍、CLI 里再查一遍，第二份必然先漂移（12.1.1 的学费）。
+
+        ## 删前清 delegate_progress 的原因
+
+        FK 级联覆盖得了 ``task_roles`` / ``artifacts`` / ``task_records`` /
+        ``task_dependencies``，但 ``delegate_progress`` 是 task_id 做主键、
+        没挂外键 —— 不清就留下一条任务已消失、恢复扫描还在啃的悬空行。
+
+        刻意**不**碰 ``pending_approvals``：未决的会被下面的闸门拒掉，
+        已定案与已过期的行是留痕（审批历史），随任务消失反而弄丢证据。
+        """
+        current = self._tasks.get(task_id)  # 不存在时 NotFoundError 由仓库抛
+        self._ensure_deletable(current)
+        self._tasks.clear_delegate_progress(task_id)  # 幂等、不抛
+        self._tasks.delete(task_id)  # FK 级联清 roles/artifacts/records/deps
+        return current
+
+    def delete_many(self, task_ids: Sequence[str]) -> list[BatchDeleteItem]:
+        """批量硬删。逐条走 :meth:`delete_task`，模式与 :meth:`drop_many` 相同。
+
+        部分失败不是错误：批量里混着正在跑 / 有待批项的条目是常态，
+        返回逐条结果才能让界面把「成了几条、哪几条为什么不行」说给人听。
+        冷冻复制的校验等于第二份闸门，这里一条不抄。
+        """
+        results: list[BatchDeleteItem] = []
+        seen: set[str] = set()
+        for raw in task_ids:
+            task_id = str(raw)
+            if task_id in seen:
+                continue  # 同一条传两遍:第二次必是 failed，跳过
+            seen.add(task_id)
+            try:
+                task = self.delete_task(task_id)
+            except FreeAgentError as exc:
+                title = ""
+                found = self._tasks.find(task_id)
+                if found is not None:
+                    title = found.title
+                results.append(
+                    BatchDeleteItem(id=task_id, ok=False, title=title,
+                                    reason=str(exc))
+                )
+            else:
+                results.append(
+                    BatchDeleteItem(id=task_id, ok=True, title=task.title)
+                )
+        return results
+
+    def _ensure_deletable(self, task: Task) -> None:
+        """删除前的两道闸门，理由**互相可区分**（判罚混同 = 用户不知道干嘛）。
+
+        「正在跑」复用判定侧同一份 :func:`~freeagent.services.delegate.
+        attempt_state` —— 形状推导各写一份，「校验说能删」与「判定还在跑」
+        会在真跑时打架（reset_delegation 同一个坑，不再踩一次）。
+        """
+        from .delegate import attempt_state
+
+        in_flight, _last = attempt_state(self._records.list_for_task(task.id))
+        if in_flight:
+            raise ValidationError(
+                f"「{task.title}」的委派正在跑，不能删 —— 边跑边删会让恢复"
+                "扫描指向一个不存在的项目。先等它跑完，或用「停止」把它"
+                "停下来再删。"
+            )
+        if self._has_pending is not None and self._has_pending(task.id):
+            raise ValidationError(
+                f"「{task.title}」桌上还有没批完的待批项，不能删 —— "
+                "先批完或拒掉那些卡再来删；卡悬着没人批，任务删了也没人记得。"
+            )
 
     def reopen(self, task_id: str) -> Task:
         return self.set_state(task_id, TaskState.INBOX, reason="重新打开")

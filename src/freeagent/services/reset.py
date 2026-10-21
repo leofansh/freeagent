@@ -26,6 +26,13 @@ artifacts、pending_approvals、stop_requests。
 **留**：roles 与 role_knowledge（脉络是结构，不是记录）、以及全部
 配置（config.json / llm.env / feishu.env / oc_selection / 飞书状态
 文件）。清配置等于让用户重配一遍，那是另一种事故。
+
+## 为什么每日备份也住这里（12.11.2 / V1.39）
+
+它不清库，但**独删**旧备份 —— 本仓第二个「真的会删文件」的功能，
+只有两处。让删除能力散进第三个模块，等于把「谁有权删」的盘点变难。
+两个备份函数共用同一套 sqlite 线上备份手法与 fail 姿态（出厂备份
+失败抛、日备份失败只记日志 —— 守的动作不同，姿态就不同）。
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import logging
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -43,7 +51,9 @@ __all__ = [
     "ResetResult",
     "WIPE_ORDER",
     "backup_database",
+    "daily_backup",
     "db_path_of",
+    "last_daily_backup",
     "reset_factory",
     "running_services",
     "wipe_transaction_data",
@@ -76,6 +86,16 @@ WIPE_ORDER: tuple[str, ...] = (
 #: 备份文件名后缀。跟随用户机器上已有的 ``.bak-*`` 习惯
 #:（``~/.freeagent`` 下一批 agent.db.bak-*）。
 _BACKUP_TAG = "bak-factory"
+
+#: 每日滚备的文件名后缀（12.11.2 / V1.39）。**独立于 bak-factory**：
+#: 出厂备份「清空前留退路」、日备份「日常兜底」，语义不同 ——
+#: 混用一个标签的话，「上次出厂备份是哪份」要靠猜，而那个时刻
+#: 正是用户最不该猜的时候。
+_DAILY_TAG = "bak-daily"
+
+#: 日备份保留份数。7 份对单机个人库是「一周」的直觉刻度，磁盘占用
+#: 又买得起；更多份没换来更好的恢复能力，少了怕滚早了。
+_DAILY_KEEP = 7
 
 
 class ResetRefused(RuntimeError):
@@ -198,6 +218,81 @@ def backup_database(db_path: Path) -> Path:
     if not dest.is_file() or dest.stat().st_size == 0:
         raise ResetRefused(f"备份没写成功：{dest}——拒绝清空")
     return dest
+
+
+def daily_backup(db_path: Path, *, today: datetime.date | None = None) -> Path | None:
+    """每日滚动备份（12.11.2 / V1.39）：当日第一笔跑，否则跳过。
+
+    与 :func:`backup_database` 的差别在那三层**刻意的不一样**：
+
+    * **当日一次** —— 三个进程入口（终端/执行器/WEB）每天各跑几次，
+      但用户只需要「每天有一份」。判断目标日的文件名里有没有当天日期，
+      有就跳过（连库连接都不开 —— 备不该占跑的位置）。
+    * **独立标签** ``bak-daily`` —— 出厂备份与日备份语义不同，见
+      :data:`_DAILY_TAG`。
+    * **失败不阻断、不抛** —— :func:`backup_database` 失败时抛，是因为
+      它守着「清空」这个没有退路的动作；日备份是兜底姿态，今天没备成
+      明天还有机会，拦下用户正事是丢西瓜捡芝麻。
+
+    ``today`` 给测试留的注入口：按本仓纪律时间必须可注入
+    （conftest 的 FrozenClock 同一条道理）；缺省取真实当天。
+    """
+    log = logging.getLogger(__name__)
+    day = today or datetime.date.today()
+    prefix = f"{db_path.name}.{_DAILY_TAG}-{day.strftime('%Y%m%d')}"
+    if any(db_path.parent.glob(prefix + "*")):
+        return None
+    # ⚠️ 戳里的日期用**逻辑日**（注入的 today）而不是真实今天：无注入时
+    # 两者一致；测试注入历史日期时，dest 的名字才不与同秒内的另一次
+    # 调用撞车。时刻部分仍取真实时间 —— 叫什么时候备的 就是事实。
+    stamp = day.strftime("%Y%m%d") + datetime.datetime.now().strftime("-%H%M%S")
+    dest = db_path.with_name(f"{db_path.name}.{_DAILY_TAG}-{stamp}")
+    try:
+        src = sqlite3.connect(db_path)
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        if not dest.is_file() or dest.stat().st_size == 0:
+            log.warning("每日备份没写成功：%s（明天再试）", dest)
+            dest.unlink(missing_ok=True)
+            return None
+    except (sqlite3.Error, OSError) as exc:
+        # 失败只记日志：备份是需要成功的事，不是必须成功的事。
+        # ⚠️ 炸掉的**空壳文件必须清走**：留下来会被「当日已有备份」的
+        # 判定当成已备——当天从此不再尝试，谁也说不清哪天真的没备。
+        log.warning("每日备份失败（不阻断主流程）：%s", exc)
+        with contextlib.suppress(OSError):
+            dest.unlink(missing_ok=True)
+        return None
+    # 滚动删除：只留最近 _DAILY_KEEP 份，旧的清掉。按文件名里的
+    # 时间戳排序 —— 文件名就是这个用途起的。
+    dailies = sorted(db_path.parent.glob(f"{db_path.name}.{_DAILY_TAG}-*"))
+    for stale in dailies[:-_DAILY_KEEP]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
+    return dest
+
+
+def last_daily_backup(db_path: Path) -> datetime.datetime | None:
+    """最近一次日备份的时刻（设置页显示用）；没有则 None。
+
+    从**文件名**读时间戳而非查文件 mtime：mtime 会被复制/同步工具
+        改写，文件名里的戳才是我们自己写的、唯一可靠的。
+    """
+    dailies = sorted(db_path.parent.glob(f"{db_path.name}.{_DAILY_TAG}-*"))
+    if not dailies:
+        return None
+    raw = dailies[-1].name.rsplit("-", 2)[-2:]
+    stamp = "-".join(raw)
+    try:
+        return datetime.datetime.strptime(stamp, "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
 
 
 def wipe_transaction_data(db_path: Path) -> dict[str, int]:

@@ -175,10 +175,54 @@ function liveItemView(it, repaint) {
     // 症状是「点允许偶尔没反应」，而它只在真人手慢时出现，测试抓不到。
     const note = el("div", "note warn");
     note.dataset.ageFor = it.updated_at;
+    // 12.11.1 的出路文案：指针型、放 dataset 里让 tick 原地拼进提示，
+    // 同样**不进**重绘签名之外的任何东西 —— 文案在本轮重画之间是常量，
+    // 记在节点上就不会每 2 秒把这张卡拆了重装。
+    note.dataset.outlet = it.outlet || "";
     box.appendChild(note);
+  }
+  if ((it.actions || []).length) {
+    // 12.11.1（V1.39）：陈旧且未结束的委派给**恢复按钮**，替代早先
+    // 「只让人去终端敲 /redispatch」的文案（那正是「不友好」的根源）。
+    // 按钮进重绘签名（actions 是常量，不会每 2 秒变），于是只在真有
+    // 状态变化时重建 —— 与「年龄数字不进签名、原地改」是相反的一对：
+    // 会变的原地改，不变得跟着卡走。
+    box.appendChild(liveRecoveryRow(it, repaint));
   }
   (it.pending || []).forEach((p) => box.appendChild(livePendingCard(p, repaint)));
   return box;
+}
+
+// 一条陈旧委派的恢复按钮行：重新派发 / 放弃。
+// 两者都进**同一套服务层写入口**（``/api/delegate/tasks/<id>/...`` →
+// TaskService），与终端 ``/redispatch`` / ``/drop`` 一份实现（12.1.1）。
+function liveRecoveryRow(it, repaint) {
+  const row = el("div", "currow");
+  const mk = (label, cls, action, confirmText) => {
+    const b = el("button", "btn " + cls, label);
+    b.addEventListener("click", () => {
+      // 放弃是终态迁移：多拦一道确认（重派是轻操作，单击即可、幂等）。
+      if (confirmText && !confirm(confirmText)) return;
+      b.disabled = true;
+      api("/api/delegate/tasks/" + encodeURIComponent(it.task_id) + "/" + action, {
+        method: "POST",
+        body: JSON.stringify({}),
+      }).then((r) => {
+        toast((r && r.message) || "已记下");
+        repaint();
+      }, (e) => { toast("没生效：" + e.message); b.disabled = false; });
+    });
+    return b;
+  };
+  if ((it.actions || []).includes("redispatch")) {
+    row.appendChild(mk("重新派发", "primary", "redispatch", ""));
+  }
+  if ((it.actions || []).includes("drop")) {
+    row.appendChild(mk("放弃", "", "drop", "放弃这条委派？记录仍保留、可审计。"));
+  }
+  row.appendChild(el("span", "hint",
+    "重新派发后由执行器下次扫描执行；放弃为终态、可审计。"));
+  return row;
 }
 """
 

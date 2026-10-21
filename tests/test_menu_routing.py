@@ -61,6 +61,9 @@ class _Msg:
         self.chat_id = "oc_chat"
         self.event_id = "ev_1"
         self.message_id = "om_1"
+        #: V1.48 起 ``_capture_unsupported`` 会读它（None = 无可下载附件）。
+        #: 与真类 ``IncomingMessage.attachment`` 同形状，缺了会 AttributeError。
+        self.attachment = None
 
     @property
     def dedup_key(self) -> str:

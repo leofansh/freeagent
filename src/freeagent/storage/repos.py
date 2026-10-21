@@ -16,6 +16,8 @@ from typing import Iterable, Sequence, TypeVar, cast
 from ..domain import (
     Artifact,
     ArtifactStatus,
+    CapturedItem,
+    CapturedStatus,
     ConflictError,
     InvariantViolation,
     NotFoundError,
@@ -32,7 +34,7 @@ from ..domain import (
     new_id,
 )
 
-__all__ = ["RoleRepo", "TaskRepo", "RecordRepo", "ArtifactRepo"]
+__all__ = ["RoleRepo", "TaskRepo", "RecordRepo", "ArtifactRepo", "CapturedRepo"]
 
 _TERMINAL_VALUES = (TaskState.DONE.value, TaskState.DROPPED.value)
 #: 未结束 = 全部状态减去已结束。顺序按生命周期，查询时的 IN 列表也用它。
@@ -771,17 +773,40 @@ class RecordRepo(_RepoBase):
     def append(
         self, task_id: str, type_: RecordType, content: str, ts: datetime
     ) -> TaskRecord:
-        record = TaskRecord(id=new_id(), task_id=task_id, ts=ts, type=type_, content=content)
         with self._tx():
+            # seq 本任务内取 MAX+1（12.10.6 / V1.37）。不交由调用方传、
+            # 也不用全局 AUTOINCREMENT —— 取号必须和 INSERT 同事务，
+            # 否则并发写入会拿到同一个号；而全局序号会被不相干任务
+            # 的写入强行排出先后，暴露写竞争。
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM task_records WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            seq = (row[0] if row is not None else 0) + 1
+            record = TaskRecord(
+                id=new_id(), task_id=task_id, ts=ts, type=type_, content=content, seq=seq
+            )
             self._conn.execute(
-                "INSERT INTO task_records (id, task_id, ts, type, content) VALUES (?,?,?,?,?)",
-                (record.id, record.task_id, record.ts.isoformat(), record.type.value, record.content),
+                "INSERT INTO task_records (id, task_id, ts, type, content, seq)"
+                " VALUES (?,?,?,?,?,?)",
+                (
+                    record.id,
+                    record.task_id,
+                    record.ts.isoformat(),
+                    record.type.value,
+                    record.content,
+                    record.seq,
+                ),
             )
         return record
 
     def list_for_task(self, task_id: str) -> list[TaskRecord]:
+        # 同刻记录按 seq 定序（12.10.6 / V1.37）：id 是随机的，旧排序
+        # `ts ASC, id ASC` 在同一条时间戳上等于掷硬币 —— 撞到
+        # dispatched/failed 同微秒落库时，attempt_state 会把执行期失败
+        # 整个判反。seq 是每任务单调的，这条排序是全序、确定性。
         rows = self._conn.execute(
-            "SELECT * FROM task_records WHERE task_id = ? ORDER BY ts ASC, id ASC",
+            "SELECT * FROM task_records WHERE task_id = ? ORDER BY ts ASC, seq ASC",
             (task_id,),
         )
         return [self._row_to_record(r) for r in rows]
@@ -790,11 +815,22 @@ class RecordRepo(_RepoBase):
         """最近 N 条，按时间**升序**返回。"""
         rows = self._conn.execute(
             "SELECT * FROM task_records WHERE task_id = ?"
-            " ORDER BY ts DESC, id DESC LIMIT ?",
+            " ORDER BY ts DESC, seq DESC LIMIT ?",
             (task_id, limit),
         )
         records = [self._row_to_record(r) for r in rows]
         return tuple(reversed(records))
+
+    def list_all(self) -> list[TaskRecord]:
+        """全量记录，按时间升序。
+
+        个人模型等跨任务聚合视图用——它们要数全部顺延记录，
+        而按任务逐条 ``list_for_task`` 是 N 次查询。只读，不改任何状态。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM task_records ORDER BY ts ASC, seq ASC"
+        )
+        return [self._row_to_record(r) for r in rows]
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> TaskRecord:
@@ -804,6 +840,138 @@ class RecordRepo(_RepoBase):
             ts=datetime.fromisoformat(row["ts"]),
             type=RecordType(row["type"]),
             content=row["content"],
+            # 旧行（迁移前）可能没有该列；列在 ALTER 后必然存在但值可为 NULL。
+            seq=row["seq"],
+        )
+
+
+# --------------------------------------------------------------------------- #
+# CapturedRepo
+# --------------------------------------------------------------------------- #
+class CapturedRepo(_RepoBase):
+    """待处理收集器的存取（设计文档 11.18）。
+
+    **只存取，不判定**：什么算「待处理」由服务层
+    :class:`~freeagent.services.pending.PendingService` 决定，仓储只认显式
+    传入的状态值 —— 与 delegate_progress 那张表同一条分工（投影不判事）。
+    """
+
+    def add(
+        self,
+        *,
+        source: str,
+        kind: str,
+        media_key: str,
+        name: str,
+        size: int,
+        path: str,
+        now: datetime,
+        item_id: str | None = None,
+    ) -> CapturedItem:
+        """收下一条捕获，**永远以 pending 落盘**。
+
+        下载失败的调用方传 ``path=""`` 之外还会写一个 ``.meta.json``
+        引用文件（见桥接 ``_capture_unsupported``）—— 那条路走得通，
+        是因为 ``media_key`` 一直在，凭它还能重新下载。
+        """
+        item = CapturedItem(
+            id=item_id or new_id(),
+            source=source,
+            kind=kind,
+            media_key=media_key,
+            name=name,
+            size=size,
+            path=path,
+            status=CapturedStatus.PENDING,
+            created_at=now,
+        )
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO captured_items"
+                " (id, source, kind, media_key, name, size, path, status, task_id,"
+                "  created_at, resolved_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    item.id,
+                    item.source,
+                    item.kind,
+                    item.media_key,
+                    item.name,
+                    item.size,
+                    item.path,
+                    item.status.value,
+                    item.task_id,
+                    item.created_at.isoformat(),
+                    None,
+                ),
+            )
+        return item
+
+    def get(self, item_id: str) -> CapturedItem:
+        row = self._conn.execute(
+            "SELECT * FROM captured_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("待处理项", item_id)
+        return self._row_to_item(row)
+
+    def list_pending(self) -> list[CapturedItem]:
+        """待处理的全部，**先进先出**（创建序升序）。
+
+        收集器的纪律是「越早收下越先摆出来」—— 和邮箱一个道理：按时间
+        倒序会让最早收下的那条永远沉底，而它往往已经躺得最久。
+        同刻创建的按 ``id`` 定序，保证全序确定（不掷硬币）。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM captured_items WHERE status = ?"
+            " ORDER BY created_at ASC, id ASC",
+            (CapturedStatus.PENDING.value,),
+        )
+        return [self._row_to_item(r) for r in rows]
+
+    def count_pending(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM captured_items WHERE status = ?",
+            (CapturedStatus.PENDING.value,),
+        ).fetchone()
+        return int(row[0])
+
+    def resolve(
+        self,
+        item_id: str,
+        status: CapturedStatus,
+        now: datetime,
+        *,
+        task_id: str | None = None,
+    ) -> CapturedItem:
+        """落到终态（clarified / dismissed）。只改状态三列，不碰捕获内容。
+
+        **刻意不在这里拒「重复 resolve」**：那条判定在服务层 —— 它要给不出
+        面向用户的话术（「这条已经澄清成事务 X 了」），而仓储的职责是写。
+        同 ``TaskRepo.update`` 不判状态机：判定归服务，存取归仓储。
+        """
+        with self._tx():
+            self._conn.execute(
+                "UPDATE captured_items SET status = ?, task_id = ?, resolved_at = ?"
+                " WHERE id = ?",
+                (status.value, task_id, now.isoformat(), item_id),
+            )
+        return self.get(item_id)
+
+    @staticmethod
+    def _row_to_item(row: sqlite3.Row) -> CapturedItem:
+        return CapturedItem(
+            id=row["id"],
+            source=row["source"],
+            kind=row["kind"],
+            media_key=row["media_key"],
+            name=row["name"],
+            size=int(row["size"]),
+            path=row["path"] or "",
+            status=CapturedStatus(row["status"]),
+            task_id=row["task_id"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            resolved_at=_dt_in(row["resolved_at"]),
         )
 
 

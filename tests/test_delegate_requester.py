@@ -163,8 +163,16 @@ class TestGateUsesRequester:
         finally:
             app.close()
 
-    def test_no_requester_falls_back_to_approver(self, tmp_path):
-        """终端发起的委派**行为与今天一致** —— 落回 approver。"""
+    def test_no_requester_leaves_row_blank_card_still_to_approver(
+            self, tmp_path):
+        """终端/WEB 发起（无真实发起人）→ requested_by **留空**，卡发 approver。
+
+        曾钉死旧行为：requested_by 落回兜底 approver。V1.40 推翻——12.8 靠
+        「requested_by 为空」判 WEB 面板可决，把兜底身份写进去会让本机发起的
+        委派被误判成「飞书发起」而从 WEB 面板消失（真机截图实证：
+        tp 待批行标灰不给按钮）。兜底身份只允许出现在**卡片收件人**上，
+        本测试两种断言都保留：胜利是「可决」，同时不丢人（卡仍有去处）。
+        """
         app, task, store, gate = self._gate_and_task(
             tmp_path, requester=None, approver="ou_Zed")
         sender = gate._sender
@@ -174,7 +182,9 @@ class TestGateUsesRequester:
                 store._conn.execute(
                     "SELECT credential FROM pending_approvals LIMIT 1"
                 ).fetchone()[0])
-            assert row.requested_by == "ou_Zed"
+            # requested_by 只记真实发起人：没有就留空，绝不造假身份
+            assert not (row.requested_by or "").strip()
+            # 兜底身份只做收件人
             assert sender.sent[0]["open_id"] == "ou_Zed"
         finally:
             app.close()

@@ -171,7 +171,7 @@ function renderSettings(d) {
       msg.innerHTML = '<span class="err">' + esc(err.message) + "</span>";
     }
   };
-  root.appendChild(advancedSection());
+  root.appendChild(advancedSection(d));
 
   root.appendChild(f);
 
@@ -189,18 +189,18 @@ function renderSettings(d) {
 // 摆顶部 = 一屏内伸手可及，误触成本最高；埋底部 = 没人找得到（实测第一
 // 位使用者就没看到）。折叠是两不牺牲：一行入口在页顶不用滚，展开是显式
 // 动作，破坏性按钮从不出现在「不小心看到」的状态里。
-function advancedSection() {
+function advancedSection(d) {
   const box = el("details", "advanced");
   const sum = el("summary", "", "高级设置（恢复出厂）");
   box.appendChild(sum);
-  box.appendChild(resetSection());
+  box.appendChild(resetSection(d));
   return box;
 }
 
 // 恢复出厂。口令**印在卡片上**：它的作用是让人慢一秒，不是保密 ——
 // 藏起来只会逼用户输错一次从报错里才知道输什么，白惹一声「功能坏了」。
 //（端点仍受会话令牌 + 只监听回环保护，不靠口令保密。）
-function resetSection() {
+function resetSection(d) {
   const box = el("div", "card");
   box.innerHTML =
     '<div class="row1"><span class="title">恢复出厂</span>' +
@@ -239,7 +239,11 @@ function resetSection() {
   row.appendChild(ta);
   row.appendChild(go);
   box.appendChild(row);
-  box.appendChild(el("div", "hint",
-    "口令（逐字输入）：<b>我确定清空所有事务数据</b>。执行器或桥接在跑时会拒绝（正在写同一个库）—— 先停再试；备份文件名带时间戳。"));
+  const hint = el("div", "hint",
+    "口令（逐字输入）：<b>我确定清空所有事务数据</b>。执行器或桥接在跑时会拒绝（正在写同一个库）—— 先停再试；备份文件名带时间戳。");
+  if (d && d.last_backup) hint.innerHTML +=
+    " 最近一次自动备份：<b>" + esc(d.last_backup) +
+    "</b>（启动时每日一份，保留 7 份）。";
+  box.appendChild(hint);
   return box;
 }"""

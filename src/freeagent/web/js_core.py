@@ -4,9 +4,8 @@
 
 列表渲染（renderList / taskCard）在本文件，而勾选态要被**三处**读到：
 工具条重绘、卡片渲染、视图切换时清理。放在这里而不是 renderList 内部，
-是为了让「切视图即清空」有一个稳定的存放处 —— 只活在 renderList 里的
-状态会被下一次重渲染无声吞掉，而用户看到的后果是「勾了半天的选择
-跳个页回来还在」，紧接着一把算掉他以为已经取消的那些。
+是为了让「切视图即清空」有一个稳定的存放处 —— 只活在 renderList 里的状态
+会被下一次重渲染吞掉，用户看到的后果是「勾了半天的选择跳个页回来还在」。
 """
 
 from __future__ import annotations
@@ -65,8 +64,7 @@ function exitPickMode() {
 }
 
 // 批量工具条：已选 N · 批量算了 · 全选 · 退出选择。
-// 只读「同一份数据」的纪律不受影响：这里没有任何筛选/隐藏 ——
-// 勾选只是为了指认「要改哪几条」，视图读的仍是全量。
+// 勾选只是为了指认「要改哪几条」，视图读的仍是全量（无筛选/隐藏）。
 function repaintPickBar() {
   $("#pickbar")?.remove();
   if (!pickMode) return;
@@ -75,6 +73,10 @@ function repaintPickBar() {
   bar.appendChild(el("span", "pickcount", "已选 " + picked.size + " 条"));
   const go = el("button", "btn primary", "批量算了");
   go.onclick = batchDrop;
+  // 删除与「算了」并排放：危险度差着量级，一红一主色并排，
+  // 人才不会把「批量删除」看成「批量算了」顺手点下去。
+  const del = el("button", "btn danger", "批量删除");
+  del.onclick = batchDelete;
   const all = el("button", "btn", "全选");
   all.onclick = () => {
     document.querySelectorAll(".card.clickable").forEach((c) => {
@@ -85,28 +87,55 @@ function repaintPickBar() {
   };
   const off = el("button", "btn", "退出选择");
   off.onclick = exitPickMode;
-  bar.appendChild(go); bar.appendChild(all); bar.appendChild(off);
+  bar.appendChild(go); bar.appendChild(del);
+  bar.appendChild(all); bar.appendChild(off);
   $("#root").insertBefore(bar, $("#root").firstChild);
 }
 
-async function batchDrop() {
+// 批量操作的共用骨架：发请求 → toast 汇总 → 清勾选重载。「算了」与「删除」
+// 在批量这一段完全同形，再抄一份只会给「以后加第三个批量」埋下漂移的伏笔。
+async function runBatch(path, payload) {
   if (!picked.size) { toast("先勾几条"); return; }
-  // 确认是必须的：勾选是临时的，drop 虽然可审计、终态也可逆
-  // （DROPPED → INBOX 合法），一把算掉几十条仍该让人停一秒。
-  if (!confirm("把这 " + picked.size + " 条标为「算了」？记录仍保留、可审计。")) return;
   try {
-    const r = await api("/api/tasks/drop", {
-      method: "POST",
+    const r = await api(path, { method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: [...picked], reason: "网页端批量算了" }),
-    });
-    toast(r.summary);
-    clearPick();
-    load(view);
+      body: JSON.stringify(payload) });
+    toast(r.summary); clearPick(); load(view);
   } catch (e) {
     // 保留勾选不清：失败时人想改一改再试，清掉等于让重新勾一遍。
-    toast("批量算了失败：" + e.message);
+    toast("批量操作失败：" + e.message);
   }
+}
+
+async function batchDrop() {
+  // drop 可审计、终态可逆（DROPPED → INBOX 合法），但一把算掉几十条仍该停一秒。
+  if (!confirm("把这 " + picked.size + " 条标为「算了」？记录仍保留、可审计。")) return;
+  await runBatch("/api/tasks/drop", { ids: [...picked], reason: "网页端批量算了" });
+}
+
+async function batchDelete() {
+  // 两道确认都过才发请求：删除不可恢复，一道 confirm 挡不住「顺手确定」。
+  if (!confirm("把这 " + picked.size + " 条事务彻底删除？记录与进度一起消失。")) return;
+  if (!confirm("这次删了找不回来。确定删掉 " + picked.size + " 条？")) return;
+  await runBatch("/api/tasks/delete", { ids: [...picked], confirmed: true });
+}
+
+// 详情页的单个删除：两道确认后调同一个批量端点（单条也是批量的一种，
+// 服务端逐条结果那套逻辑不必为「一条」单开一扇门）。
+function mountDelete(t) {
+  const b = el("button", "btn danger", "删除");
+  b.onclick = () => {
+    b.disabled = true;  // 删除后详情页随即失效，防连点
+    const cancel = () => { b.disabled = false; };
+    if (!confirm("彻底删除「" + t.title + "」？记录与进度一起消失。")) return cancel();
+    if (!confirm("这次删了找不回来。确定删除？")) return cancel();
+    api("/api/tasks/delete", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: [t.id], confirmed: true }) })
+      .then((r) => { toast(r.summary); load(view); },
+            (e) => { toast(e.message); b.disabled = false; });
+  };
+  return b;
 }
 
 async function api(path, opts) {

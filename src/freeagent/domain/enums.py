@@ -13,11 +13,13 @@ __all__ = [
     "TaskKind",
     "RecordType",
     "ArtifactStatus",
+    "CapturedStatus",
     "WaitingKind",
     "SortSignalCode",
     "SORT_SIGNAL_WEIGHTS",
     "STATE_LABELS",
     "KIND_LABELS",
+    "CAPTURED_STATUS_LABELS",
     "SIGNAL_LABELS",
 ]
 
@@ -105,6 +107,21 @@ class ArtifactStatus(str, Enum):
     SUPERSEDED = "superseded"
 
 
+class CapturedStatus(str, Enum):
+    """待处理收集器里一条捕获的生命周期（设计文档 11.18）。
+
+    **刻意与 ``TaskState`` 分开**：收集器里放的还不是事务 —— 它是「收下了
+    但还没澄清」的原材料。``pending`` 是唯一入口态；``clarified`` 意味着
+    「用户显式 /pending N 之后它变成了一条事务」，``dismissed`` 意味着
+    「用户明确说这条不要了」。两个终态都只由**用户显式动作**产生，
+    没有任何自动迁移 —— 自动澄清就等于替用户决定「这是什么」。
+    """
+
+    PENDING = "pending"
+    CLARIFIED = "clarified"
+    DISMISSED = "dismissed"
+
+
 class WaitingKind(str, Enum):
     """等候对象类型。"""
 
@@ -150,6 +167,12 @@ KIND_LABELS: dict[TaskKind, str] = {
     TaskKind.ACTION: "动作",
     TaskKind.WAIT: "等候",
     TaskKind.REMINDER: "提醒",
+}
+
+CAPTURED_STATUS_LABELS: dict[CapturedStatus, str] = {
+    CapturedStatus.PENDING: "待处理",
+    CapturedStatus.CLARIFIED: "已澄清",
+    CapturedStatus.DISMISSED: "已忽略",
 }
 
 SIGNAL_LABELS: dict[SortSignalCode, str] = {

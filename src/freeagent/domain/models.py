@@ -12,6 +12,7 @@ from datetime import date, datetime
 
 from .enums import (
     ArtifactStatus,
+    CapturedStatus,
     RecordType,
     SortSignalCode,
     TaskKind,
@@ -26,6 +27,7 @@ __all__ = [
     "Task",
     "TaskRecord",
     "Artifact",
+    "CapturedItem",
     "SortSignal",
     "ScoredTask",
     "RestoreView",
@@ -192,6 +194,9 @@ class TaskRecord:
     ts: datetime
     type: RecordType
     content: str
+    # 每任务单调递增（RecordRepo.append 取号）。缺省 None 是给存量构造点
+    # 留的兼容面：老记录（迁移回填前读出）没有它，排序会落到 ts 后面。
+    seq: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +216,38 @@ class Artifact:
     @property
     def is_editable(self) -> bool:
         return self.status is not ArtifactStatus.SUPERSEDED
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedItem:
+    """待处理收集器里的一条捕获（设计文档 11.18）。
+
+    **它不是事务**：这是本类型存在的全部理由。事务是「你承诺要做什么」，
+    而捕获只是「东西先进来了」—— 一张截图、一个文件、一条引用。
+    两者之间隔着一个**用户显式动作**（``/pending N`` 澄清），
+    没有自动迁移。混成一张表的代价见 11.18：排序会把没澄清的东西
+    算成承诺，而「它到底是什么」只有用户知道。
+
+    字段分工：
+
+    * ``media_key``：飞书侧的 key（``image_key`` / ``file_key``），
+      **重新下载的唯一凭据** —— 本地文件丢了还能捞回来；
+    * ``path``：本地落盘的路径。下载失败时是 ``.meta.json`` 引用文件，
+      此时 ``size`` 是消息里声称的大小、不是实测字节数；
+    * ``task_id``：澄清后指向生成的事务；未澄清为 ``None``。
+    """
+
+    id: str
+    source: str
+    kind: str
+    media_key: str
+    name: str
+    size: int
+    path: str
+    status: CapturedStatus
+    created_at: datetime
+    resolved_at: datetime | None = None
+    task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

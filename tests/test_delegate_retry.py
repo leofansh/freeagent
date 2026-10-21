@@ -395,10 +395,10 @@ class TestManualRedispatch:
         app = build_app(db, clock=FrozenClock(_dt(2026, 9, 30, 17)))
         app.record_repo.append(task.id, RecordType.DELEGATION_DISPATCHED,
                                "派出去了", app.clock.now())
-        # ⚠️ 必须**推进时钟**再落第二条：``list_for_task``按 ``ts ASC, id ASC``
-        # 排序，而 ``id`` 是随机的 —— 同一时刻的两条记录顺序**不确定**。
-        # 不推进的话这条测试是「有时过有时不过」，而那种 flaky 会被当成
-        # 偶发而不被追。
+        # ⚠️ 必须**推进时钟**再落第二条：``list_for_task``按 ``ts ASC, seq ASC``
+        # 排序（V1.37 起同刻由 seq 定序，不再依赖随机 id）—— 但测试要验的是
+        # 「时间上后来」这个语义，不是「同刻」，所以照样推进。那种年份里
+        # 「不推进就 flaky」的坑不再存在，时钟纪律照旧。
         app.clock.advance(seconds=1)
         app.record_repo.append(task.id, RecordType.DELEGATION_SUCCEEDED,
                                "做完了", app.clock.now())
@@ -448,10 +448,9 @@ class TestManualRedispatch:
 
         # 2) 人改好配置后要求重来。
         #    ⚠️ 先推进时钟：``reset_delegation`` 内部用 ``clock.now()``，
-        #    与上面那条 failed 会是同一刻。而 ``list_for_task`` 按
-        #    ``ts ASC, id ASC`` 排、``id`` 随机 —— 不推进就可能读到
-        #    「reset 在前、failed 在后」，于是又变回 refused，这条测试
-        #    就变成「有时过有时不过」。
+        #    与上面那条 failed 会是同一刻。V1.37 起同刻由 ``seq`` 定序、
+        #    读回顺序确定，不再随机 —— 但这里要验的是「后来重置」这个
+        #    **时间语义**，不是「同刻」，所以照样推进。
         app.clock.advance(seconds=1)
         app.tasks.reset_delegation(task.id, "白名单加好了")
         assert len(eligible_tasks(app.task_repo, app.record_repo)) == 1, (

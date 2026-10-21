@@ -108,6 +108,20 @@ def dispatch_post(
             app, parts[3], read_body()
         )
 
+    # 陈旧委派的恢复动作（12.11.1 / V1.39）：重新派发 / 放弃。
+    # 与上面三条同一条纪律：改状态的操作只走 POST，绝不挂 GET。
+    # 放在 ``approvals`` / ``questions`` 之后、``tasks`` 命名空间下，
+    # 与「待批项按 credential」的路径天然不相撞。
+    if (len(parts) == 5 and parts[:3] == ["api", "delegate", "tasks"]
+            and parts[4] in ("redispatch", "drop")):
+        if parts[4] == "redispatch":
+            return HTTPStatus.OK, endpoints_delegate_action.delegate_redispatch(
+                app, parts[3]
+            )
+        return HTTPStatus.OK, endpoints_delegate_action.delegate_drop(
+            app, parts[3]
+        )
+
     if len(parts) == 4 and parts[:2] == ["api", "services"]:
         # 后台服务统一控制（启停重启）。POST-only 的理由同旧飞书控制：
         # 能杀进程的操作不能挂在 GET 上。动作白名单在端点里。
@@ -149,6 +163,13 @@ def dispatch_post(
         # 前端连发 N 次单条：批量要有整体上限与逐条汇总
         # （见 endpoints_write.drop_tasks 的说明）。
         return HTTPStatus.OK, endpoints_write.drop_tasks(app, read_body())
+
+    if parts == ["api", "tasks", "delete"]:
+        # **批量硬删**（不可恢复）。与 /api/tasks/drop 对称：同样三段路径、
+        # 同样整体上限 + 逐条汇总。POST-only 的理由见 drop —— 删数据的
+        # 操作更不能挂在 GET 上。确认链是「前端两道 confirm → 端点只认
+        # confirmed 真布尔」（见 endpoints_write.delete_tasks）。
+        return HTTPStatus.OK, endpoints_write.delete_tasks(app, read_body())
 
     # 产物验收（2026-10-17）。刻意排在下面那个通用 `/api/task/<id>/<action>`
     # 分支**之前**：那里的动作名来自 ``STATE_ACTIONS``（状态迁移白名单），

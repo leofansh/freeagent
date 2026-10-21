@@ -9,12 +9,14 @@ import pytest
 from freeagent.app import App
 from freeagent.domain import (
     InvariantViolation,
+    RecordType,
     TaskKind,
     TaskState,
     ValidationError,
     WaitingKind,
     WaitingOn,
 )
+from freeagent.services.approval import ApprovalStore
 from freeagent.services.clock import FrozenClock
 from freeagent.services.tasks import ALLOWED_TRANSITIONS, validate_task
 
@@ -213,3 +215,87 @@ def test_drop_many_dedups_ids(app: App, roles):
     results = app.tasks.drop_many([t.id, t.id])
     assert len(results) == 1
     assert results[0].ok
+
+
+# =============================================================================
+# 硬删（V1.42）
+# =============================================================================
+def test_delete_removes_task_and_cascades(app: App, roles):
+    t = app.tasks.create("删我", [roles["work"].id])
+    app.record_repo.append(t.id, RecordType.NOTE, "留痕", app.clock.now())
+    app.conn.execute(
+        "INSERT OR REPLACE INTO delegate_progress (task_id, status, updated_at) "
+        "VALUES (?, 'running', ?)", (t.id, app.clock.now().isoformat()),
+    )
+    app.conn.commit()
+
+    snap = app.tasks.delete_task(t.id)
+    assert snap.title == "删我"
+    assert app.task_repo.find(t.id) is None
+    assert app.record_repo.list_for_task(t.id) == []
+    assert app.conn.execute(
+        "SELECT COUNT(*) FROM task_roles WHERE task_id=?", (t.id,)
+    ).fetchone()[0] == 0
+    assert app.conn.execute(
+        "SELECT COUNT(*) FROM delegate_progress WHERE task_id=?", (t.id,)
+    ).fetchone()[0] == 0
+
+
+def test_delete_returns_snapshot(app: App, roles):
+    t = app.tasks.create("快照", [roles["work"].id])
+    snap = app.tasks.delete_task(t.id)
+    assert snap.id == t.id
+    assert snap.state is TaskState.INBOX
+
+
+def test_delete_missing_raises(app: App):
+    with pytest.raises(Exception) as exc:
+        app.tasks.delete_task("no-such-task-id")
+    assert "不存在" in str(exc.value)
+
+
+def test_delete_refuses_while_in_flight(app: App, roles):
+    t = app.tasks.create("跑着的", [roles["work"].id])
+    app.record_repo.append(
+        t.id, RecordType.DELEGATION_DISPATCHED, "派出去了", app.clock.now(),
+    )
+    with pytest.raises(ValidationError) as exc:
+        app.tasks.delete_task(t.id)
+    assert "正在跑" in str(exc.value)
+    assert app.task_repo.get(t.id).title == "跑着的"
+
+
+def test_delete_refuses_with_pending_approval(app: App, roles):
+    t = app.tasks.create("有待批的", [roles["work"].id])
+    store = ApprovalStore(app.conn, clock=app.clock.now)
+    store.ask("允许 edit x", task_id=t.id)
+    with pytest.raises(ValidationError) as exc:
+        app.tasks.delete_task(t.id)
+    assert "待批" in str(exc.value)
+    assert app.task_repo.get(t.id).title == "有待批的"
+
+
+def test_delete_many_mixed(app: App, roles):
+    good = app.tasks.create("好的", [roles["work"].id])
+    other = app.tasks.create("其它", [roles["work"].id])
+    app.record_repo.append(other.id, RecordType.DELEGATION_DISPATCHED, "派", app.clock.now())
+    results = app.tasks.delete_many([good.id, other.id, good.id, "ghost"])
+    assert [r.ok for r in results] == [True, False, False]
+    assert results[1].reason and "正在跑" in results[1].reason
+    assert "不存在" in results[2].reason
+    assert app.task_repo.find(good.id) is None
+
+
+def test_tasks_module_does_not_import_approval_store():
+    import re
+    with open("src/freeagent/services/tasks.py", encoding="utf-8") as f:
+        src = f.read()
+    # 服务层不得 import ApprovalStore（防循环依赖复活）；注释里提名字不算。
+    code_lines = [ln for ln in src.splitlines()
+                  if not ln.lstrip().startswith("#") and '"""' not in ln]
+    joined = "\n".join(code_lines)
+    assert "ApprovalStore" not in joined, "tasks 不得依赖 approval 模块"
+
+
+def test_app_wires_has_pending(app: App):
+    assert app.tasks._has_pending is not None

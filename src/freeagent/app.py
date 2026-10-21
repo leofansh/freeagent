@@ -13,20 +13,31 @@ from typing import Any
 
 from .config import Config, load_config
 from .services.artifacts import ArtifactService
+from .services.approval import ApprovalStore
 from .services.capability import CapabilityRouter, CapabilityView
 from .services.chat import ChatService
 from .services.clock import Clock, SystemClock
 from .services.knowledge import KnowledgeService
+from .services.memory import MemoryService
 from .services.llm import LLMProvider, build_provider
 from .services.llm.vision import VisionProvider
-from .services.reminders import ReminderEngine
+from .services.pending import PendingService
+from .services.reminders import QuietHours, ReminderEngine
 from .services.restore import RestoreService
 from .services.roles import RoleService
 from .services.sorting import EnergyWindows
 from .services.tasks import TaskService
 from .services.today import TodayService
+from .services.week import WeekService
+from .services.personal_model import PersonalModelService
 from .storage.db import connect, migrate, resolve_db_path
-from .storage.repos import ArtifactRepo, RecordRepo, RoleRepo, TaskRepo
+from .storage.repos import (
+    ArtifactRepo,
+    CapturedRepo,
+    RecordRepo,
+    RoleRepo,
+    TaskRepo,
+)
 
 __all__ = ["App", "build_app"]
 
@@ -46,6 +57,11 @@ class App:
     tasks: TaskService
     artifacts: ArtifactService
     today: TodayService
+    week: WeekService
+    personal_model: PersonalModelService
+    #: 待处理收集器（11.18）。捕获侧（飞书）与澄清侧（/pending）共用这一个
+    #: 服务层与同一写入口 —— 不许为第二个通道复制逻辑（12.1.1）。
+    pending: PendingService
     restore: RestoreService
     reminders: ReminderEngine
 
@@ -53,11 +69,16 @@ class App:
     #: 角色脉络知识。检索结果**自带来源说明**（关键词命中 / 近期回落 / 被截断）——
     #: 见 :class:`~freeagent.services.knowledge.RetrievalResult`。
     knowledge: KnowledgeService
+    #: core 记忆（3.7）。跨角色的偏好 / 约定 / 修正，检索同样**自带来源**。
+    memory: MemoryService
     task_repo: TaskRepo
     role_repo: RoleRepo
     record_repo: RecordRepo
     artifact_repo: ArtifactRepo
     energy_windows: EnergyWindows | None
+    #: 安静窗口（9.8）。``None`` = 不启用。与 ``energy_windows`` **并列而不嵌套**——
+    #: 见 :class:`~freeagent.config.Config` 与设计文档 9.8 的「为什么不复用」。
+    quiet_hours: QuietHours | None = None
     config: Config | None = None
     #: 视觉能力。**没配 Key 时是 None** —— 那就是「没有这个能力」，
     #: 不是「有个能力返回失败」。界面据此直接说清原因，不假装试过了。
@@ -95,6 +116,8 @@ class App:
         self.llm = build_provider(config)
         self.energy_windows = config.energy_windows
         self.today.set_energy_windows(config.energy_windows)
+        self.quiet_hours = config.quiet_hours
+        self.reminders.set_quiet_hours(config.quiet_hours)
 
     def close(self) -> None:
         self.conn.close()
@@ -181,6 +204,7 @@ def build_app(
     llm: LLMProvider | None = None,
     vision: VisionProvider | None = None,
     energy_windows: EnergyWindows | None = None,
+    quiet_hours: QuietHours | None = None,
     config: Config | None = None,
 ) -> App:
     """建库并组装服务。``db_path`` 为空时按 ``FREEAGENT_HOME`` 解析。
@@ -212,28 +236,60 @@ def build_app(
     the_config = config
     if energy_windows is None and the_config is not None:
         energy_windows = the_config.energy_windows
+    if quiet_hours is None and the_config is not None:
+        quiet_hours = the_config.quiet_hours
     the_llm = llm if llm is not None else build_provider(the_config)
 
     task_repo = TaskRepo(conn)
     role_repo = RoleRepo(conn)
     record_repo = RecordRepo(conn)
     artifact_repo = ArtifactRepo(conn)
+    captured_repo = CapturedRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
-    task_service = TaskService(task_repo, record_repo, the_clock)
+    # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
+    # （未决、未过期、提问要答完）全在 ApprovalStore.pending_for_web 里，
+    # 这里不再写第二份。TaskService 只删事务，不直接依赖那边的 store。
+    def _has_pending(task_id: str) -> bool:
+        store = ApprovalStore(conn, clock=the_clock.now)
+        return any(p.task_id == task_id for p in store.pending_for_web())
+
+    task_service = TaskService(
+        task_repo, record_repo, the_clock, has_pending=_has_pending
+    )
     artifact_service = ArtifactService(
         artifact_repo, task_repo, record_repo, the_clock
     )
     today_service = TodayService(
         task_repo, record_repo, the_clock, energy_windows=energy_windows
     )
+    # 周回顾复用今天视图的顺延实现（不复制）。见 services/week.py 模块文档。
+    week_service = WeekService(
+        task_repo, record_repo, the_clock, today=today_service
+    )
+    # 连续性个人模型（11.17）：纯只读聚合，复用既有的 TaskRepo / RecordRepo，
+    # 不建表、不写库。role_repo 用于把 role_id 翻成名字（活跃度展示用）。
+    personal_model_service = PersonalModelService(
+        task_repo, record_repo, the_clock, role_repo=role_repo
+    )
+    # 待处理收集器（11.18）。澄清要建事务，所以它拿 TaskService（唯一写入口）
+    # 与 RoleService（默认脉络）；不自己拼 INSERT —— 一份能力一份实现。
+    pending_service = PendingService(
+        captured_repo, task_service, role_service, the_clock
+    )
     restore_service = RestoreService(
         task_service, artifact_service, record_repo, role_service, the_clock
     )
-    reminder_engine = ReminderEngine(task_repo, record_repo, the_clock)
+    reminder_engine = ReminderEngine(
+        task_repo, record_repo, the_clock, quiet_hours=quiet_hours
+    )
     # 角色知识只需要连接与角色仓储（要校验 role_id 存在），不碰任务仓储 ——
     # 知识是**角色的**，不是事务的。
     knowledge_service = KnowledgeService(conn, role_repo, the_clock)
+    # 记忆（3.7）与角色知识**共用同一套检索机制**（bigram + BM25 + tail +
+    # 来源自报），但作用域不同：知识按角色，记忆分 global / role:<id>。
+    # 同样只需要连接与角色仓储（role:<id> 要校验角色存在）。
+    memory_service = MemoryService(conn, role_repo, the_clock)
     chat_service = ChatService(
         task_service, task_repo, role_service, restore_service,
         today_service, the_clock, the_llm,
@@ -268,15 +324,20 @@ def build_app(
         tasks=task_service,
         artifacts=artifact_service,
         today=today_service,
+        week=week_service,
+        personal_model=personal_model_service,
+        pending=pending_service,
         restore=restore_service,
         reminders=reminder_engine,
         chat=chat_service,
         knowledge=knowledge_service,
+        memory=memory_service,
         task_repo=task_repo,
         role_repo=role_repo,
         record_repo=record_repo,
         artifact_repo=artifact_repo,
         energy_windows=energy_windows,
+        quiet_hours=quiet_hours,
         config=the_config,
         vision=vision,
     )

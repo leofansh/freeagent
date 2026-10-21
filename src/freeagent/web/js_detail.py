@@ -1,7 +1,4 @@
-"""角色视图与事务详情页。
-
-
-"""
+"""角色视图与事务详情页。"""
 
 from __future__ import annotations
 
@@ -131,6 +128,7 @@ function renderTask(data) {
       (t.reminder_time ? '<span class="meta">提醒 ' + when(t.reminder_time) + "</span>" : "") +
     "</div>";
   head.appendChild(actionBar(data));
+  head.appendChild(mountDelete(t));  // 不可恢复：两道确认在按钮里（js_core）
   root.appendChild(head);
 
   const dl = el("div", "card");

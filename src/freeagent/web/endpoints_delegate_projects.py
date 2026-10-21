@@ -19,6 +19,14 @@
 
 理由同 12.7：浏览器预取、爬虫、`<img src>` 都会自动发 GET，能改权限的
 操作绝不能挂在这种方法上。
+
+## 为什么列表是「三源并集」（12.7.1.1）
+
+候选有三个来源：OpenCode 注册表、**白名单里注册表不知道的**（手加的，
+或项目已从 OpenCode 删除）、**可授权根点选**（picker）。只给第一个的
+后果：手加的白名单行在界面上只是一行文字 —— 看得见、**撤不掉**，最该
+清理的死配置反而没有清理入口。所以每行都带 ``source`` 说明它为什么
+在这儿，且三种来源的行都有同一个撤销/允许按钮。
 """
 
 from __future__ import annotations
@@ -30,7 +38,8 @@ from typing import Any
 from ..app import App
 from ..config import load_config, save_config
 from ..domain import FreeAgentError
-from ..services.opencode_projects import list_projects, resolve
+from ..services.delegate_browse import pick_from_body
+from ..services.opencode_projects import _basename, list_projects, resolve
 from .endpoints_feishu import state_home_for
 
 __all__ = ["delegate_projects", "delegate_projects_save"]
@@ -68,9 +77,24 @@ def delegate_projects(app: App) -> dict[str, Any]:
             "path": p.worktree,
             "allowed": p.worktree.replace("\\", "/").rstrip("/").casefold()
             in allowed,
+            "source": "opencode",
         }
         for p in projects
     ]
+
+    # 三源并集之二：白名单里 OpenCode 不知道的（12.7.1.1）。它们以前只在
+    # 下面当一行纯文本 —— 看得见、撤不掉；进 items 后才有撤销按钮。
+    # 刻意**不改 opencode_found**：那个字段说的是「注册表查没查到」，
+    # 与白名单里有什么无关，混在一起会让界面报错时说不清是哪一环坏了。
+    registry = {_norm(p.worktree) for p in projects}
+    for path in cfg.delegate_projects:
+        if _norm(path) in registry:
+            continue  # 注册表行已列过，不再产生第二行
+        disp = path.replace("\\", "/").rstrip("/")
+        name = _basename(path) or disp
+        # 白名单行按定义就是已授权的；进 items 是为了有撤销按钮（12.7.1.1）
+        items.append({"name": name, "key": name.casefold(), "path": disp,
+                      "allowed": True, "source": "whitelist"})
 
     return {
         "kind": "delegate_projects",
@@ -82,6 +106,12 @@ def delegate_projects(app: App) -> dict[str, Any]:
         "whitelist": sorted(
             p.replace("\\", "/").rstrip("/") for p in cfg.delegate_projects
         ),
+        # 三源之一的原料（picker 的范围）。空数组 = 浏览关闭，界面据此
+        # 整段不显示 —— 「没配」不是错误，是默认朝关的设计。统一成正斜杠
+        # 回显，理由同上：同一条路径两种写法会被看成两条。
+        "browse_roots": [
+            p.replace("\\", "/").rstrip("/") for p in cfg.delegate_browse_roots
+        ],
     }
 
 
@@ -120,7 +150,14 @@ def _add(cfg, path: str):
 def _revoke(cfg, name: str, projects):
     """撤销授权。返回 ``(新配置, 是否真的删掉了)``。
 
-    ## 先按名字解析成路径，再比路径
+    ## 第一优先：按**精确路径**匹配
+
+    界面按行回传的是 ``item.path`` —— 白名单行（source=whitelist）在
+    OpenCode 里查不到名字，走名字解析会落到 basename 兜底，而兜底是
+    **按目录名比对**：两条不同路径只要末段同名就会删错行。所以路径
+    相等先短路。
+
+    ## 然后按名字解析成路径，再比路径
 
     第一版直接拿 ``name`` 去比白名单里的**路径**，于是永远不相等 ——
     名字（``OpenMOS``）和路径（``D:/.../openmos``）根本不是一回事。
@@ -134,8 +171,11 @@ def _revoke(cfg, name: str, projects):
     """
     from ..services.opencode_projects import _basename
 
-    hit = resolve(name, projects)
     before = cfg.delegate_projects
+    if any(_norm(p) == _norm(name) for p in before):
+        kept = tuple(p for p in before if _norm(p) != _norm(name))
+        return replace(cfg, delegate_projects=kept), len(kept) != len(before)
+    hit = resolve(name, projects)
     if hit is not None:
         path_key = _norm(hit.worktree)
         kept = tuple(p for p in before if _norm(p) != path_key)
@@ -152,23 +192,40 @@ def delegate_projects_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
     「保存成功但回显的还是旧值」这种时序不一致（与
     :func:`feishu_config_save` 同一条理由）。
     """
-    unknown = sorted(set(body) - {"allow", "revoke"})
+    unknown = sorted(set(body) - {"allow", "revoke", "allow_pick"})
     if unknown:
         raise FreeAgentError(
-            f"不认识这些字段：{', '.join(unknown)}。只支持 allow / revoke。"
+            f"不认识这些字段：{', '.join(unknown)}。"
+            "只支持 allow / revoke / allow_pick。"
         )
 
     allow = body.get("allow")
     revoke = body.get("revoke")
-    if allow and revoke:
-        raise FreeAgentError("一次只能改一个项目（allow 与 revoke 不能同时给）")
-    if not allow and not revoke:
-        raise FreeAgentError("要给出 allow（项目名）或 revoke（项目名）")
+    pick = body.get("allow_pick")
+    # 三个动作互斥且恰好给一个。空值（""/null/空对象）不算「给了」——
+    # 与旧语义一致：「给了但没值」按「没给」处理，报缺字段而不是走过场。
+    if sum(1 for v in (allow, revoke, pick) if v) > 1:
+        raise FreeAgentError(
+            "一次只能改一个项目（allow / revoke / allow_pick 只能给一个）"
+        )
+    if not (allow or revoke or pick):
+        raise FreeAgentError(
+            "要给出 allow（项目名）、revoke（项目名或路径）"
+            "或 allow_pick（{root, path}）"
+        )
 
     home = state_home_for(app)
     cfg = load_config(home)
 
-    if allow:
+    if pick:
+        # 约束 5：载荷与路径校验都在 services.delegate_browse（与 GET
+        # browse 同一道边界），这里只做「解析 → 写白名单」的接线。
+        target = pick_from_body(cfg.delegate_browse_roots, pick)
+        cfg, changed = _add(cfg, target)
+        if not changed:
+            raise FreeAgentError(f"{target} 已经在白名单里了")
+        save_config(cfg, home)
+    elif allow:
         if not isinstance(allow, str):
             raise FreeAgentError("allow 必须是项目名字符串")
         hit = resolve(allow, list_projects())

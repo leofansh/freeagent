@@ -13,7 +13,7 @@ import pytest
 
 from freeagent.app import App
 from freeagent.cli.app import KIND_ALIASES, Repl
-from freeagent.domain import ArtifactStatus, TaskKind, TaskState, WaitingKind
+from freeagent.domain import ArtifactStatus, RecordType, TaskKind, TaskState, WaitingKind
 from freeagent.services.sorting import DISCLAIMER_MARKER
 
 
@@ -517,3 +517,34 @@ class TestHelpSurface:
             instance = Repl(app, out=io.StringIO())
             instance.handle(cmd)
             assert "用法" in instance.out.getvalue(), f"{cmd} 未给用法提示"
+# =============================================================================
+# 事务硬删（V1.42）
+# =============================================================================
+class TestTaskDeleteCLI:
+    def test_first_call_only_warns(self, app, roles, repl):
+        t = app.tasks.create("CLI删", [roles["work"].id])
+        out = _run(repl, f"/task-del {t.id[:8]}")
+        assert "彻底删除" in out
+        assert "confirm" in out
+        assert app.task_repo.get(t.id).title == "CLI删"
+
+    def test_second_call_with_confirm_deletes(self, app, roles, repl):
+        t = app.tasks.create("CLI删2", [roles["work"].id])
+        out = _run(repl, f"/task-del {t.id[:8]} confirm")
+        assert "已删除" in out
+        assert app.task_repo.find(t.id) is None
+
+    def test_missing_arg_shows_usage(self, repl):
+        repl.handle("/task-del")
+        assert "用法" in repl.out.getvalue()
+
+    def test_unknown_id_says_not_found(self, repl):
+        out = _run(repl, "/task-del ghost-id confirm")
+        assert "找不到" in out
+
+    def test_in_flight_blocked(self, app, roles, repl):
+        t = app.tasks.create("CLI跑着", [roles["work"].id])
+        app.record_repo.append(t.id, RecordType.DELEGATION_DISPATCHED, "派", app.clock.now())
+        out = _run(repl, f"/task-del {t.id[:8]} confirm")
+        assert "正在跑" in out
+        assert app.task_repo.get(t.id).title == "CLI跑着"

@@ -18,7 +18,7 @@ from http.client import HTTPConnection
 import pytest
 
 from freeagent.app import App, build_app
-from freeagent.domain import TaskKind, WaitingKind, WaitingOn
+from freeagent.domain import RecordType, TaskKind, WaitingKind, WaitingOn
 from freeagent.services.clock import FrozenClock
 from freeagent.services.sorting import DISCLAIMER_MARKER
 from freeagent.web.server import create_server
@@ -492,6 +492,68 @@ class TestBatchDrop:
         post(served[0], "/api/tasks/drop", {"ids": [t.id]})
         types = [r.type.value for r in seeded.record_repo.list_for_task(t.id)]
         assert "status_change" in types
+
+
+class TestBatchDelete:
+    """批量硬删端点：全成、部分失败、confirmed 闸门、上限。"""
+
+    def test_all_success(self, served, seeded):
+        work = seeded.roles.get_by_name("工作项目A")
+        a = seeded.tasks.create("删甲", [work.id])
+        b = seeded.tasks.create("删乙", [work.id])
+        status, data = post(served[0], "/api/tasks/delete",
+                            {"ids": [a.id, b.id], "confirmed": True})
+        assert status == 200
+        assert data["deleted"] == 2
+        assert data["failed"] == []
+        for t in (a, b):
+            assert seeded.task_repo.find(t.id) is None
+
+    def test_partial_failure_reports_reason(self, served, seeded):
+        work = seeded.roles.get_by_name("工作项目A")
+        good = seeded.tasks.create("好的", [work.id])
+        status, data = post(
+            served[0], "/api/tasks/delete",
+            {"ids": [good.id, "ghost-id"], "confirmed": True},
+        )
+        assert status == 200
+        assert data["deleted"] == 1
+        assert len(data["failed"]) == 1
+        assert data["failed"][0]["reason"]
+        assert seeded.task_repo.find(good.id) is None
+
+    def test_requires_confirmed_true(self, served, seeded):
+        work = seeded.roles.get_by_name("工作项目A")
+        t = seeded.tasks.create("待删", [work.id])
+        status, data = post(served[0], "/api/tasks/delete", {"ids": [t.id]})
+        assert status == 400 and "confirmed" in data["error"]
+        status, data = post(served[0], "/api/tasks/delete",
+                            {"ids": [t.id], "confirmed": "true"})
+        assert status == 400
+        assert seeded.task_repo.get(t.id).title == "待删"
+
+    def test_empty_ids_rejected(self, served, seeded):
+        status, data = post(served[0], "/api/tasks/delete",
+                            {"ids": [], "confirmed": True})
+        assert status == 400 and "ids" in data["error"]
+
+    def test_over_limit_rejected(self, served, seeded):
+        from freeagent.web.endpoints_write import MAX_BATCH_DELETE
+        work = seeded.roles.get_by_name("工作项目A")
+        t = seeded.tasks.create("占位", [work.id])
+        status, data = post(served[0], "/api/tasks/delete",
+                            {"ids": [t.id] * (MAX_BATCH_DELETE + 1), "confirmed": True})
+        assert status == 400 and "最多" in data["error"]
+
+    def test_rejects_in_flight_per_item(self, served, seeded):
+        work = seeded.roles.get_by_name("工作项目A")
+        t = seeded.tasks.create("跑着", [work.id])
+        seeded.record_repo.append(t.id, RecordType.DELEGATION_DISPATCHED, "派", seeded.clock.now())
+        status, data = post(served[0], "/api/tasks/delete",
+                            {"ids": [t.id], "confirmed": True})
+        assert status == 200
+        assert data["deleted"] == 0
+        assert data["failed"] and "正在跑" in data["failed"][0]["reason"]
 
 
 class TestFactoryResetEndpoint:

@@ -29,14 +29,18 @@ from typing import Callable, Sequence
 
 from ..domain import FreeAgentError, RecordType, Task
 from ..domain.models import Task as DomainTask
+from ..domain.models import TaskRecord
 
 __all__ = [
     "DelegationPolicy",
     "DelegationRequest",
     "DispatchOutcome",
+    "PROJECTION_STALE_SECONDS",
     "check_project_allowed",
     "build_brief",
+    "failure_history_line",
     "parse_opencode_output",
+    "projection_age_seconds",
     "eligible_tasks",
     "already_dispatched",
 ]
@@ -342,6 +346,32 @@ def already_dispatched(records: Sequence) -> bool:
     return last != "failed"
 
 
+# -- 进度投影的陈旧口径（12.8 / 12.11.1 共用）-------------------------------- #
+#
+# 为什么住在这里而不是 web 包：执行器（:mod:`freeagent.delegate`）启动时要
+# 用同一个阈值判「这条委派是不是没人续上」，而执行器 import web 层会把
+# 「怎么画界面」倒灌进执行链路（12.3 分层纪律）。阈值与判定只有**一份**：
+# 谁抄一份，早晚漂移成「执行器认领了、WEB 面板还当它在跑」两说。
+
+#: 进度多久没更新就算「疑似卡住」（秒）。取 60 的理由见 WEB 实时面板
+#: （``endpoints_delegate_live``）的模块说明：30 秒会把「正在想」说成卡住。
+PROJECTION_STALE_SECONDS = 60
+
+
+def projection_age_seconds(updated_at: str, now: datetime) -> float:
+    """投影的年龄（秒）。**解析失败返回无穷大**。
+
+    坏时间戳的唯一合理读法是「这条早就不动了」——按陈旧处理：
+    宁可把没误说成卡住（那只多一条提示），也不许把死了的说成在跑
+    （那会让等通知的人永远等下去）。12.11.1 恢复扫描与 WEB 面板
+    用的是同一份函数，两处**不许**再各写一个 try/except。
+    """
+    try:
+        return (now - datetime.fromisoformat(updated_at)).total_seconds()
+    except (ValueError, TypeError):
+        return float("inf")
+
+
 def eligible_tasks(repo, records_repo) -> list[Task]:
     """够格被派发的事务。
 
@@ -376,7 +406,49 @@ def one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
-def build_brief(task: DomainTask, intent: str | None, dod: str | None) -> str:
+def failure_history_line(records: Sequence[TaskRecord]) -> str:
+    """把本任务的历史错因折成**一段单行**；没有执行期失败就返回空串。
+
+    设计文档 12.10.7 / V1.38。三条纪律：
+
+    * **复用唯一那份推导**（12.1.1 / 12.10.5）：结局判定走
+      :func:`~freeagent.services.feedback.read_outcome`，它又复用
+      ``attempt_state``。在这里另写一份「是不是失败过」，一旦和履历
+      判定漂移，「简报说失败过」与「/feedback 说没跑过」就会打架。
+    * **只摆事实**，不带「建议/注意」类指令（12.10.2 末条：指令类语
+      是自动决策的前一步 —— 上层读到一个「建议」，要么自动照办
+      要么被无视，两头都坏）。
+    * **必须单行**（``build_brief`` 的实测硬约束），所以段内文本
+      照样过 :func:`one_line`。
+
+    refused（派发前被拒）与 never 不算「踩过坑」—— 连执行都没进过，
+    回给执行者是「上次那条被拒绝了」这种执行者无法行动的信息。
+    """
+    # 局部导入：feedback 模块顶层 `from .delegate import attempt_state`，
+    # 这里若顶层反向导入，两个模块的加载顺序就互相咬住（实测顶层导入
+    # 直接 ImportError）。绕开的成本是两行缩进，换来的是判定只有一份。
+    from .feedback import read_outcome
+
+    outcome = read_outcome(records)
+    if outcome.outcome != "failed":
+        return ""
+    failures = sum(
+        1 for r in records if r.type is RecordType.DELEGATION_FAILED
+    )
+    bits = ["这条任务是重派，上次执行失败"]
+    if outcome.reason:
+        bits.append(f"上次错因：{outcome.reason}")
+    if failures > 1:
+        bits.append(f"累计失败 {failures} 次")
+    return one_line("历史记录：" + "；".join(bits))
+
+
+def build_brief(
+    task: DomainTask,
+    intent: str | None,
+    dod: str | None,
+    records: Sequence[TaskRecord] = (),
+) -> str:
     """给 opencode 的需求简报。**必须是单行**。
 
     踩过的坑（实测，opencode 1.18.31）：提示里**只要有一个换行符**，
@@ -395,12 +467,20 @@ def build_brief(task: DomainTask, intent: str | None, dod: str | None) -> str:
 
     所以「格式好看」和「能跑」在这里是冲突的，**能跑优先**：
     刻意不用 ``#`` / ``##`` / ``-`` 那套 markdown 排版。
+
+    ``records``（可选，V1.38）：本任务的 ``task_records``。有执行期失败
+    历史时，简报末尾追加一段**单行**错因事实（12.10.7）——
+    上层存在的意义就是从下层的结果里学到东西，而简报是回流的最短路径。
+    没历史就整段缺席，一个字不占。
     """
     bits = [f"在当前项目目录里完成：{one_line(task.title)}"]
     if intent:
         bits.append(one_line(intent))
     if dod:
         bits.append(f"做到什么程度算完：{one_line(dod)}")
+    history = failure_history_line(records)
+    if history:
+        bits.append(history)
     bits.append("只在这个项目目录内改动，不要动目录外的文件")
     bits.append("改完跑一遍项目自带的测试（若有）")
     bits.append("用中文说清你改了什么、为什么这么改")

@@ -148,3 +148,76 @@ def test_wipe_is_idempotent(tmp_path, monkeypatch) -> None:
     conn.close()
     counts = wipe_transaction_data(db)
     assert all(v == 0 for v in counts.values())
+
+
+# =============================================================================
+# 每日滚动备份（12.11.2 / V1.39）
+# =============================================================================
+import datetime  # noqa: E402  - 与上面 import 区分开，本节归属 V1.39
+
+from freeagent.services.reset import (  # noqa: E402
+    daily_backup,
+    last_daily_backup,
+)
+
+D1 = datetime.date(2026, 10, 17)
+
+
+class TestDailyBackup:
+    def test_runs_once_per_day_then_skips(self, tmp_path):
+        db = tmp_path / "c.db"
+        first = daily_backup(db, today=D1)
+        assert first is not None and first.is_file()
+        # 同日第二笔：跳过 —— 连新文件都不该出（哪怕时间戳不同）。
+        assert daily_backup(db, today=D1) is None
+        assert [d.is_file() for d in tmp_path.glob("c.db.bak-daily-*")] == [True]
+
+    def test_next_day_runs_again(self, tmp_path):
+        db = tmp_path / "c.db"
+        daily_backup(db, today=D1)
+        second = daily_backup(db, today=D1 + datetime.timedelta(days=1))
+        assert second is not None
+        assert {d.stat().st_size > 0 for d in tmp_path.glob("c.db.bak-daily-*")} == {True}
+
+    def test_keeps_seven_but_older_backups_untouched(self, tmp_path):
+        """标签独立：bak-factory 与 bak-daily 互不采信，也不互删。"""
+        import datetime as dt
+
+        db = tmp_path / "c.db"
+        base = dt.date(2026, 10, 1)
+        for i in range(9):
+            assert daily_backup(db, today=base + dt.timedelta(days=i)) is not None
+        dailies = sorted(tmp_path.glob("c.db.bak-daily-*"))
+        assert len(dailies) == 7, "只留最近 7 份"
+        # 被滚掉的是最早的，留下的最新日期齐全。
+        assert "20261001" not in dailies[0].name
+        assert "20261009" in dailies[-1].name
+        # 老的出厂备份兄弟文件不该被日备份逻辑碰到 —— 滚动删除只识
+        # 自己的标签，别的标签不是它的账本。（这句是本测试**监护的目的**，
+        # 断言真做出来；隔壁 test_daily_and_factory_* 验的是「判定互不采信」，
+        # 这里验的是「滚动不误删」。）
+        assert daily_backup(db, today=D1) is not None
+        assert len(list(tmp_path.glob("c.db.bak-factory-*"))) == 0
+
+    def test_daily_and_factory_tags_do_not_interfere(self, tmp_path):
+        db = tmp_path / "c.db"
+        daily_backup(db, today=D1)
+        backup_database(db)  # 出厂口径的备份
+        assert daily_backup(db, today=D1) is None, "同日判定只看 daily 标签"
+        assert len(list(tmp_path.glob("c.db.bak-daily-*"))) == 1
+        assert len(list(tmp_path.glob("c.db.bak-factory-*"))) == 1
+
+    def test_failures_do_not_raise(self, tmp_path):
+        """备份失败只记日志不阻断 —— 兜底姿态，不是没退路前的那种硬闸。"""
+        db = tmp_path / "c.db"
+        db.write_text("not a database")
+        # sqlite3 会在这个文件上炸「file is not a database」—— 但调用方
+        # 不该收到异常。
+        assert daily_backup(db, today=D1) is None
+
+    def test_last_daily_backup_readable(self, tmp_path):
+        db = tmp_path / "c.db"
+        assert last_daily_backup(db) is None, "没备过就该 None，显示侧别猜"
+        daily_backup(db, today=D1)
+        got = last_daily_backup(db)
+        assert got is not None and got.date() == D1

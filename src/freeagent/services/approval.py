@@ -768,6 +768,40 @@ class ApprovalStore:
         )
         self._conn.commit()
 
+    def card_message_ids_for_task(self, task_id: str) -> tuple[str, ...]:
+        """这条委派**已发出去**的全部卡片消息 id（授权卡 + 提问卡）。
+
+        服务对象只有一个：:func:`freeagent.delegate._retire_settled_cards`
+        （V1.41 滚动瘦身）—— 发下一张卡之前把已定案的旧卡从聊天里撤掉。
+        所以这里**刻意不发一个通用的「按 task 列记录」口子**：那会引来
+        第二个调用方，而第二个调用方要的是结论（decided_by / decision），
+        不是消息 id —— 口子一多，谁在写谁在撤就说不清了。
+
+        ## 为什么「包含还没定案的行」是安全的
+
+        判据是**时序**而不是状态列：`open_message_id` 在**发卡之后**才
+        落（:meth:`record_card`），而撤回只发生在**发下一张卡之前**和
+        收尾两处 —— 那两个时刻，执行循环是**串行**的（前一张必然已经
+        等到了结论，本张还没发出去、还没记 id），所以查出来的 id 全部
+        属于已定案的卡。当前挂起的卡**永远不在结果里**，不需要再查
+        `decision IS NOT NULL` 来保险 —— 状态列反而会骗人（提问行靠
+        `answer_text` 判已答，授权行才看 decision，两套判据混一条 SQL
+        就会漂）。
+
+        **空任务号返回空**——不归属任何委派的行（task_id 为 NULL，
+        终端/本地操作）与「没归属」是同一件事，一视同仁。
+        """
+        if not task_id:
+            return ()
+        rows = self._conn.execute(
+            "SELECT open_message_id FROM pending_approvals"
+            " WHERE task_id = ? AND open_message_id IS NOT NULL"
+            " AND open_message_id != ''"
+            " ORDER BY asked_at ASC",
+            (task_id,),
+        ).fetchall()
+        return tuple(row["open_message_id"] for row in rows)
+
     def resolve(
         self, credential: str, decision: Decision, *, decided_by: str | None = None
     ) -> bool:

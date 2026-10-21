@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import timedelta
 
 from ..domain import RecordType, RestoreView, Role, ScoredTask, Task
 from ..services.llm import SignalRef, TaskRef
 from ..services.reminders import ReminderDigest
 from ..services.sorting import DISCLAIMER_MARKER
 from ..services.today import TodayView
+from ..services.week import WeekView
 
 __all__ = [
     "DISCLAIMER",
@@ -23,6 +25,8 @@ __all__ = [
     "render_roles",
     "render_role_detail",
     "render_all",
+    "render_week",
+    "render_pending",
     "render_digest",
     "render_suggestion",
     "render_artifact",
@@ -63,7 +67,9 @@ def _one_line(index: int, scored: ScoredTask, names: dict[str, str]) -> str:
     return f"{head}\n     {meta}  [{scored.total_weight} 分]  {_signal_text(scored)}"
 
 
-def render_today(view: TodayView, names: dict[str, str]) -> str:
+def render_today(
+    view: TodayView, names: dict[str, str], *, pending_count: int = 0
+) -> str:
     summary = view.rollover.summary()
     rolled = view.rolled_over_ids
     lines: list[str] = []
@@ -73,7 +79,7 @@ def render_today(view: TodayView, names: dict[str, str]) -> str:
     lines.append(f"今天 · {view.day} · {len(view.items)} 件事（{DISCLAIMER}）")
     if not view.items:
         lines.append("今天没有排进来的事务。直接说一句话就能新建。")
-        return "\n".join(lines)
+        return _with_pending_hint(lines, pending_count)
 
     lines.append("")
     for index, scored in enumerate(view.items, start=1):
@@ -81,6 +87,22 @@ def render_today(view: TodayView, names: dict[str, str]) -> str:
         lines.append(_one_line(index, scored, names) + mark)
     lines.append("")
     lines.append("助手不替你决定先做哪个。用 /task <id> 打开某一条。")
+    return _with_pending_hint(lines, pending_count)
+
+
+def _with_pending_hint(lines: list[str], pending_count: int) -> str:
+    """有待处理捕获时，给今天视图挂一条**有界**提醒。
+
+    **只在 >0 时出现**：0 条还挂一行是噪音，而今天的主区是排序结果，
+    不该被一条常态空行稀释。收集器是工作台，今天只负责提醒
+    「还有没收揽的活」—— 细节去 /pending，这里给路（11.18）。
+    """
+    if pending_count > 0:
+        lines.append("")
+        lines.append(
+            f"待处理 {pending_count} 条（收下的图片/文件还没澄清）"
+            " → /pending 查看，/pending <序号> 澄清成事务"
+        )
     return "\n".join(lines)
 
 
@@ -100,6 +122,183 @@ def render_all(
     lines.append("")
     for index, scored in enumerate(scored_list, start=1):
         lines.append(_one_line(index, scored, names))
+    return "\n".join(lines)
+
+
+#: 周一…周日。``date.weekday()`` 是 0=周一，所以直接索引。
+_WEEKDAY_CN = "一二三四五六日"
+
+
+def render_week(view: WeekView, names: dict[str, str]) -> str:
+    """周回顾（6.5）。
+
+    刻意**不排序**：分区内按事实本身的时间顺序（结束时间倒序、排期升序、
+    创建升序）。打了分的列表会暗示「先看哪条」，而回顾要回答的是
+    「这一周发生了什么」，不是「现在先做哪个」。
+    """
+    span = f"{view.start} ~ {view.end - timedelta(days=1)}"
+    lines = [f"本周回顾 · {span}（{DISCLAIMER}）"]
+    if view.is_empty:
+        lines.append("本周还没有可回顾的事实。直接说一句话就能新建。")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(
+        f"本周结束 {len(view.closed)} 件"
+        f"（完成 {len(view.completed)} / 放弃 {len(view.dropped)}）"
+    )
+    if view.closed:
+        for index, task in enumerate(view.closed, start=1):
+            when = task.completed_at or task.dropped_at
+            at = f" {when:%m-%d %H:%M}" if when is not None else ""
+            lines.append(
+                f"  {index}. {_role_label(task, names)}{task.title}"
+                f" —— {task.state.label}{at}"
+            )
+    else:
+        lines.append("  （没有结束的事务）")
+
+    lines.append("")
+    if view.slips:
+        lines.append(f"卡在哪：本周顺延 {view.slipped_times} 次")
+        for item in view.slips:
+            lines.append(f"  · {item.task.title} —— 顺延 {item.times} 次")
+    else:
+        lines.append("卡在哪：本周没有顺延记录。")
+
+    lines.append("")
+    if view.next_week:
+        lines.append(f"下周承诺 {len(view.next_week)} 件")
+        for task in view.next_week:
+            day = task.scheduled_for
+            assert day is not None            # WeekView 只收排期非空的
+            lines.append(
+                f"  · {day:%m-%d} 周{_WEEKDAY_CN[day.weekday()]}"
+                f"  {_role_label(task, names)}{task.title}"
+            )
+    else:
+        lines.append("下周承诺：下周还没有排期。")
+
+    lines.append("")
+    if view.unscheduled:
+        lines.append(f"没排期 {len(view.unscheduled)} 件（记了但没进任何一天）")
+        for task in view.unscheduled:
+            lines.append(f"  · {_role_label(task, names)}{task.title}")
+    else:
+        lines.append("没排期：没有悬空的事务。")
+
+    if view.waiting:
+        lines.append("")
+        lines.append(f"在等 {len(view.waiting)} 件")
+        for task in view.waiting:
+            waiting = task.waiting_on
+            assert waiting is not None        # WeekView 只收在等的
+            lines.append(f"  · {task.title} —— {waiting.describe()}")
+
+    lines.append("")
+    lines.append("这些是**事实**，不是建议 —— 要改什么，由你决定。")
+    return "\n".join(lines)
+
+
+def render_model(view, names: dict[str, str]) -> str:
+    """连续性个人模型（11.17 / 20.1.1）。
+
+    刻意**不排序打分、不给建议**：只把从记录里现推的规律摆出来
+    （第七章「摆得更清楚 ≠ 替你决定」）。与 /week、/feedback 同一条纪律。
+    ``names`` 保留签名一致，角色名已在服务层翻好。
+    """
+    days = (view.until - view.since).days + 1
+    lines = [f"连续性个人模型 · 近 {days} 天（{DISCLAIMER}）"]
+    if view.is_empty:
+        lines.append("这段时间还没有可归纳的记录 —— 先记几件事、完成几件，规律才会显现。")
+        return "\n".join(lines)
+
+    lines.append("")
+    if view.done_in_window:
+        lines.append(f"完成 {view.done_in_window} 件，按**时段**分布：")
+        for hour, count in view.completion_by_hour:
+            lines.append(f"  {hour:02d}:00  {count:>3}  {'▏' * count}")
+        lines.append("按**星期**分布：")
+        for dow, count in view.completion_by_dow:
+            lines.append(f"  周{_WEEKDAY_CN[dow]}   {count:>3}  {'▏' * count}")
+    else:
+        lines.append("这段时间没有完成的记录。")
+
+    lines.append("")
+    if view.rollover_total:
+        extra = f"（其中反复顺延 {len(view.tasks_rolled_over)} 件）" if view.tasks_rolled_over else ""
+        lines.append(f"顺延 {view.rollover_total} 次{extra}")
+        for tid, title, n in view.tasks_rolled_over:
+            lines.append(f"  · {title}（{tid}） —— 顺延 {n} 次")
+    else:
+        lines.append("顺延：这段时间没有顺延记录。")
+
+    lines.append("")
+    if view.stuck_waiting:
+        lines.append(f"卡住的等候 {len(view.stuck_waiting)} 件（已等 ≥7 天）：")
+        for tid, title, age in view.stuck_waiting:
+            lines.append(f"  · {title}（{tid}） —— 已等 {age} 天")
+    else:
+        lines.append("卡住的等候：没有悬在别人手里超过 7 天的事。")
+
+    lines.append("")
+    if view.role_activity:
+        lines.append("角色活跃度（按挂接的事务数）：")
+        for name, count in view.role_activity:
+            lines.append(f"  · {name}  {count}")
+    else:
+        lines.append("角色活跃度：还没有任何角色。")
+
+    lines.append("")
+    lines.append("这些是**从你的记录里现推的规律**，不是评价 —— 要不要顺着它调整，由你决定。")
+    return "\n".join(lines)
+
+
+#: 捕获类型 → 人话。与桥接 ``_capture_unsupported`` 的 label 口径一致
+#: （那边是「图片 / 文件」的二选一，这里同款）。
+_CAPTURE_KIND_LABELS = {"image": "图片", "file": "文件"}
+
+
+def _fmt_size(size: int) -> str:
+    """字节数 → 人话。下载失败时 ``size`` 是消息里声称的大小，照实显示。"""
+    if size <= 0:
+        return "大小未知"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def render_pending(items, now=None) -> str:
+    """待处理收集器（11.18）。
+
+    **只摆事实，不猜内容**：每条捕获显示类型、收下时间、大小、本地路径 ——
+    「它是什么」留给用户。序号即澄清时的编号（``/pending N``），
+    先进先出，与仓储排序一致（最早收下的排最前）。
+    """
+    count = len(items)
+    lines = [f"待处理 · {count} 条（最早收下的排最前；只摆事实，不猜它们是什么）"]
+    if count == 0:
+        lines.append("收集器是空的。飞书里发图片/文件会被收下并放到这里，")
+        lines.append("等你显式说一声才变成事务。")
+        return "\n".join(lines)
+
+    lines.append("")
+    for index, item in enumerate(items, start=1):
+        label = _CAPTURE_KIND_LABELS.get(item.kind, item.kind or "捕获")
+        head = f"  {index}. {label}"
+        if item.name and item.name != item.kind:
+            head += f"「{item.name}」"
+        head += f" · {item.created_at:%m-%d %H:%M} · {_fmt_size(item.size)}"
+        lines.append(head)
+        if item.path:
+            lines.append(f"     {item.path}")
+        else:
+            lines.append(f"     （未下载，飞书引用 {item.media_key}）")
+    lines.append("")
+    lines.append("澄清成事务：/pending <序号> [标题]")
+    lines.append("明确不要了：/pending drop <序号>")
     return "\n".join(lines)
 
 

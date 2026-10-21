@@ -108,11 +108,18 @@ def reminder_payload(digest) -> dict:
 
     与终端遵守同一条规则：**合并成一条摘要**，绝不逐条弹（设计文档 9.4）；
     超过 6 小时的如实标为「已错过」，不当作刚发生的新提醒（9.3）。
+
+    ## 安静窗口（9.8）
+
+    窗口内 ``digest`` 是空摘要但带 ``quiet_until`` —— 此时 ``text`` 为 null，
+    界面应改念 ``quiet_note``（「安静窗口内…已压后」），不是把它当成
+    「今天没有提醒」。两个字段一起给，让界面能分清这两种「没内容」。
     """
     return {
         "kind": "reminders",
         "count": digest.count,
         "text": digest.text(),
+        "quiet": digest.quiet_note(),
         "fired": [
             {"task_id": e.task_id, "title": e.title, "due_at": _iso(e.due_at)}
             for e in digest.fired
