@@ -15,11 +15,15 @@ __all__ = [
     "ArtifactStatus",
     "CapturedStatus",
     "WaitingKind",
+    "ContactKind",
+    "PromiseStatus",
     "SortSignalCode",
     "SORT_SIGNAL_WEIGHTS",
     "STATE_LABELS",
     "KIND_LABELS",
     "CAPTURED_STATUS_LABELS",
+    "CONTACT_KIND_LABELS",
+    "PROMISE_STATUS_LABELS",
     "SIGNAL_LABELS",
 ]
 
@@ -130,11 +134,59 @@ class WaitingKind(str, Enum):
     TIME = "time"
 
 
+class ContactKind(str, Enum):
+    """关系对象的类型（设计文档 11.19）。
+
+    **为什么要有这张表**：``WaitingOn.who_or_what`` 是**自由文本**，
+    「在等张总」与「在等张总回合同」都是它，但没法聚合 ——
+    你问「我跟张总有几次往来」，得去翻所有事务的文本。
+    关系对象把它变成**可检索的一等公民**（20.1.5）。
+
+    刻意只分这么几类：分类的价值在于**能聚合**，分太细就退化成自由文本
+    （11.10.2「能力声明一旦手写就会陈旧」同源的问题）。用户不写标识符，
+    只从这几个里选。
+    """
+
+    PERSON = "person"
+    """具体的人：同事、客户、老师、孩子。"""
+
+    ORG = "org"
+    """组织：公司、团队、学校、对方公司。"""
+
+    SELF = "self"
+    """自己。刻意单列 —— 「我答应自己」是一种真实且常见的承诺，
+    与「我答应别人」的违约代价不同（前者代价小，后者有社会代价）。"""
+
+
+class PromiseStatus(str, Enum):
+    """对外承诺的生命周期（设计文档 11.19）。
+
+    承诺的三个终态都只由**用户显式动作**产生：
+
+    * ``KEPT`` —— 兑现了（用户说「交了」）；
+    * ``BROKEN`` —— 违约了（用户说「没做到」）；
+    * ``WITHDRAWN`` —— 对方取消了/我收回去了。
+
+    刻意**没有「自动违约」**：过了承诺日期不等于违约 ——
+    可能是延期了、可能是对方改主意了。系统只能摆事实，
+    判「违约」是替用户下结论（第十五章）。
+    """
+
+    OPEN = "open"
+    """未兑现（唯一入口态）。"""
+
+    KEPT = "kept"
+    BROKEN = "broken"
+    WITHDRAWN = "withdrawn"
+
+
+
 class SortSignalCode(str, Enum):
     """透明弱信号代码。排序只由这些确定性信号构成，不做价值打分。"""
 
     OVERDUE_WAIT = "overdue_wait"
     DEADLINE_RISK = "deadline_risk"
+    PROMISE_OVERDUE = "promise_overdue"
     DEPENDED_ON = "depended_on"
     RESUME_STALE = "resume_stale"
     WAITING_TOO_LONG = "waiting_too_long"
@@ -147,6 +199,17 @@ class SortSignalCode(str, Enum):
 SORT_SIGNAL_WEIGHTS: dict[SortSignalCode, int] = {
     SortSignalCode.OVERDUE_WAIT: 50,
     SortSignalCode.DEADLINE_RISK: 40,
+    #: 承诺逾期未兑现（11.19）—— 权重**高于** ``DEADLINE_RISK``。
+    #:
+    #: 19.5.3 的理由：自己的截止日改了没什么，**答应别人的没有内部宽限期**。
+    #: 逾期的代价是社会性的（对方失望、关系受损），而 ``DEADLINE_RISK``
+    #: 说的只是「你自己的时间不够了」。所以 45 —— 排第二，低于
+    #: ``OVERDUE_WAIT``（那是在等别人，代价是**卡住**，是全局性的）。
+    #:
+    #: ⚠️ 名字里**没有「违约」**：这个信号只陈述事实「逾期了、还没兑现」，
+    #: 判「违约」是用户的事（11.19.5）—— 可能延期了、可能对方改主意了。
+    #: 系统的职责是把事实摆到最显眼处，不是替用户下结论。
+    SortSignalCode.PROMISE_OVERDUE: 45,
     SortSignalCode.DEPENDED_ON: 30,
     SortSignalCode.RESUME_STALE: 20,
     SortSignalCode.WAITING_TOO_LONG: 15,
@@ -173,6 +236,19 @@ CAPTURED_STATUS_LABELS: dict[CapturedStatus, str] = {
     CapturedStatus.PENDING: "待处理",
     CapturedStatus.CLARIFIED: "已澄清",
     CapturedStatus.DISMISSED: "已忽略",
+}
+
+CONTACT_KIND_LABELS: dict[ContactKind, str] = {
+    ContactKind.PERSON: "人",
+    ContactKind.ORG: "组织",
+    ContactKind.SELF: "自己",
+}
+
+PROMISE_STATUS_LABELS: dict[PromiseStatus, str] = {
+    PromiseStatus.OPEN: "未兑现",
+    PromiseStatus.KEPT: "已兑现",
+    PromiseStatus.BROKEN: "已违约",
+    PromiseStatus.WITHDRAWN: "已收回",
 }
 
 SIGNAL_LABELS: dict[SortSignalCode, str] = {

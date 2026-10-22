@@ -60,8 +60,9 @@ def store(conn):
 
 class TestMigration:
     def test_version(self):
-        # 18 = captured_items（待处理收集器，设计文档 11.18 / V1.50）。
-        # （上一版 17 = memory（跨角色 core 记忆 + FTS5，设计文档 3.7 / V1.47）；
+        # 19 = contacts + promises（对外承诺与关系对象，设计文档 11.19 / V1.51）。
+        # （上一版 18 = captured_items（待处理收集器，设计文档 11.18 / V1.50）；
+        # 再上 17 = memory（跨角色 core 记忆 + FTS5，设计文档 3.7 / V1.47）；
         # 再上 16 = task_records.seq，同刻记录定序，设计文档 12.10.6 / V1.37；
         # 再上 15 = delegate_progress + pending_approvals.task_id，
         # WEB 委派实时面板，设计文档 12.8 / V1.35。）
@@ -82,7 +83,16 @@ class TestMigration:
         # 16 → 17 那一步执行，17 → 18 反而空跑。**len(_MIGRATIONS) 与
         # SCHEMA_VERSION 的差值不是常量**（取决于有几版走了域步骤），
         # 所以这里只能逐版核对标签与索引，不能拿一个算式概括。
-        assert SCHEMA_VERSION == 18
+        #
+        # v19（contacts + promises）又踩了同一族的坑，但**理由相反**，
+        # 值得分开记：这一次 _MIGRATIONS 索引 17 本来就是 v19 自己的位置
+        # （18 → 19 需要一条真条目，而 17 → 18 那格因走 _DOMAIN_STEPS
+        # 一直是占位）。所以我在索引 17 填的 ``SELECT 1`` **只是语法占位**，
+        # 真正的建表语句在 _DOMAIN_STEPS 的 keyed-19。
+        # ——同一个索引位，两种完全不同的理由：v8/v17 是"被前移的坑"，
+        # 这里只是"这一格必须有行"。若不写清楚，后人照 v8 的教训去查
+        # 索引 17，会查出一个并不存在的 bug。
+        assert SCHEMA_VERSION == 19
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

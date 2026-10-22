@@ -12,6 +12,7 @@ from typing import Sequence
 
 from ..domain import (
     SORT_SIGNAL_WEIGHTS,
+    Promise,
     ScoredTask,
     SortSignal,
     SortSignalCode,
@@ -206,6 +207,37 @@ def _energy_fit_signals(
     ]
 
 
+def _promise_overdue_signals(
+    task: Task, now: datetime, promise: Promise | None
+) -> list[SortSignal]:
+    """对外承诺逾期未兑现（设计文档 11.19）。
+
+    **只陈述事实，不判违约**：理由写「逾期 N 天未兑现」，
+    不写「你违约了」—— 判违约是用户的事（可能延期了、可能对方改主意了，
+    见 11.19.5）。信号只把事实摆到显眼处。
+
+    为什么权重高于 ``DEADLINE_RISK``（19.5.3）：自己的截止日改了没人受损，
+    答应别人的没有内部宽限期。
+
+    已兑现 / 已违约 / 已收回的承诺**不再产生信号** —— 账已经结了，
+    还占着权重就是噪声。
+    """
+    if promise is None or not promise.is_open:
+        return []
+    if promise.promised_for is None or promise.promised_for >= now:
+        return []
+    overdue = now - promise.promised_for
+    days = overdue.days
+    span = f"已逾期 {days} 天" if days >= 1 else "今天刚过期限"
+    return [
+        SortSignal(
+            code=SortSignalCode.PROMISE_OVERDUE,
+            weight=_weight(SortSignalCode.PROMISE_OVERDUE),
+            reason=f"答应了的事{span}还没兑现（{promise.statement}）",
+        )
+    ]
+
+
 def compute_signals(
     task: Task,
     now: datetime,
@@ -213,16 +245,21 @@ def compute_signals(
     *,
     dependents: int = 0,
     energy_windows: EnergyWindows | None = None,
+    promise: Promise | None = None,
 ) -> tuple[SortSignal, ...]:
     """计算一条事务命中的全部弱信号。
 
     已结束的事务不产生任何信号。
+
+    ``promise`` 是这条事务上的对外承诺（11.19）。可空：没有承诺的
+    事务照常算分 —— 承诺是**可选属性**，不是事务的必备字段。
     """
     if not task.is_open:
         return ()
     signals: list[SortSignal] = []
     signals += _overdue_wait_signals(task, now)
     signals += _deadline_risk_signals(task, now)
+    signals += _promise_overdue_signals(task, now, promise)
     signals += _depended_on_signals(dependents)
     signals += _resume_stale_signals(task, now)
     signals += _waiting_too_long_signals(task, now)
@@ -240,9 +277,15 @@ def score_task(
     *,
     dependents: int = 0,
     energy_windows: EnergyWindows | None = None,
+    promise: Promise | None = None,
 ) -> ScoredTask:
     signals = compute_signals(
-        task, now, today, dependents=dependents, energy_windows=energy_windows
+        task,
+        now,
+        today,
+        dependents=dependents,
+        energy_windows=energy_windows,
+        promise=promise,
     )
     return ScoredTask(
         task=task, signals=signals, total_weight=sum(s.weight for s in signals)
@@ -267,12 +310,22 @@ def score_and_sort(
     *,
     dependents_of=None,
     energy_windows: EnergyWindows | None = None,
+    promise_of=None,
 ) -> list[ScoredTask]:
-    """一步到位：打分 + 排序。``dependents_of`` 用于避免 N+1 查询。"""
+    """一步到位：打分 + 排序。
+
+    ``dependents_of`` 用于避免 N+1 查询；``promise_of`` 同理
+    （11.19 的对外承诺：一条事务一条承诺，批量取比逐条查省事）。
+    """
     if dependents_of is None:
 
         def dependents_of(task_id: str) -> int:
             return 0
+
+    if promise_of is None:
+
+        def promise_of(task_id: str) -> Promise | None:
+            return None
 
     scored = [
         score_task(
@@ -281,6 +334,7 @@ def score_and_sort(
             today,
             dependents=dependents_of(task.id),
             energy_windows=energy_windows,
+            promise=promise_of(task.id),
         )
         for task in tasks
     ]

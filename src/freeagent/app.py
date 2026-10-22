@@ -19,9 +19,11 @@ from .services.chat import ChatService
 from .services.clock import Clock, SystemClock
 from .services.knowledge import KnowledgeService
 from .services.memory import MemoryService
+from .services.nudge import NudgeService
 from .services.llm import LLMProvider, build_provider
 from .services.llm.vision import VisionProvider
 from .services.pending import PendingService
+from .services.promise import PromiseService
 from .services.reminders import QuietHours, ReminderEngine
 from .services.restore import RestoreService
 from .services.roles import RoleService
@@ -34,6 +36,8 @@ from .storage.db import connect, migrate, resolve_db_path
 from .storage.repos import (
     ArtifactRepo,
     CapturedRepo,
+    ContactRepo,
+    PromiseRepo,
     RecordRepo,
     RoleRepo,
     TaskRepo,
@@ -62,6 +66,12 @@ class App:
     #: 待处理收集器（11.18）。捕获侧（飞书）与澄清侧（/pending）共用这一个
     #: 服务层与同一写入口 —— 不许为第二个通道复制逻辑（12.1.1）。
     pending: PendingService
+    #: 关系对象与对外承诺（11.19）。承诺要建兑现物，所以它拿 TaskService
+    #: （唯一写入口）；关系对象只是记账层，不碰事务。
+    promise: PromiseService
+    #: 催办草稿（20.1.4）。**只读 + 拼文本**：不持有任何发送通道，
+    #: 想代发的人找不到那条路 —— 见模块纪律 1。
+    nudge: NudgeService
     restore: RestoreService
     reminders: ReminderEngine
 
@@ -245,6 +255,8 @@ def build_app(
     record_repo = RecordRepo(conn)
     artifact_repo = ArtifactRepo(conn)
     captured_repo = CapturedRepo(conn)
+    contact_repo = ContactRepo(conn)
+    promise_repo = PromiseRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
     # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
@@ -260,13 +272,6 @@ def build_app(
     artifact_service = ArtifactService(
         artifact_repo, task_repo, record_repo, the_clock
     )
-    today_service = TodayService(
-        task_repo, record_repo, the_clock, energy_windows=energy_windows
-    )
-    # 周回顾复用今天视图的顺延实现（不复制）。见 services/week.py 模块文档。
-    week_service = WeekService(
-        task_repo, record_repo, the_clock, today=today_service
-    )
     # 连续性个人模型（11.17）：纯只读聚合，复用既有的 TaskRepo / RecordRepo，
     # 不建表、不写库。role_repo 用于把 role_id 翻成名字（活跃度展示用）。
     personal_model_service = PersonalModelService(
@@ -276,6 +281,28 @@ def build_app(
     # 与 RoleService（默认脉络）；不自己拼 INSERT —— 一份能力一份实现。
     pending_service = PendingService(
         captured_repo, task_service, role_service, the_clock
+    )
+    # 关系对象与对外承诺（11.19）。承诺要挂兑现物，所以拿 TaskService
+    # （唯一写入口）；关系对象只做记账，不碰事务。
+    promise_service = PromiseService(
+        conn, contact_repo, promise_repo, task_service, role_service, the_clock
+    )
+    # 催办草稿（20.1.4）。**只读**：拿任务服务（列未结束）、承诺与关系仓储
+    # （读事实），一个写仓储都不碰 —— 草稿生成不该留下痕迹。
+    nudge_service = NudgeService(
+        task_service, promise_repo, contact_repo, the_clock
+    )
+    # 今天视图**排在**承诺服务之后建：它要用承诺算「逾期未兑现」的权重
+    # （11.19），所以得先有承诺服务才能给出那个查找回调。
+    # 回调而不是直接依赖仓储 —— 见 TodayService.__init__ 的注释。
+    today_service = TodayService(
+        task_repo, record_repo, the_clock,
+        energy_windows=energy_windows,
+        promise_of=promise_service.promise_of,
+    )
+    # 周回顾复用今天视图的顺延实现（不复制）。见 services/week.py 模块文档。
+    week_service = WeekService(
+        task_repo, record_repo, the_clock, today=today_service
     )
     restore_service = RestoreService(
         task_service, artifact_service, record_repo, role_service, the_clock
@@ -327,6 +354,8 @@ def build_app(
         week=week_service,
         personal_model=personal_model_service,
         pending=pending_service,
+        promise=promise_service,
+        nudge=nudge_service,
         restore=restore_service,
         reminders=reminder_engine,
         chat=chat_service,

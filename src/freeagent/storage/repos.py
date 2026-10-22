@@ -19,8 +19,12 @@ from ..domain import (
     CapturedItem,
     CapturedStatus,
     ConflictError,
+    Contact,
+    ContactKind,
     InvariantViolation,
     NotFoundError,
+    Promise,
+    PromiseStatus,
     RecordType,
     Role,
     StaleRevisionError,
@@ -34,7 +38,15 @@ from ..domain import (
     new_id,
 )
 
-__all__ = ["RoleRepo", "TaskRepo", "RecordRepo", "ArtifactRepo", "CapturedRepo"]
+__all__ = [
+    "RoleRepo",
+    "TaskRepo",
+    "RecordRepo",
+    "ArtifactRepo",
+    "CapturedRepo",
+    "ContactRepo",
+    "PromiseRepo",
+]
 
 _TERMINAL_VALUES = (TaskState.DONE.value, TaskState.DROPPED.value)
 #: 未结束 = 全部状态减去已结束。顺序按生命周期，查询时的 IN 列表也用它。
@@ -100,6 +112,8 @@ def _waiting_out(value: WaitingOn | None) -> str | None:
             "since": value.since.isoformat(),
             "follow_up_at": _dt_out(value.follow_up_at),
             "note": value.note,
+            # V1.52 加的可选字段。历史行没有这个键，读侧用 .get 兜住。
+            "contact_id": value.contact_id,
         },
         ensure_ascii=False,
     )
@@ -116,6 +130,7 @@ def _waiting_in(raw: str | None) -> WaitingOn | None:
         since=since,
         follow_up_at=_dt_in(payload.get("follow_up_at")),
         note=payload.get("note"),
+        contact_id=payload.get("contact_id"),
     )
 
 
@@ -920,11 +935,20 @@ class CapturedRepo(_RepoBase):
 
         收集器的纪律是「越早收下越先摆出来」—— 和邮箱一个道理：按时间
         倒序会让最早收下的那条永远沉底，而它往往已经躺得最久。
-        同刻创建的按 ``id`` 定序，保证全序确定（不掷硬币）。
+
+        同刻创建的按 ``rowid`` 定序。**不是 ``id``**：``id`` 是
+        ``new_id()`` 的随机 hex，拿它兜底只是「碰巧有个确定的顺序」，
+        不是「确定的插入顺序」。冻时钟下同刻落库很常见（一次抓一批、
+        测试、导入），而这里的序号是 ``/pending N`` 的 N —— 顺序随机
+        意味着用户看到的第 1 条和他澄清出来的第 1 条可能不是同一条。
+        同一个坑 V1.37 在 task_records 上踩过一次（见 feedback 模块
+        文档「同刻记录的顺序前提」），那次是加 seq 列根治；这里表还没
+        别的排序依赖，用 SQLite 自带的插入序即可 —— 与 tasks 仓储
+        ``ORDER BY ... rowid ASC`` 同一个先例。
         """
         rows = self._conn.execute(
             "SELECT * FROM captured_items WHERE status = ?"
-            " ORDER BY created_at ASC, id ASC",
+            " ORDER BY created_at ASC, rowid ASC",
             (CapturedStatus.PENDING.value,),
         )
         return [self._row_to_item(r) for r in rows]
@@ -972,6 +996,275 @@ class CapturedRepo(_RepoBase):
             task_id=row["task_id"],
             created_at=datetime.fromisoformat(row["created_at"]),
             resolved_at=_dt_in(row["resolved_at"]),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# ContactRepo
+# --------------------------------------------------------------------------- #
+class ContactRepo(_RepoBase):
+    """关系对象的存取（设计文档 11.19）。
+
+    **只存取，不判定**：名字重名怎么办、合并要不要级联 ——
+    那些判定在 :class:`~freeagent.services.promise.PromiseService`，
+    仓储只写。与 ``CapturedRepo`` 同一条分工。
+    """
+
+    def add(
+        self,
+        name: str,
+        now: datetime,
+        *,
+        kind: ContactKind = ContactKind.PERSON,
+        contact_id: str | None = None,
+        note: str | None = None,
+    ) -> Contact:
+        contact = Contact(
+            id=contact_id or new_id(),
+            name=name.strip(),
+            kind=kind,
+            created_at=now,
+            updated_at=now,
+            note=note,
+        )
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO contacts (id, name, kind, note, merged_into,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    contact.id,
+                    contact.name,
+                    contact.kind.value,
+                    contact.note,
+                    None,
+                    contact.created_at.isoformat(),
+                    contact.updated_at.isoformat(),
+                ),
+            )
+        return contact
+
+    def get(self, contact_id: str) -> Contact:
+        row = self._conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("关系对象", contact_id)
+        return self._row_to_contact(row)
+
+    def get_by_name(self, name: str) -> Contact | None:
+        """按名字找。**找不到返回 None 而不是抛错** —— 「还没这个人」
+        是正常状态（服务层据此决定要不要新建）。"""
+        row = self._conn.execute(
+            "SELECT * FROM contacts WHERE name = ?", (name.strip(),)
+        ).fetchone()
+        return None if row is None else self._row_to_contact(row)
+
+    def list_all(self) -> list[Contact]:
+        """全部关系对象，按**创建序**（最早的先列）。
+
+        刻意不按名字排：用户认识的是「我认识的人」，而那个顺序是
+        「认识多久」—— 按字母排会把最常打交道的人排到字母深处。
+        同刻创建的按 ``rowid`` 定序（同 ``list_pending`` 的理由：
+        随机 id 兜不住「谁先谁后」）。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM contacts ORDER BY created_at ASC, rowid ASC"
+        )
+        return [self._row_to_contact(r) for r in rows]
+
+    def count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM contacts").fetchone()
+        return int(row[0])
+
+    def set_note(self, contact_id: str, note: str | None, now: datetime) -> Contact:
+        with self._tx():
+            self._conn.execute(
+                "UPDATE contacts SET note = ?, updated_at = ? WHERE id = ?",
+                (note, now.isoformat(), contact_id),
+            )
+        return self.get(contact_id)
+
+    def merge(self, source_id: str, target_id: str, now: datetime) -> Contact:
+        """把 ``source_id`` 重定向到 ``target_id``（3.5 同一条纪律）。
+
+        **刻意不做级联改写** ``promises.contact_id``：承诺是**历史**，
+        「我跟张总有过一笔账」这件事不该因为张总被合并进「张总（供应商）」
+        就消失。读时沿 ``merged_into`` 追到根即可（服务层做）。
+        """
+        with self._tx():
+            self._conn.execute(
+                "UPDATE contacts SET merged_into = ?, updated_at = ? WHERE id = ?",
+                (target_id, now.isoformat(), source_id),
+            )
+        return self.get(source_id)
+
+    @staticmethod
+    def _row_to_contact(row: sqlite3.Row) -> Contact:
+        return Contact(
+            id=row["id"],
+            name=row["name"],
+            kind=ContactKind(row["kind"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            note=row["note"],
+            merged_into=row["merged_into"],
+        )
+
+
+# --------------------------------------------------------------------------- #
+# PromiseRepo
+# --------------------------------------------------------------------------- #
+class PromiseRepo(_RepoBase):
+    """对外承诺的存取（设计文档 11.19）。
+
+    **只存取，不判定**：「过了承诺日期算不算违约」这种判定**不在这层**
+    —— 系统不能替用户判违约（第十五章），所以仓储里连
+    「今天有几条逾期承诺」这种查询都不提供，逾期由服务层拿
+    ``promised_for`` 与当前时刻现算。
+    """
+
+    def add(
+        self,
+        *,
+        task_id: str,
+        statement: str,
+        now: datetime,
+        contact_id: str | None = None,
+        promised_for: datetime | None = None,
+        note: str | None = None,
+        promise_id: str | None = None,
+    ) -> Promise:
+        """记一条承诺，**永远以 open 落盘**。
+
+        终态（kept / broken / withdrawn）只能由 :meth:`resolve` 产生，
+        而那只能由用户显式动作触发。
+        """
+        promise = Promise(
+            id=promise_id or new_id(),
+            task_id=task_id,
+            contact_id=contact_id,
+            statement=statement.strip(),
+            promised_for=promised_for,
+            status=PromiseStatus.OPEN,
+            created_at=now,
+            updated_at=now,
+            note=note,
+        )
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO promises (id, task_id, contact_id, statement,"
+                " promised_for, status, note, created_at, updated_at, resolved_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    promise.id,
+                    promise.task_id,
+                    promise.contact_id,
+                    promise.statement,
+                    _dt_out(promise.promised_for),
+                    promise.status.value,
+                    promise.note,
+                    promise.created_at.isoformat(),
+                    promise.updated_at.isoformat(),
+                    None,
+                ),
+            )
+        return promise
+
+    def get(self, promise_id: str) -> Promise:
+        row = self._conn.execute(
+            "SELECT * FROM promises WHERE id = ?", (promise_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("承诺", promise_id)
+        return self._row_to_promise(row)
+
+    def list_open(self) -> list[Promise]:
+        """未兑现的承诺，按**承诺日期升序**（最早到期的前面）。
+
+        刻意按 ``promised_for`` 排而不按创建序：用户问「我答应了什么」，
+        要看的是**快到期的那几个**，而不是最早立下的那几条。
+        没给日期的（``promised_for IS NULL``）排在最后 ——
+        SQLite 的 ASC 把 NULL 排最前，所以显式用
+        ``promised_for IS NULL`` 作第一排序键把它们推到后面。
+        同期限的按 ``rowid`` 定序（插入序），理由同 ``list_pending``。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM promises WHERE status = ?"
+            " ORDER BY (promised_for IS NULL) ASC, promised_for ASC, rowid ASC",
+            (PromiseStatus.OPEN.value,),
+        )
+        return [self._row_to_promise(r) for r in rows]
+
+    def list_for_task(self, task_id: str) -> list[Promise]:
+        """这条事务上的承诺（一条事务最多一条，见 11.19.2）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM promises WHERE task_id = ?"
+            " ORDER BY created_at ASC, rowid ASC",
+            (task_id,),
+        )
+        return [self._row_to_promise(r) for r in rows]
+
+    def list_for_contact(self, contact_id: str) -> list[Promise]:
+        """这个关系对象名下的承诺（关系一等化的意义所在，11.19.3）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM promises WHERE contact_id = ?"
+            " ORDER BY (promised_for IS NULL) ASC, promised_for ASC, rowid ASC",
+            (contact_id,),
+        )
+        return [self._row_to_promise(r) for r in rows]
+
+    def count_open(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM promises WHERE status = ?",
+            (PromiseStatus.OPEN.value,),
+        ).fetchone()
+        return int(row[0])
+
+    def resolve(
+        self,
+        promise_id: str,
+        status: PromiseStatus,
+        now: datetime,
+        *,
+        note: str | None = None,
+    ) -> Promise:
+        """落到终态（kept / broken / withdrawn）。只改状态三列。
+
+        **刻意不在这里拒「重复 resolve」**：判定在服务层 ——
+        它要给面向用户的话术（「这条已经兑现了」），仓储的职责是写。
+        """
+        with self._tx():
+            self._conn.execute(
+                "UPDATE promises SET status = ?, updated_at = ?, resolved_at = ?,"
+                " note = COALESCE(?, note) WHERE id = ?",
+                (status.value, now.isoformat(), now.isoformat(), note, promise_id),
+            )
+        return self.get(promise_id)
+
+    def set_promised_for(
+        self, promise_id: str, promised_for: datetime | None, now: datetime
+    ) -> Promise:
+        """改承诺日期（延期）。**不算违约** —— 延期是用户的正当权利。"""
+        with self._tx():
+            self._conn.execute(
+                "UPDATE promises SET promised_for = ?, updated_at = ? WHERE id = ?",
+                (_dt_out(promised_for), now.isoformat(), promise_id),
+            )
+        return self.get(promise_id)
+
+    @staticmethod
+    def _row_to_promise(row: sqlite3.Row) -> Promise:
+        return Promise(
+            id=row["id"],
+            task_id=row["task_id"],
+            contact_id=row["contact_id"],
+            statement=row["statement"],
+            promised_for=_dt_in(row["promised_for"]),
+            status=PromiseStatus(row["status"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            resolved_at=_dt_in(row["resolved_at"]),
+            note=row["note"],
         )
 
 

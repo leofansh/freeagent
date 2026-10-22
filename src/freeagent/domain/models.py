@@ -13,6 +13,8 @@ from datetime import date, datetime
 from .enums import (
     ArtifactStatus,
     CapturedStatus,
+    ContactKind,
+    PromiseStatus,
     RecordType,
     SortSignalCode,
     TaskKind,
@@ -28,6 +30,8 @@ __all__ = [
     "TaskRecord",
     "Artifact",
     "CapturedItem",
+    "Contact",
+    "Promise",
     "SortSignal",
     "ScoredTask",
     "RestoreView",
@@ -87,13 +91,23 @@ class Role:
 
 @dataclass(frozen=True, slots=True)
 class WaitingOn:
-    """等候对象：回答「为什么卡住」「在等谁」。"""
+    """等候对象：回答「为什么卡住」「在等谁」。
+
+    ``contact_id`` 是 11.19 加的**可选**指向：``who_or_what`` 是自由文本，
+    「在等张总」与「在等张总回合同」都是它 —— 关系一等化之后，
+    「等张总」这一维应该能连到 ``contacts`` 表上，否则「我跟张总之间有几笔
+    在等的事」还是得靠人眼认文本。
+
+    **刻意可选、且不建外键**：历史行没有这个字段，读出来是 ``None``，
+    与「没挂关系」是同一件事；用户也不必为记一句「在等对方回话」先建人。
+    """
 
     kind: WaitingKind
     who_or_what: str
     since: datetime
     follow_up_at: datetime | None = None
     note: str | None = None
+    contact_id: str | None = None
 
     def describe(self) -> str:
         base = f"{self.kind.value} · {self.who_or_what}"
@@ -248,6 +262,80 @@ class CapturedItem:
     created_at: datetime
     resolved_at: datetime | None = None
     task_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Contact:
+    """关系对象：**人**或组织（设计文档 11.19 / 20.1.5）。
+
+    **它为什么不是角色**：角色是「事务的脉络」（工作 / 家庭 / 投资），
+    回答「这件事属于哪一块」；关系对象是「事务背后的人」，
+    回答「我跟谁之间有这笔账」。两者维度不同，可以正交 ——
+    一条「给张总交付报价」的事务既属于「工作」角色，也指向「张总」这个关系。
+
+    **它为什么不是自由文本**：``WaitingOn.who_or_what`` 是文本，
+    「在等张总」与「在等张总回合同」都是它，但没法聚合 ——
+    你问「我跟张总往来过几次」，得去翻所有事务的文本再人工认。
+    有了关系对象就能直接数、直接列（11.19.3）。
+
+    ``note`` 放「怎么找他」「答应了什么」这类自由文本 ——
+    结构化不进来的部分老实放在一边，不假装它能进（11.19.2）。
+    """
+
+    id: str
+    name: str
+    kind: ContactKind
+    created_at: datetime
+    updated_at: datetime
+    note: str | None = None
+    #: 合并重定向（与角色同一条纪律，3.5）。读时沿它追到根。
+    merged_into: str | None = None
+
+    @property
+    def is_merged(self) -> bool:
+        return self.merged_into is not None
+
+
+@dataclass(frozen=True, slots=True)
+class Promise:
+    """一条**对外承诺**（设计文档 11.19 / 19.5.3）。
+
+    **它是什么**：我答应别人（或自己）要做的事。9.1 的 ``WaitingOn``
+    只记了「我等别人」那一半；这一半是反方向的 —— **我欠别人的**。
+
+    **为什么它单独一张表而不是事务的一个字段**：
+
+    * 承诺需要**自己的生命周期**（未兑现 → 已兑现 / 已违约 / 已收回），
+      而事务的生命周期是「待办 → 进行中 → 完成」，两套状态机对不齐；
+    * 承诺要指向**关系对象**（``contact_id``）才能聚合，
+      而事务上挂的是 ``role_ids``（脉络）；
+    * 一条事务可以承载多条承诺吗？刻意**不**允许 —— 一条承诺对应
+      一个兑现物（``task_id``），一对一。多对多会让「谁欠谁多少」变糊。
+
+    **终态只由用户显式动作产生**（``PromiseStatus``）：过了承诺日期
+    **不等于**违约 —— 可能延期了、可能对方改主意了。系统只摆事实，
+    判「违约」是替用户下结论（第十五章）。
+    """
+
+    id: str
+    task_id: str
+    #: 承诺给谁。指向 :class:`Contact`。``None`` = 不指向具体关系
+    #: （「我答应过要搞定这件事」，对象不明）。
+    contact_id: str | None
+    #: 承诺了什么。**一句话**，不是自由文本块 —— 它是给列表看的。
+    statement: str
+    #: 答应什么时候做到。``None`` = 没给日期（「尽快」也是一种承诺）。
+    promised_for: datetime | None
+    status: PromiseStatus
+    created_at: datetime
+    updated_at: datetime
+    #: 兑现/违约/收回的时刻。
+    resolved_at: datetime | None = None
+    note: str | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.status is PromiseStatus.OPEN
 
 
 @dataclass(frozen=True, slots=True)

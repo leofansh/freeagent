@@ -46,7 +46,8 @@ __all__ = [
 #: ——这个数改动时必须同时自查两个方向。
 #: 17 → memory（3.7 / V1.47）。
 #: 18 → captured_items（待处理收集器，11.18 / V1.50）。
-SCHEMA_VERSION = 18
+#: 19 → contacts + promises（关系对象与对外承诺，11.19 / V1.51）。
+SCHEMA_VERSION = 19
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -260,6 +261,30 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         )
         """,
     ),
+    # 18 → 19：占位 —— v19 的真实步骤是**多语句**（contacts + promises +
+    # 三个索引），走 _DOMAIN_STEPS keyed-19。
+    #
+    # 为什么需要占位：_MIGRATIONS 按「源版本 − 1」位置索引。
+    # 索引 16 = 源版本 17 → 18（captured_items，**单语句**：一条 CREATE TABLE
+    # 塞得进 conn.execute，所以它没走域通道）；**索引 17 = 源版本 18 → 19**。
+    #
+    # 那为什么不干脆把 v19 也塞进这条单语句格？因为它是**多语句**
+    # （两张表 + 三个索引）：_run_idempotent 只对单条 ALTER 有幂等兜底，
+    # 多语句塞进 _MIGRATIONS 会破坏「一步一条」的不变量
+    # （理由见 _DOMAIN_STEPS 的文档字符串）。所以 v19 走域通道，
+    # 本格只留一条**无副作用**的 SELECT 1 —— 空语句会让 conn.execute("")
+    # 报语法错。
+    #
+    # ⚠️ 与 v8/v17 的占位**理由不同**：那两处是「多语句版本占了索引位、
+    # 导致后面的真条目前移一格」（索引 15 补占位后，v18 真条目才落在
+    # 索引 16）；这里索引 16 已是 v18 的真条目，索引 17 **本来就是**
+    # v19 自己的位置，只是它要跑的是域通道。所以只需语法占位。
+    # 两种情况都用 SELECT 1，但别混为一谈。
+    (
+        "18 → 19：占位 —— v19 的真实步骤是多语句（contacts + promises + 索引），"
+        "走 _DOMAIN_STEPS keyed-19。",
+        "SELECT 1",
+    ),
 )
 
 
@@ -391,6 +416,56 @@ CREATE TRIGGER IF NOT EXISTS memory_au BEFORE UPDATE ON memory BEGIN
 END;
 """
 
+#: 关系对象与对外承诺（11.19 / V1.51）的建表脚本。
+#:
+#: **为什么是两张表而不是 tasks 上的两列**：
+#:
+#: * ``contacts`` —— 关系对象是**独立维度**。角色回答「这件事属于哪一块」
+#:   （工作 / 家庭 / 投资），关系对象回答「我跟谁之间有这笔账」。
+#:   两者正交：一条「给张总交付报价」既属于「工作」角色，也指向「张总」。
+#:   把关系塞进 roles 会毁掉角色的语义（「张总」不是一种事务类型）。
+#: * ``promises`` —— 承诺需要**自己的生命周期**（未兑现 → 已兑现 / 已违约 /
+#:   已收回），而事务的生命周期是「待办 → 进行中 → 完成」，两套状态机
+#:   对不齐；而且承诺指向的是关系对象（``contact_id``）而不是脉络
+#:   （``role_ids``），挂不上 tasks 的现有结构。
+#:
+#: ``promises.task_id`` 是**一对一**的：一条承诺对应一个兑现物。
+#: 刻意不做多对多 —— 「谁欠谁多少」一旦多对多就糊了，
+#: 而这正是承诺要回答的问题。
+#:
+#: 外键都**不建索引以外的约束**：``contact_id`` 可空（承诺对象可能不明），
+#: 且刻意不设 REFERENCES —— 关系对象被删时承诺应当**保留**（历史承诺
+#: 不该因为人删了就消失），服务层按「空 = 不指向具体关系」处理。
+_PROMISE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contacts (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL DEFAULT 'person',  -- person / org / self
+    note        TEXT,
+    merged_into TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS promises (
+    id           TEXT PRIMARY KEY NOT NULL,
+    task_id      TEXT NOT NULL,
+    contact_id   TEXT,
+    statement    TEXT NOT NULL,
+    promised_for TEXT,
+    status       TEXT NOT NULL DEFAULT 'open',   -- open / kept / broken / withdrawn
+    note         TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    resolved_at  TEXT
+);
+
+-- 承诺的三个常用查询：这条事务的承诺、这个关系的承诺、还没兑现的。
+CREATE INDEX IF NOT EXISTS idx_promises_task    ON promises(task_id);
+CREATE INDEX IF NOT EXISTS idx_promises_contact ON promises(contact_id);
+CREATE INDEX IF NOT EXISTS idx_promises_status  ON promises(status, promised_for);
+"""
+
 #: **多语句**的域变更，键是**目标**版本。
 #:
 #: 为什么不并进 :data:`_MIGRATIONS`：那个元组一步只跑一条 ``conn.execute``，
@@ -450,6 +525,16 @@ _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
     # 那是「按角色的脉络知识」，这是「跨角色的 core 记忆」，作用域模型不同
     # （外键 vs scope 文本），理由见 _MEMORY_SCHEMA 的注释。
     (17, _MEMORY_SCHEMA),
+    # 18 → 19：contacts + promises（对外承诺，11.19 / V1.51）。
+    #
+    # 走多语句通道的原因同 v15/v17：这一版要建**两张表 + 三个索引**，
+    # 塞不进一条 executescript 的单语句通道；而拆成多步会留下
+    # 「表建了索引没建」的中间态。
+    #
+    # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等；新库 init_schema
+    # 时已有同款建表，重复执行无害。理由见 _PROMISE_SCHEMA 的注释
+    # （为什么是两张表、为什么 task_id 一对一）。
+    (19, _PROMISE_SCHEMA),
 )
 
 #: 覆盖默认数据目录的环境变量名。
@@ -673,6 +758,10 @@ CREATE TABLE IF NOT EXISTS captured_items (
     resolved_at TEXT
 );
 """
+
+#: 新库的基线 schema 在 _SCHEMA 之后**追加** _PROMISE_SCHEMA 的内容 ——
+#: 理由见 _PROMISE_SCHEMA 的注释（为什么是两张表、为什么 task_id 一对一）。
+_SCHEMA = _SCHEMA + _PROMISE_SCHEMA
 
 
 def resolve_db_path(home: str | Path | None = None) -> Path:

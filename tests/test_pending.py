@@ -64,6 +64,27 @@ class TestPendingService:
         assert all(i.status is CapturedStatus.PENDING for i in items)
         assert all(i.resolved_at is None and i.task_id is None for i in items)
 
+    def test_fifo_holds_even_when_captured_at_the_same_instant(self, env):
+        """同刻收下也得按插入序 —— 回归（V1.51 修）。
+
+        上面那条 FIFO 靠 ``_add`` 默认推进一分钟才成立，时间戳天然有差。
+        真实世界不保证：一次批量发多张图、脚本导入、测试冻时钟，都能同刻
+        落库。而排序原本写的是 ``created_at ASC, id ASC``，``id`` 是随机
+        hex —— 同刻时顺序随机，于是「列表第 1 条」与「``/pending 1``
+        澄清出来的第 1 条」可能不是同一条，用户会以为系统弄错了。
+
+        这个坑 V1.37 在 ``task_records`` 上踩过一次（那次加了 seq 列），
+        这里改用 ``rowid``（插入序），与 tasks 仓储同一个先例。
+        """
+        app, _clock, _role = env
+        # advance_by=0 → 不推进时钟，三条必定同刻。
+        names = ["one.pdf", "two.pdf", "three.pdf"]
+        added = [_add(app, _clock, name=n, advance_by=0) for n in names]
+        items = app.pending.pending()
+        assert [i.id for i in items] == [a.id for a in added], (
+            "同刻创建的顺序必须等于插入顺序"
+        )
+
     def test_clarify_creates_task_links_item_and_empties_queue(self, env):
         app, clock, _role = env
         item = _add(app, clock, name="报价单.pdf", size=4096, path="/x/quote.pdf")
@@ -302,3 +323,58 @@ class TestBridgeEnqueues:
         bridge._capture_unsupported(_msg(event_id="dup", message_id="", attachment=att))
         bridge._capture_unsupported(_msg(event_id="dup", message_id="", attachment=att))
         assert app.pending.count() == 1
+
+
+# ----------------------------------------------------------------- 通道收口
+class TestChannelCanClarify:
+    """飞书里 ``/pending`` 到底能不能用（设计文档 11.18.8）。
+
+    这条纪律是**实测出来的**：文档曾把「飞书里直接 ``/pending``」列为不做，
+    而 ``channel.py:359`` 早就放行了所有 ``/`` 前缀命令 —— 文档说不做、
+    代码做得到，是比两种明确状态都差的错位。11.18.8 收口成「能与终端同权」，
+    本类把它钉住，免得哪天又被当成「没接线」而改回去。
+    """
+
+    def _channel(self, app):
+        from freeagent.services.channel import ChannelService
+
+        return ChannelService(app, allowed_senders=frozenset({"ou_a"}))
+
+    def test_channel_lists_pending(self, env):
+        app, clock, _role = env
+        _add(app, clock, name="合同扫描件.pdf")
+        reply = self._channel(app).handle("oc1", "ou_a", "/pending")
+        assert "待处理" in reply.text, f"通道里 /pending 要能列出：{reply.text!r}"
+        assert "合同扫描件.pdf" in reply.text, f"要看到收下了什么：{reply.text!r}"
+
+    def test_channel_clarifies_into_a_task(self, env):
+        app, clock, _role = env
+        _add(app, clock, name="合同扫描件.pdf")
+        channel = self._channel(app)
+        reply = channel.handle("oc1", "ou_a", "/pending 1 处理合同扫描件")
+        assert app.pending.count() == 0, "澄清后待处理清空"
+        tasks = app.tasks.list_all() if hasattr(app.tasks, "list_all") else []
+        assert "处理合同扫描件" in reply.text, f"回话要说清建了什么：{reply.text!r}"
+        # 落点必须说清：手机上看不见「我归到默认脉络了」（11.18.8）
+        assert "默认脉络" in reply.text, f"要说清落在哪：{reply.text!r}"
+        assert "/move" in reply.text, f"要附归位方法：{reply.text!r}"
+
+    def test_capture_reply_points_to_this_channel_not_terminal(self, env, tmp_path):
+        """飞书回话不许说「在终端 /pending」—— 用户人就在飞书里。
+
+        说错了用户会绕到终端去找，绕一圈才发现飞书里就有；而 11.18.7
+        曾把飞书澄清记成「不做」，于是回话与文档双双说谎。
+        """
+        app, _clock, _role = env
+        home = tmp_path / "state3"
+        home.mkdir()
+        bridge = FeishuBridge(
+            _FakeChannel(app), _FakeSender(), config=None,
+            home=home, pending=app.pending,
+        )
+        bridge._capture_unsupported(
+            _msg(attachment=AttachmentRef("image", "k9", "image", 0)),
+        )
+        reply = next(t for _, t in bridge.sender.sent if "待处理队列" in t)
+        assert "终端" not in reply, f"飞书回话不许把人指去终端：{reply!r}"
+        assert "/pending" in reply, f"要指明在哪看：{reply!r}"

@@ -43,9 +43,16 @@ def test_state_open_flag():
 
 
 def test_weights_match_design_doc():
-    """回归：权重表是契约，改动必须同步文档 7.2 节。"""
+    """回归：权重表是契约，改动必须同步文档 7.2 节。
+
+    字典书写顺序即权重降序。V1.51 插入 ``PROMISE_OVERDUE: 45`` 时
+    卡在 50 与 40 之间，理由见设计文档 19.5.3：改自己的截止日没人受损，
+    答应别人的没有内部宽限期 —— 所以高于 DEADLINE_RISK；但代价是
+    「卡住」（50），那是全局性的，仍该排在最前。
+    """
     assert SORT_SIGNAL_WEIGHTS == {
         SortSignalCode.OVERDUE_WAIT: 50,
+        SortSignalCode.PROMISE_OVERDUE: 45,
         SortSignalCode.DEADLINE_RISK: 40,
         SortSignalCode.DEPENDED_ON: 30,
         SortSignalCode.RESUME_STALE: 20,

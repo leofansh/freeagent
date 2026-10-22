@@ -78,11 +78,18 @@ class TodayService:
         clock: Clock,
         *,
         energy_windows: EnergyWindows | None = None,
+        promise_of=None,
     ) -> None:
         self._tasks = tasks
         self._records = records
         self._clock = clock
         self._energy_windows = energy_windows
+        #: 对外承诺的查找器（11.19）。**刻意是回调而不是仓储依赖** ——
+        #: 排序层不该知道承诺表长什么样，而 TodayService 也不该为了
+        #: 「多一个权重」就多一个仓储。传 None = 没有承诺（默认）。
+        #:
+        #: 回调签名：``(task_id) -> Promise | None``。
+        self._promise_of = promise_of
 
     def set_energy_windows(self, windows: EnergyWindows | None) -> None:
         """运行期换精力档位（设置页用），下次算分即生效。
@@ -91,6 +98,12 @@ class TodayService:
         所以换完不需要重建任何服务。
         """
         self._energy_windows = windows
+
+    def _promise_for(self, task_id: str):
+        """取这条事务的承诺。**没接线就返回 None**（不算信号）。"""
+        if self._promise_of is None:
+            return None
+        return self._promise_of(task_id)
 
     # -- 顺延 --------------------------------------------------------------- #
     def rollover(self) -> RolloverReport:
@@ -128,6 +141,7 @@ class TodayService:
             today,
             dependents_of=self._tasks.count_dependents,
             energy_windows=self._energy_windows,
+            promise_of=self._promise_for,
         )
         # 没排期的不进今天视图（设计如此），但条数要报 —— 理由见
         # :attr:`TodayView.unscheduled_count`。
@@ -153,4 +167,5 @@ class TodayService:
             self._clock.today(),
             dependents_of=self._tasks.count_dependents,
             energy_windows=self._energy_windows,
+            promise_of=self._promise_for,
         )
