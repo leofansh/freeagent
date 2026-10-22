@@ -4,6 +4,9 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+# 本机跑全量测试时用的 ``--basetemp`` 落点（沙箱拦pytest 清理
+# ``%TEMP%\pytest-of-*``，只能指到仓库内；跑完一两次就能到几百 MB）。
+.pytest-tmp/
 .mypy_cache/
 .ruff_cache/
 .venv/

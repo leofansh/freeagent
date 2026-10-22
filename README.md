@@ -320,6 +320,9 @@ python -m freeagent.feishu.bridge
 | `/feedback` | 执行层履历：派了多少、成了多少、反复失败在哪（只摆事实） |
 | `/model` | 连续性个人模型：从记录现推的规律（完成时段 / 常顺延 / 卡住的等候 / 角色活跃度，只摆事实） |
 | `/pending` | 待处理收集器：飞书收下的图片/文件；无参列出，`/pending N [标题]` 澄清成事务，`/pending drop N` 忽略 |
+| `/promise` | 对外承诺：我答应别人的；无参列出，`/promise 记 <事务id> <承诺> [关系=名字] [期限=时间]` 记一笔，`/promise keep\|break\|withdraw <序号>` 落终态，`/promise postpone <序号> <日期>` 延期。**只显式记录，不自动推断** |
+| `/contact` | 关系对象：事务背后的人；无参列出（附「几条承诺未兑现」**与「几笔在等他」**），`/contact <名字> [备注]` 记一个 |
+| `/nudge` | 催办草稿：无参列出该催的事务（等候跟进日已过 / 承诺逾期），`/nudge <序号>` 出草稿。**只铺事实、正文留白，系统没有发送能力，绝不代发**；出了草稿也不代替你结账 |
 | `/all [open\|closed\|all]` | 全部事务（默认只列未结束） |
 | `/roles [all]` | 角色脉络（默认只列活跃，`all` 含静置） |
 | `/role <名字\|id>` | 某角色下的事务 |
@@ -354,7 +357,7 @@ python -m freeagent.feishu.bridge
 |---|---|
 | `/start` `/pause` `/done` `/drop` `<id>` | 开始 / 等会再做 / 完成 / 放弃 |
 | `/kind <id> <action\|wait\|reminder> [等谁]` | 改形状 |
-| `/wait <id> <等谁>` | 放一放，记下在等什么 |
+| `/wait <id> <等谁> [关系=名字]` | 放一放，记下在等什么；给了 `关系=` 就同时挂到关系对象上（于是 `/contact` 里能看到「几笔在等他」） |
 | `/followup <id> <日期\|off>` | 设/清跟进时间 |
 | `/today-pin <id> [日期\|off]` | 排进今天 / 指定日期 / 移出排期 |
 | `/note <id> <内容>` | 记一笔进度 |

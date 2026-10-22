@@ -1133,7 +1133,8 @@ class FeishuBridge:
                 msg.chat_id,
                 f"已收下这条{label}（{att.name}，{len(data)} 字节），"
                 "进了待处理队列。\n"
-                "在终端 /pending 能看到它，/pending <序号> 一键澄清成事务。\n"
+                "在这里敲 /pending 就能看到它，"
+                "/pending <序号> 一键澄清成事务。\n"
                 f"原件存到 {dest}",
             )
         elif state == "unwired":
