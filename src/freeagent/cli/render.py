@@ -8,9 +8,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from ..domain import RecordType, RestoreView, Role, ScoredTask, Task
+from ..domain import (
+    CONTACT_KIND_LABELS,
+    RecordType,
+    RestoreView,
+    Role,
+    ScoredTask,
+    Task,
+)
 from ..services.llm import SignalRef, TaskRef
 from ..services.reminders import ReminderDigest
 from ..services.sorting import DISCLAIMER_MARKER
@@ -299,6 +306,186 @@ def render_pending(items, now=None) -> str:
     lines.append("")
     lines.append("澄清成事务：/pending <序号> [标题]")
     lines.append("明确不要了：/pending drop <序号>")
+    return "\n".join(lines)
+
+
+def render_promises(items, contacts=None, now=None) -> str:
+    """对外承诺列表（设计文档 11.19）。
+
+    **只摆事实，不判违约**：逾期的写「已逾期 N 天」，不写「你违约了」——
+    判违约是用户的事（可能延期了、可能对方改主意了，见 11.19.5）。
+
+    ``contacts`` 是 ``{contact_id: 名字}``，用来把关系显示成
+    「答应了张总」而不是一串 id。
+    """
+    names = contacts or {}
+    count = len(items)
+    lines = [
+        f"对外承诺 · {count} 条"
+        "（我答应别人的；快到期的在前；只摆事实，违不违约你说）"
+    ]
+    if count == 0:
+        lines.append("没有未兑现的承诺。")
+        return "\n".join(lines)
+
+    lines.append("")
+    for index, promise in enumerate(items, start=1):
+        head = f"  {index}. {promise.statement}"
+        who = names.get(promise.contact_id or "")
+        if who:
+            head += f"（答应{who}）"
+        if promise.promised_for is not None:
+            head += f" · 期限 {promise.promised_for:%m-%d %H:%M}"
+            if now is not None and promise.promised_for < now:
+                overdue = now - promise.promised_for
+                days = overdue.days
+                head += (
+                    f" · **已逾期 {days} 天**"
+                    if days >= 1
+                    else " · **今天刚过期限**"
+                )
+        lines.append(head)
+    lines.append("")
+    lines.append("兑现了：/promise keep <序号>")
+    lines.append("违约了：/promise break <序号>")
+    lines.append("收回了：/promise withdraw <序号>")
+    lines.append("延期到：/promise postpone <序号> <日期>")
+    return "\n".join(lines)
+
+
+def render_contacts(items, promise_counts=None, waiting_counts=None) -> str:
+    """关系对象列表（设计文档 11.19 / 20.1.5）。
+
+    ``promise_counts`` 是 ``{contact_id: 未兑现承诺数}``，让用户一眼看到
+    「我跟谁之间还有账」—— 那是关系一等化的全部意义。
+
+    ``waiting_counts``（V1.52）是 ``{contact_id: 未结束等候数}``：关系不只
+    挂在承诺上（我答应对方），也挂在等候上（我在等对方）。两数并排，
+    「我跟张总之间有三笔没结清的」这个答案才是完整的 —— 少一半就还得
+    靠人眼翻事务列表。
+    """
+    counts = promise_counts or {}
+    waits = waiting_counts or {}
+    count = len(items)
+    lines = [f"关系对象 · {count} 个（事务背后的人；与角色脉络是两个维度）"]
+    if count == 0:
+        lines.append("还没有记录过关系对象。")
+        return "\n".join(lines)
+
+    lines.append("")
+    for index, contact in enumerate(items, start=1):
+        head = f"  {index}. {contact.name}"
+        kind = CONTACT_KIND_LABELS.get(contact.kind, contact.kind.value)
+        head += f" · {kind}"
+        parts = []
+        pending = counts.get(contact.id, 0)
+        if pending:
+            parts.append(f"{pending} 条承诺未兑现")
+        waiting = waits.get(contact.id, 0)
+        if waiting:
+            parts.append(f"{waiting} 笔在等他")
+        if parts:
+            head += " · " + "、".join(parts)
+        lines.append(head)
+        if contact.note:
+            lines.append(f"     {contact.note}")
+    return "\n".join(lines)
+
+
+def render_contact_ledger(ledger, now: datetime | None = None) -> str:
+    """关系对象名下的「一页账」（设计文档 20.1.5 的最后一步）。
+
+    见这个人之前最该先看的一页：**我欠他的**（未兑现承诺）与
+    **我在等他的**（未结束等候）。只摆事实 —— 逾期的写「已逾期 N 天」、
+    「已过 N 天」，不写「你违约了」，也不催。判违约、催不催，都是
+    用户的事（11.19.5）。
+    """
+    contact = ledger.contact
+    lines = [
+        f"{contact.name} · {CONTACT_KIND_LABELS.get(contact.kind, contact.kind.value)}",
+    ]
+    if contact.note:
+        lines.append(f"  备注：{contact.note}")
+
+    promises = ledger.promises
+    lines.append("")
+    if promises:
+        lines.append(f"我欠他的（未兑现承诺 · {len(promises)} 条）：")
+        for index, item in enumerate(promises, start=1):
+            head = f"  {index}. {item.promise.statement}"
+            when = item.promise.promised_for
+            if when is not None:
+                head += f" · 期限 {when:%m-%d %H:%M}"
+                if now is not None and when < now:
+                    head += _elapsed_tag(now - when)
+            head += f" → {item.task_title} [{item.task_id[:8]}]"
+            lines.append(head)
+    else:
+        lines.append("我欠他的：没有未兑现的承诺。")
+
+    waitings = ledger.waitings
+    lines.append("")
+    if waitings:
+        lines.append(f"我在等他的（未结束等候 · {len(waitings)} 条）：")
+        for index, item in enumerate(waitings, start=1):
+            w = item.waiting
+            head = f"  {index}. 等 {w.who_or_what}（从 {w.since:%m-%d} 起）"
+            if w.follow_up_at is not None:
+                head += f" · 原定跟进 {w.follow_up_at:%m-%d %H:%M}"
+                if now is not None and w.follow_up_at < now:
+                    head += _elapsed_tag(now - w.follow_up_at)
+            head += f" → {item.task.title} [{item.task.id[:8]}]"
+            lines.append(head)
+    else:
+        lines.append("我在等他的：没有未结束的等候。")
+
+    lines.append("")
+    if ledger.is_empty:
+        lines.append("账已结清 —— 既不欠他，也不在等他。")
+    lines.append("结账：/promise keep|break|withdraw <序号>（见 /promise 列表）")
+    lines.append(f"记新的：/promise 记 <事务id> <承诺> 关系={contact.name}")
+    lines.append(f"         /wait <事务id> <等谁> 关系={contact.name}")
+    return "\n".join(lines)
+
+
+def _elapsed_tag(delta: timedelta) -> str:
+    """「已逾期 N 天」/「已过 N 天」/「今天刚过」—— 只陈述时间，不判违约。"""
+    if delta.days >= 1:
+        return f" · 已过 {delta.days} 天"
+    return " · 今天刚过"
+
+
+def render_nudge_targets(items) -> str:
+    """该催的事务（设计文档 20.1.4）。
+
+    **只列事实与方向，不写该怎么说。** 输出里没有一句建议语气的话 ——
+    催办的急迫感由用户自己决定（``services/nudge.py`` 纪律 3）。
+    方向写清「等我方动静」还是「等我方交付」，是因为这两者语气相反，
+    看错方向就会催反（该催的人没被催，该道歉的事被写成质问）。
+    """
+    count = len(items)
+    lines = [
+        f"该催的事务 · {count} 条"
+        "（系统只铺事实，正文要你自己敲；**它不会代发**）"
+    ]
+    if count == 0:
+        lines.append(
+            "现在没有到点的催办：等候件的跟进日没过、承诺也没逾期。"
+        )
+        return "\n".join(lines)
+
+    lines.append("")
+    for index, target in enumerate(items, start=1):
+        head = f"  {index}. {target.task.title}"
+        who = target.contact_name
+        head += f"（{who}）" if who else "（未挂关系）"
+        if target.direction == "promise":
+            head += " · 我欠对方"
+        else:
+            head += " · 等对方"
+        lines.append(f"{head}　{target.elapsed}")
+    lines.append("")
+    lines.append("起草稿（事实已铺好，正文留白）：/nudge <序号>")
     return "\n".join(lines)
 
 

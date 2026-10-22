@@ -122,6 +122,18 @@ _USAGE: dict[str, str] = {
     ),
     "/tick": "/tick",
     "/llm": "/llm            查看当前智能层与配置（不显示 Key）",
+    # 对外承诺（11.19）。用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
+    "/promise": (
+        "/promise [记 <事务id> <承诺> [关系=名字] [期限=时间]"
+        "|keep <序号>|break <序号>|withdraw <序号>|postpone <序号> <日期>]"
+        "  对外承诺：我答应别人的"
+    ),
+    "/contact": "/contact [关系名 [备注]]  关系对象：事务背后的人（可检索）",
+    # 催办草稿（20.1.4）。用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
+    "/nudge": (
+        "/nudge [序号]  该催的事务；给序号就出草稿"
+        "（**只铺事实、正文留白，绝不代发**）"
+    ),
     # 用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
     "/agents": "/agents       有哪些执行器可用、装了没、能不能派（只看不派）",
     "/ask": "/ask <问题>    问执行器一句（只读：不改文件、不建事务、不问审批）",
@@ -131,6 +143,33 @@ _USAGE: dict[str, str] = {
 
 _WAIT_TARGET_RE = re.compile(r"等([^，。；、]{1,10}?)(?:回复|回|答复|结果|确认|通知|消息)")
 
+_RELATION_MARK = "关系="
+
+
+def _split_relation(tokens: list[str]) -> tuple[list[str], str | None]:
+    """把 ``关系=名字`` 从其余 token 里摘出来。
+
+    **刻意用显式标记，不用位置猜**（与 ``/promise 记`` 同一条纪律）：
+    「周三」这种既是日期又可能是人名的词，位置猜会误判；误判的代价是
+    把「在等张总」记成「在等一个叫周三的关系」。
+
+    返回 ``(其余 token, 关系名或 None)``。关系名可以为空（``关系=``），
+    那表示「我要挂关系，但名字还没给」—— 调用方据此报错而不是静默忽略，
+    因为静默忽略会让用户以为挂上了。
+    """
+    rest: list[str] = []
+    name: str | None = None
+    for token in tokens:
+        if token.startswith(_RELATION_MARK):
+            name = token[len(_RELATION_MARK):].strip() or ""
+        else:
+            rest.append(token)
+    if name == "":
+        raise FreeAgentError(
+            f"{_RELATION_MARK} 后面要写关系名（例：{_RELATION_MARK}张总）"
+        )
+    return rest, (name or None)
+
 _HELP = """\
 个人事务助手 · 命令
   ── 视图 ──
@@ -139,6 +178,9 @@ _HELP = """\
   /feedback           执行层履历：派了多少、成了多少、反复失败在哪（只摆事实）
   /model              连续性个人模型：从记录现推的规律（完成时段 / 常顺延 / 卡住的等候 / 角色活跃度，只摆事实）
   /pending [N|drop N]  待处理收集器：飞书收下的图片/文件，列出来、一键澄清成事务
+  /promise [记|keep|break|withdraw|postpone]  对外承诺：我答应别人的（只显式记录，不自动推断）
+  /contact [名字 [备注]]  关系对象：事务背后的人（与角色脉络是两个维度）
+  /nudge [序号]       该催的事务；给序号出草稿（只铺事实、正文留白，**绝不代发**）
   /all [open|closed|all]  全部事务（默认只列未结束）
   /roles [all]        角色脉络（默认只列活跃；all 含静置）
   /role <名字|id>      某个角色下的事务
@@ -1210,6 +1252,11 @@ class Repl:
             # 问一句（设计文档 11.10.6）。刻意放在委派**旁边**而不是混进
             # 委派那张表：它不建事务、不落库，混进去会让人以为它能存东西。
             "/ask": self._cmd_ask,
+            # 对外承诺与关系对象（设计文档 11.19）。放在「脉络」那张表**外面**，
+            # 因为它不是脉络 —— 关系是「事务背后的人」，与角色正交（11.19.2）。
+            "/promise": self._cmd_promise,
+            "/contact": self._cmd_contact,
+            "/nudge": self._cmd_nudge,
         }
 
     # ---- 视图 ---- #
@@ -1305,6 +1352,255 @@ class Repl:
             self._usage("/pending")
             return
         self._say(render.render_pending(items))
+
+    def _cmd_promise(self, args: list[str]) -> None:
+        """对外承诺（设计文档 11.19）。
+
+        **只由用户显式触发，绝不从对话里静默推断**（11.19.1）——
+        抽取「你答应了什么」是弱信号，与 11.10.5「绝不自动触发委派」同型。
+        """
+        items = self.app.promise.open_promises()
+        if not args:
+            self._say(
+                render.render_promises(
+                    items, self._contact_names(), now=self.app.clock.now()
+                )
+            )
+            return
+
+        head = args[0]
+
+        # 记一笔：/promise 记 <事务id> <承诺内容> [关系] [期限]
+        if head == "记":
+            self._promise_record(args[1:])
+            return
+
+        # 落终态：/promise keep|break|withdraw <序号>
+        if head in ("keep", "break", "withdraw"):
+            if len(args) < 2 or not args[1].isdigit():
+                self._usage("/promise")
+                return
+            index = int(args[1])
+            if not 1 <= index <= len(items):
+                self._say(
+                    f"没有第 {index} 条承诺（当前共 {len(items)} 条）。"
+                    "/promise 看列表。"
+                )
+                return
+            promise = items[index - 1]
+            action = {
+                "keep": ("已兑现", self.app.promise.keep),
+                "break": ("已违约", self.app.promise.break_),
+                "withdraw": ("已收回", self.app.promise.withdraw),
+            }[head]
+            label, call = action
+            try:
+                call(promise.id)
+            except FreeAgentError as exc:
+                self._say(f"记不上：{exc}")
+                return
+            self._say(
+                f"第 {index} 条承诺记为「{label}」：{promise.statement}\n"
+                f"未兑现的还剩 {self.app.promise.open_count()} 条。"
+            )
+            return
+
+        # 延期：/promise postpone <序号> <日期>
+        if head == "postpone":
+            if len(args) < 3 or not args[1].isdigit():
+                self._usage("/promise")
+                return
+            index = int(args[1])
+            if not 1 <= index <= len(items):
+                self._say(
+                    f"没有第 {index} 条承诺（当前共 {len(items)} 条）。"
+                    "/promise 看列表。"
+                )
+                return
+            try:
+                when = self._parse_moment(args[2])
+            except FreeAgentError as exc:
+                self._say(f"日期看不懂：{exc}")
+                return
+            try:
+                self.app.promise.postpone(items[index - 1].id, when)
+            except FreeAgentError as exc:
+                self._say(f"延期不上去：{exc}")
+                return
+            self._say(
+                f"第 {index} 条承诺的期限改到 {when:%Y-%m-%d %H:%M}。"
+                "（延期不算违约。）"
+            )
+            return
+
+        self._usage("/promise")
+
+    def _promise_record(self, args: list[str]) -> None:
+        """``/promise 记 <事务id> <承诺内容> [关系] [期限]``。
+
+        承诺**必须有兑现物**（11.19.2）：没有兑现物的承诺是空头承诺，
+        记下来也无处可查、无从兑现。所以第一个参数是事务 id。
+
+        **关系与期限用显式标记分开**（``关系=张总`` / ``期限=周三``），
+        不用位置猜：位置猜的话「周三」这种既是日期又可能是人名的
+        东西会被误判 —— 而误判的代价是把「我答应张总」记成「我答应
+        陌生人，期限周三」。
+        """
+        if len(args) < 2:
+            self._usage("/promise")
+            return
+        try:
+            task_id = self._resolve_id(args[0])
+        except FreeAgentError as exc:
+            self._say(f"记不上承诺：{exc}")
+            return
+        statement = args[1]
+        rest = args[2:]
+
+        contact_name: str | None = None
+        promised_for: datetime | None = None
+        for token in rest:
+            if token.startswith("关系="):
+                contact_name = token[len("关系="):].strip() or None
+            elif token.startswith("期限="):
+                raw = token[len("期限="):].strip()
+                try:
+                    promised_for = self._parse_moment(raw)
+                except FreeAgentError as exc:
+                    self._say(f"期限看不懂：{exc}")
+                    return
+            else:
+                self._say(
+                    f"看不懂「{token}」—— 关系写「关系=张总」，"
+                    "期限写「期限=明天下午三点」。"
+                )
+                return
+
+        try:
+            promise = self.app.promise.promise(
+                statement,
+                contact_name=contact_name,
+                promised_for=promised_for,
+                task_id=task_id,
+            )
+        except FreeAgentError as exc:
+            self._say(f"记不上承诺：{exc}")
+            return
+        who = self._contact_names().get(promise.contact_id or "")
+        tail = f"（答应{who}）" if who else ""
+        when = f"，期限 {promised_for:%Y-%m-%d %H:%M}" if promised_for else ""
+        self._say(
+            f"记下了这条承诺{tail}：{promise.statement}{when}\n"
+            f"挂在事务 {task_id[:8]} 上。\n"
+            f"未兑现的承诺共 {self.app.promise.open_count()} 条。"
+        )
+
+    def _cmd_contact(self, args: list[str]) -> None:
+        """关系对象（设计文档 11.19 / 20.1.5）。
+
+        与角色脉络**正交**：角色回答「这件事属于哪一块」，关系回答
+        「我跟谁之间有这笔账」。
+        """
+        if not args:
+            counts: dict[str, int] = {}
+            for promise in self.app.promise.open_promises():
+                if promise.contact_id:
+                    counts[promise.contact_id] = counts.get(promise.contact_id, 0) + 1
+            waits = self._waiting_counts_by_contact()
+            self._say(
+                render.render_contacts(
+                    self.app.promise.contacts(), counts, waiting_counts=waits
+                )
+            )
+            return
+        name = args[0]
+        note = " ".join(args[1:]).strip() or None
+        # 单参数、且这个关系**已经存在** → 查账（「见人前一页账」）。
+        # 只有「记备注」（多参数）或「还不存在」才落到创建 ——
+        # 关系对象是记账层，查账必须只读、不脏写；为查账去建一个
+        # 不存在的人，会把「我有没有这笔账」变成「我造了一笔账」。
+        if note is None:
+            existing = self.app.promise.find_contact(name)
+            if existing is not None:
+                self._say(
+                    render.render_contact_ledger(
+                        self.app.promise.ledger(existing),
+                        now=self.app.clock.now(),
+                    )
+                )
+                return
+        try:
+            contact = self.app.promise.contact(name, note=note)
+        except FreeAgentError as exc:
+            self._say(f"记不下关系：{exc}")
+            return
+        self._say(
+            f"关系对象「{contact.name}」（{contact.id[:8]}）已记下。\n"
+            "承诺挂到它名下就能按人聚合了：/promise 记 <事务id> <承诺> "
+            f"{contact.name}"
+        )
+
+    def _contact_names(self) -> dict[str, str]:
+        """``{contact_id: 名字}``，给渲染层用。"""
+        return {c.id: c.name for c in self.app.promise.contacts()}
+
+    def _waiting_counts_by_contact(self) -> dict[str, int]:
+        """每个关系对象名下的**未结束等候**条数。
+
+        与未兑现承诺并排显示，两数一读就是「我跟这个人之间有多少笔
+        没结清的账」—— 关系一等化的意义（20.1.5）全在这两行数字上。
+        """
+        counts: dict[str, int] = {}
+        for task in self.app.tasks.list_open():
+            waiting = task.waiting_on
+            if waiting is not None and waiting.contact_id:
+                counts[waiting.contact_id] = counts.get(waiting.contact_id, 0) + 1
+        return counts
+
+    def _cmd_nudge(self, args: list[str]) -> None:
+        """该催的事务 / 出催办草稿（设计文档 20.1.4）。
+
+        **起草不发送**：这一命令只产出文本，系统没有「顺手发出去」
+        这条路。理由见 :mod:`freeagent.services.nudge` 的纪律 1 ——
+        不可逆的动作不该只靠一条纪律守着，得让那条路径不存在。
+        """
+        targets = self.app.nudge.targets()
+        if not args:
+            self._say(render.render_nudge_targets(targets))
+            return
+        if not targets:
+            self._say("现在没有到点的催办（等候件的跟进日没过、承诺也没逾期）。")
+            return
+        raw = args[0]
+        picked: object | None = None
+        # **先试序号，再试 id 前缀**，而不是靠 ``isdigit()`` 分流。
+        # 踩过的坑：`id` 是 ``new_id()`` 的纯 hex，**可能是全数字**
+        # （实测 id 前缀 "61316741" 就是），而 ``isdigit()`` 判真后
+        # 会被当成序号 61316741，于是「没有第 61316741 条」——
+        # 用户明明敲了一个合法的 id，却被告越界。
+        # 判据不是「像不像数字」，而是**试过之后哪种解释成立**：
+        # 序号在范围内就按序号，超界了再按 id 试一次，两边都不中才报错。
+        if raw.isdigit():
+            number = int(raw)
+            if 1 <= number <= len(targets):
+                picked = targets[number - 1]
+        if picked is None:
+            prefix = raw.lower()
+            picked = next(
+                (t for t in targets if t.task.id.startswith(prefix)), None
+            )
+        if picked is None:
+            if raw.isdigit():
+                self._say(f"没有第 {raw} 条（现有 1..{len(targets)}），"
+                          f"也不匹配任何事务 id。")
+            else:
+                self._say(f"没有匹配 {raw} 的催办项（先 /nudge 不带参数看列表）。")
+            return
+        task = picked.task  # type: ignore[union-attr]
+        self._say(f"催办草稿 · {task.title}")
+        self._say("")
+        for line in self.app.nudge.draft(picked).splitlines():  # type: ignore[arg-type]
+            self._say(f"  {line}")
 
     def _cmd_feedback(self, args: list[str]) -> None:
         """执行层履历：派了多少、成了多少、反复失败在哪。
@@ -1832,34 +2128,64 @@ class Repl:
             raise FreeAgentError("形状只能是 action/wait/reminder（或 动作/等候/提醒）")
         waiting = None
         if kind is TaskKind.WAIT:
-            target = " ".join(args[2:]).strip()
+            target_tokens, contact_name = _split_relation(args[2:])
+            target = " ".join(target_tokens).strip()
             if not target:
                 current = self.app.tasks.get(task_id)
                 if current.waiting_on is None:
                     raise FreeAgentError(
                         "改成等候类要说在等什么：/kind <id> wait 客户回复"
                     )
+                # 保留原有的 contact_id：只是换形状，不该把人挂掉。
                 target = current.waiting_on.who_or_what
+                contact_id = current.waiting_on.contact_id
+            else:
+                contact_id = (
+                    self.app.promise.contact(contact_name).id if contact_name else None
+                )
             waiting = WaitingOn(
-                kind=WaitingKind.PERSON, who_or_what=target, since=self.app.clock.now()
+                kind=WaitingKind.PERSON,
+                who_or_what=target,
+                since=self.app.clock.now(),
+                contact_id=contact_id,
             )
         task = self.app.tasks.set_kind(task_id, kind, waiting_on=waiting)
         self._say(f"{task.title} → {task.kind.label}｜{task.state.label}")
 
     def _cmd_wait(self, args: list[str]) -> None:
+        """``/wait <id> <等谁> [关系=名字]``。
+
+        ``关系=`` 是可选的（11.19）：给了就把这条等候**挂到关系对象上**，
+        于是「我跟张总之间有几笔在等的事」能聚合出来（20.1.5 说的正是
+        这件事）。不给也能记 —— 记一句「在等对方回话」不该先被要求
+        建一个人。
+        """
         if len(args) < 2:
             self._usage("/wait")
             return
+        target_tokens, contact_name = _split_relation(args[1:])
+        target = " ".join(target_tokens).strip()
+        if not target:
+            raise FreeAgentError(
+                "要说在等什么：/wait <id> <等谁>  [关系=名字]"
+            )
+        contact_id = None
+        if contact_name:
+            contact_id = self.app.promise.contact(contact_name).id
         task = self.app.tasks.block(
             self._resolve_id(args[0]),
             WaitingOn(
                 kind=WaitingKind.PERSON,
-                who_or_what=" ".join(args[1:]),
+                who_or_what=target,
                 since=self.app.clock.now(),
+                contact_id=contact_id,
             ),
             reason="放一放",
         )
-        self._say(f"已放一放：{task.title}（等 {task.waiting_on.who_or_what}）")  # type: ignore[union-attr]
+        tail = f"，已挂到关系对象「{contact_name}」" if contact_name else ""
+        self._say(
+            f"已放一放：{task.title}（等 {task.waiting_on.who_or_what}{tail}）"  # type: ignore[union-attr]
+        )
 
     def _cmd_followup(self, args: list[str]) -> None:
         if len(args) < 2:
