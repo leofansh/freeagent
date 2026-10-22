@@ -25,6 +25,9 @@ __all__ = [
     "today_payload",
     "all_payload",
     "roles_options",
+    "pending_payload",
+    "promises_payload",
+    "contacts_payload",
 ]
 
 
@@ -81,7 +84,9 @@ def scored_payload(
     }
 
 
-def today_payload(view: TodayView, names: dict[str, str]) -> dict:
+def today_payload(
+    view: TodayView, names: dict[str, str], pending_count: int = 0
+) -> dict:
     rolled = view.rolled_over_ids
     return {
         "kind": "today",
@@ -91,6 +96,10 @@ def today_payload(view: TodayView, names: dict[str, str]) -> dict:
         # 没排期的**不进**今天视图（设计如此），但条数照报 —— 不报的话
         # 界面显示「今天 0 条」，而用户刚记的那件事其实在库里。
         "unscheduled_count": view.unscheduled_count,
+        # 待处理收集器的条数（11.18 / 11.19）。**只报数不报内容** ——
+        # 收集器是工作台，今天这块屏幕只负责提醒「还有没收揽的活」。
+        # 0 条照报（前端据此隐藏那一行），不像 CLI 那样「0 条不占位」。
+        "pending_count": pending_count,
         "items": [
             scored_payload(s, names, rolled_over=s.task.id in rolled)
             for s in view.items
@@ -104,6 +113,94 @@ def today_payload(view: TodayView, names: dict[str, str]) -> dict:
                 for i in view.rollover.items
             ],
         },
+    }
+
+
+def pending_payload(items) -> dict:
+    """待处理收集器（11.18）。
+
+    **只摆事实，不猜内容**：每条捕获显示类型、收下时间、大小、本地路径 ——
+    「它是什么」留给用户。
+
+    ``index`` 是**澄清时的编号**（从 1 起，与 ``/pending N`` 一致）。
+    这里必须显式给出而不能指望前端数出来：三个入口（终端、飞书、Web）
+    数的是同一批东西，谁自己数谁就跟别人对不上号。字段写在这里，
+    是为了让「序号」只有一个出处（12.1.1「一份能力一份实现」）。
+    """
+    return {
+        "kind": "pending",
+        "count": len(items),
+        "items": [
+            {
+                "index": index,
+                "id": i.id,
+                "kind": i.kind,
+                "name": i.name,
+                "size": i.size,
+                "path": i.path,
+                "created_at": i.created_at.isoformat(),
+            }
+            for index, i in enumerate(items, start=1)
+        ],
+    }
+
+
+def promises_payload(items, contacts: dict[str, str], now=None) -> dict:
+    """对外承诺（11.19）。
+
+    **只摆事实，不判违约**：逾期的只标「已逾期」，不写「违约」——
+    判违约是用户的事（11.19.5）。
+    """
+    rows = []
+    for index, promise in enumerate(items, start=1):
+        overdue = (
+            now is not None
+            and promise.promised_for is not None
+            and promise.promised_for < now
+        )
+        rows.append(
+            {
+                "index": index,
+                "id": promise.id,
+                "statement": promise.statement,
+                "contact_id": promise.contact_id,
+                "contact_name": contacts.get(promise.contact_id or ""),
+                "promised_for": (
+                    promise.promised_for.isoformat()
+                    if promise.promised_for is not None
+                    else None
+                ),
+                "status": promise.status.value,
+                "overdue": overdue,
+            }
+        )
+    return {"kind": "promises", "count": len(items), "items": rows}
+
+
+def contacts_payload(
+    items, promise_counts: dict[str, int], waiting_counts: dict[str, int] | None = None
+) -> dict:
+    """关系对象（11.19 / 20.1.5）。附「几条承诺未兑现」与「几笔在等他」。
+
+    两数并排，关系才真的「一等」：只看承诺会漏掉「我在等对方」那一半，
+    只看等候会漏掉「我欠对方」那一半 —— 而用户问的其实是同一句
+    「我跟这个人之间有几笔没结清的」（V1.52）。
+    """
+    waits = waiting_counts or {}
+    return {
+        "kind": "contacts",
+        "count": len(items),
+        "items": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "kind": c.kind.value,
+                "note": c.note,
+                "open_promises": promise_counts.get(c.id, 0),
+                "open_waitings": waits.get(c.id, 0),
+            }
+            for c in items
+        ],
     }
 
 

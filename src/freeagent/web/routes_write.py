@@ -30,13 +30,15 @@ from . import (
     endpoints_feishu_config,
     endpoints_oc_dispatch,
     endpoints_oc_selection_write,
+    endpoints_pending,
+    endpoints_promise,
     endpoints_read,
     endpoints_services,
     endpoints_system,
     endpoints_write,
     llm_probe,
 )
-from .actions import is_allowed_action
+from .actions import is_allowed_action, is_allowed_promise_action
 from .body import MAX_IMAGE_BODY
 
 __all__ = ["dispatch_post", "MAX_IMAGE_BODY"]
@@ -191,6 +193,29 @@ def dispatch_post(
         if is_allowed_action(action):
             return HTTPStatus.OK, endpoints_write.mutate(
                 app, parts[2], action, read_body(allow_empty=True)
+            )
+
+    if parts == ["api", "pending", "clarify"]:
+        # 澄清收集器里的捕获成事务（11.18 / V1.56，Web 待处理视图的操作）。
+        # POST-only：澄清是**唯一建事务入口**且改数据，不能挂在 GET 上
+        # （浏览器预取、爬虫都会自动发 GET）。与 CLI `/pending N` 走同一个
+        # 服务层入口（PendingService.clarify）—— 一份能力一份实现。
+        return HTTPStatus.CREATED, endpoints_pending.pending_clarify(
+            app, read_body()
+        )
+
+    # 承诺结账（11.19 / 11.20，Web「承诺」视图的操作）。白名单单列
+    # （PROMISE_ACTIONS），理由同事务动作：动作名是 URL 的一部分，
+    # 漏过一个就是一条没人看过的写路径。POST-only —— 改状态的按钮
+    # 不能挂在 GET 上（浏览器预取、爬虫都会自动发 GET）。
+    if len(parts) == 4 and parts[:2] == ["api", "promise"]:
+        action = parts[3]
+        if is_allowed_promise_action(action):
+            # 结账不需要请求体，但必须消费它（同 /api/task 分支）：否则
+            # keep-alive 连接复用时残留 body 会把下一个请求读歪。
+            read_body(allow_empty=True)
+            return HTTPStatus.OK, endpoints_promise.promise_action(
+                app, parts[2], action
             )
 
     return None

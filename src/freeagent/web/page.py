@@ -24,6 +24,10 @@ from .js_chat_select import JS_CHAT_SELECT
 from .js_chat_store import JS_CHAT_STORE
 from .js_core import JS_CORE
 from .js_detail import JS_DETAIL
+from .js_contacts import JS_CONTACTS
+from .js_promises import JS_PROMISES
+from .js_pending import JS_PENDING
+from .js_nudge import JS_NUDGE
 from .js_artifact import JS_ARTIFACT
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
@@ -64,6 +68,22 @@ INDEX_HTML = (
             JS_SETTINGS_LLM,
             JS_SETTINGS,
             JS_DETAIL,
+            # contacts 提供 renderContacts/openContact（关系视图，boot 分发
+            # data-view=contacts 用）。只用 JS_CORE 的 el/esc/api/toast/load，
+            # 但必须在 JS_BOOT 之前进页面。
+            JS_CONTACTS,
+            # promises 提供 renderPromises/settle（承诺视图，boot 分发
+            # data-view=promises 用）。只用 JS_CORE 的 helper + js_detail 的
+            # post，但必须在 JS_BOOT 之前进页面。
+            JS_PROMISES,
+            # pending 提供 renderPending/openClarify/clarify（待处理视图，
+            # boot 分发 data-view=pending 用）。只用 JS_CORE helper + js_detail
+            # 的 post，但必须在 JS_BOOT 之前进页面。
+            JS_PENDING,
+            # nudge 提供 renderNudge/openDraft/copyDraft（催办视图，boot
+            # 分发 data-view=nudge 用）。只用 JS_CORE helper + js_detail 的
+            # api，但必须在 JS_BOOT 之前进页面。
+            JS_NUDGE,
             # artifact 提供 artifactBar（验收按钮），由 JS_DETAIL 的
             # renderTask 调用 —— 用的是 js_detail 里的 post/toast/openTask。
             # 声明提升让顺序无关，写成依赖序。

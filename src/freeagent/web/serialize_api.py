@@ -15,6 +15,7 @@ __all__ = [
     "reminder_payload",
     "settings_payload",
     "chat_payload",
+    "ledger_payload",
 ]
 
 
@@ -181,4 +182,52 @@ def task_payload(view: RestoreView, names: dict[str, str]) -> dict:
             "note": waiting.note,
         },
         "next_actions": list(view.next_actions),
+    }
+
+
+def ledger_payload(ledger, now=None) -> dict:
+    """单个关系对象的「一页账」（设计文档 11.20.6，Web「关系」视图明细）。
+
+    这是 ``/api/contacts`` 列表的**明细落点**：列表给「几条承诺 + 几笔在等」，
+    点进来给逐条。**只摆事实，不判违约** —— 逾期的只标 ``overdue`` /
+    ``followup_overdue``，不写「违约」（11.19.5）。
+    """
+    contact = ledger.contact
+    return {
+        "kind": "contact_ledger",
+        "contact": {
+            "id": contact.id,
+            "name": contact.name,
+            "kind": contact.kind.value,
+            "note": contact.note,
+        },
+        "promises": [
+            {
+                "statement": p.promise.statement,
+                "promised_for": _iso(p.promise.promised_for),
+                "overdue": (
+                    now is not None
+                    and p.promise.promised_for is not None
+                    and p.promise.promised_for < now
+                ),
+                "task_title": p.task_title,
+                "task_id": p.task_id,
+            }
+            for p in ledger.promises
+        ],
+        "waitings": [
+            {
+                "who_or_what": w.waiting.who_or_what,
+                "since": _iso(w.waiting.since),
+                "follow_up_at": _iso(w.waiting.follow_up_at),
+                "followup_overdue": (
+                    now is not None
+                    and w.waiting.follow_up_at is not None
+                    and w.waiting.follow_up_at < now
+                ),
+                "task_title": w.task.title,
+                "task_id": w.task.id,
+            }
+            for w in ledger.waitings
+        ],
     }

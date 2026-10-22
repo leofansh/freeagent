@@ -16,8 +16,10 @@ __all__ = [
     "STATE_ACTIONS",
     "SCHEDULE_ACTIONS",
     "ACTION_FOR_STATE",
+    "PROMISE_ACTIONS",
     "with_actions",
     "is_allowed_action",
+    "is_allowed_promise_action",
 ]
 
 #: 界面允许触发的**状态迁移**。白名单 —— 别的动作一律 404。
@@ -43,6 +45,17 @@ ACTION_FOR_STATE: dict[str, str] = {
 
 def is_allowed_action(action: str) -> bool:
     return action in STATE_ACTIONS or action in SCHEDULE_ACTIONS
+
+
+#: 承诺结账动作（11.19 / 11.20，Web「承诺」视图的操作）。与 `/promise`
+#: 命令一致：keep（兑现）/ break（破了）/ withdraw（收回）。单列而不并入
+#: ``STATE_ACTIONS`` —— 那是事务**状态迁移**，这里是承诺**结账**，语义不同；
+#: 混进同一个白名单会让「合法迁入」这个词不再成立（同 artifact 验收的理由）。
+PROMISE_ACTIONS = ("keep", "break", "withdraw")
+
+
+def is_allowed_promise_action(action: str) -> bool:
+    return action in PROMISE_ACTIONS
 
 
 def with_actions(payload: dict) -> dict:

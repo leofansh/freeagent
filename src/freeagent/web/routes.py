@@ -22,6 +22,8 @@ from . import (
     endpoints_feishu,
     endpoints_feishu_config,
     endpoints_oc_selection,
+    endpoints_nudge,
+    endpoints_pending,
     endpoints_read,
     serialize,
     serialize_api,
@@ -93,7 +95,9 @@ def _reminders(app: App, _q: dict[str, list[str]]) -> dict[str, Any]:
 READ_ROUTES: dict[str, Callable[..., Any]] = {
     "/api/health": endpoints_read.health,
     "/api/today": lambda app, q: serialize.today_payload(
-        app.today.view(), endpoints_read.role_names(app)
+        app.today.view(),
+        endpoints_read.role_names(app),
+        pending_count=app.pending.count(),
     ),
     "/api/all": lambda app, q: endpoints_read.all_tasks(
         app, (q.get("scope") or ["open"])[0]
@@ -103,5 +107,16 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     "/api/settings": endpoints_read.settings,
     "/api/chat": endpoints_read.chat_menu,
     "/api/vision": endpoints_read.vision_status,
+    # 待处理收集器（11.18）与对外承诺（11.19）—— Web 视图补上，
+    # 复用同一服务层（12.1.1）。
+    "/api/pending": endpoints_pending.pending,
+    "/api/promises": endpoints_pending.promises,
+    "/api/contacts": endpoints_pending.contacts,
+    # 单个关系对象的一页账（11.20.6，Web「关系」视图明细）。
+    "/api/contact": endpoints_pending.contact_ledger,
+    # 催办草稿（11.20 / V1.57）：候选列表 + 单条起草。**只读 + 拼文本**，
+    # 不写表、不发（20.1.4），故都在 GET 侧。
+    "/api/nudge/candidates": endpoints_nudge.nudge_candidates,
+    "/api/nudge/draft": endpoints_nudge.nudge_draft,
     **feishu_routes(),
 }

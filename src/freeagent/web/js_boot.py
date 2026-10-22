@@ -107,6 +107,29 @@ async function load(next) {
         root.appendChild(el("div", "note", "🌙 " + esc(rem.quiet)));
       }
     } catch (e) { /* 提醒查不到不该挡住主视图 */ }
+    if (view === "contacts") {
+      // 关系视图：点开即看联系人一页账，不用记 /contact 命令（11.20.6）。
+      // 提醒照常先查（contacts 分支提前 return，不走下面的新建表单）。
+      await renderContacts(root);
+      return;
+    }
+    if (view === "promises") {
+      // 承诺视图：我欠谁的 + 直接结账（11.19 / V1.55）。提前 return，不加新建表单。
+      await renderPromises(root);
+      return;
+    }
+    if (view === "pending") {
+      // 待处理视图：收集器里的捕获 + 一键澄清成事务（11.18 / V1.56）。
+      // 提前 return，不加新建表单 —— 澄清走服务层唯一建事务入口。
+      await renderPending(root);
+      return;
+    }
+    if (view === "nudge") {
+      // 催办视图：该催的候选 + 起草铺事实留白草稿（11.20 / V1.57）。
+      // 提前 return，不加新建表单 —— 草稿不建事务、系统不发。
+      await renderNudge(root);
+      return;
+    }
     if (view === "today") {
       const data = await api("/api/today");
       renderList(data, "今天没有排进来的事务。去终端用 /today-pin 排期。");
