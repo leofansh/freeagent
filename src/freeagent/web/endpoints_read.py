@@ -206,7 +206,6 @@ def chat(app: App, body: dict) -> dict:
 
 # -- 拍照识物 ---------------------------------------------------------------
 
-
 def vision_status(app: App) -> dict:
     """能不能拍照识别。没配 Key 就**如实说没有**，而不是返回个假的「已就绪」。"""
     from ..config import API_KEY_ENV
@@ -224,6 +223,9 @@ def vision_status(app: App) -> dict:
                  "其余功能不受影响。"
         ),
     }
+
+
+# -- 连续性个人模型端点已拆到 endpoints_model.py（endpoints_read 顶到 250 行上限） --
 
 
 def vision_identify(app: App, body: dict) -> dict:

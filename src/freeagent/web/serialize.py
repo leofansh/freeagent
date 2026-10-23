@@ -28,6 +28,7 @@ __all__ = [
     "pending_payload",
     "promises_payload",
     "contacts_payload",
+    "model_payload",
 ]
 
 
@@ -113,6 +114,40 @@ def today_payload(
                 for i in view.rollover.items
             ],
         },
+    }
+
+
+def model_payload(view, now=None) -> dict:
+    """连续性个人模型（11.17 / V1.59）：节奏 / 关系 / 承诺 三面。
+
+    只读聚合的投影，不含任何业务判断 —— 逾期标 ``overdue``、违约交给用户，
+    与 /api/contacts、/api/promises 同一份「只摆事实」纪律（11.19.5）。
+    """
+    return {
+        "kind": "personal_model",
+        "since": view.since.isoformat(),
+        "until": view.until.isoformat(),
+        "window_tasks": view.window_tasks,
+        "done_in_window": view.done_in_window,
+        "completion_by_hour": [list(p) for p in view.completion_by_hour],
+        "completion_by_dow": [list(p) for p in view.completion_by_dow],
+        "rollover_total": view.rollover_total,
+        "tasks_rolled_over": [
+            {"id8": t[0], "title": t[1], "n": t[2]} for t in view.tasks_rolled_over
+        ],
+        "stuck_waiting": [
+            {"id8": t[0], "title": t[1], "age_days": t[2]} for t in view.stuck_waiting
+        ],
+        "role_activity": [{"name": n, "count": c} for (n, c) in view.role_activity],
+        # V1.59 新增两面：关系账 + 承诺与目标。
+        "relationships": [
+            {"id": r[0], "name": r[1], "open_promises": r[2], "open_waitings": r[3]}
+            for r in view.relationships
+        ],
+        "commitments": [
+            {"kind": c[0], "text": c[1], "overdue": c[2]} for c in view.commitments
+        ],
+        "disclaimer": DISCLAIMER_MARKER,
     }
 
 

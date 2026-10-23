@@ -29,6 +29,27 @@ async function refreshHeader() {
       "智能层 " + h.llm + (h.key_configured ? "（已配 Key）" : "（规则层）") +
       (h.energy_windows ? " · 精力档位已启用" : "");
   } catch (e) { /* 状态栏失败不影响主功能 */ }
+  await refreshBadges();
+}
+
+// 导航角标（V1.58）：不用点开就知道有没有事。只报数不报内容，0 隐藏。
+async function refreshBadges() {
+  let s;
+  try {
+    s = await api("/api/summary");
+  } catch (e) { return; /* 角标失败不影响主功能 */ }
+  setBadge("b-today", s.today);
+  setBadge("b-promises", s.promises_overdue);
+  setBadge("b-pending", s.pending);
+  setBadge("b-nudge", s.nudge);
+}
+
+function setBadge(id, n) {
+  const elm = document.getElementById(id);
+  if (!elm) return;
+  if (!n) { elm.hidden = true; return; }
+  elm.textContent = n > 99 ? "99+" : String(n);
+  elm.hidden = false;
 }
 
 async function load(next) {
@@ -128,6 +149,12 @@ async function load(next) {
       // 催办视图：该催的候选 + 起草铺事实留白草稿（11.20 / V1.57）。
       // 提前 return，不加新建表单 —— 草稿不建事务、系统不发。
       await renderNudge(root);
+      return;
+    }
+    if (view === "model") {
+      // 画像视图：节奏 / 关系 / 承诺 三面（11.17 / V1.59）。
+      // 提前 return，不加新建表单 —— 只读聚合，只摆事实。
+      await renderModel(root);
       return;
     }
     if (view === "today") {

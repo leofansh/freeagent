@@ -7,6 +7,12 @@
 时段、常顺延的事务、卡在别人手里的等候、角色活跃度——而不引入任何向量库或
 神经网络。这正好贴合「不自带 RAG」的定位（第十五章）：规则统计即可。
 
+V1.59 起再并入**关系账**（``contacts`` 表的「我欠 / 我等」）与
+**承诺与目标**（对外承诺 + 记忆里的「约定 / 目标」），把「关于你自己的画像」
+从纯行为统计扩成「节奏 / 关系 / 承诺」三面。仍是只读聚合：**不写库、不排序
+打分、不给建议**—— 关系账与承诺只摆事实（逾期标「已逾期」，不写「违约」；
+判断仍是用户的事），记忆只原样列出「约定 / 目标」原文。
+
 它是 **Personal 与通用助手的真正分水岭**（20.1.1 原文）：无状态即每次从零，
 等于不是 personal；而这里跨会话积累的，是对「你自己」的理解。
 
@@ -28,10 +34,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Mapping, Sequence
 
-from ..domain import RecordType, Task
+from ..domain import Contact, Promise, RecordType, Task
 from ..domain.models import TaskRecord
 from ..storage.repos import RecordRepo, RoleRepo, TaskRepo
 from .clock import Clock
+from .memory import MemoryEntry
 
 __all__ = ["PersonalModelService", "PersonalModelView", "build_personal_model"]
 
@@ -65,17 +72,24 @@ class PersonalModelView:
     tasks_rolled_over: tuple[tuple[str, str, int], ...]  # (id8, title, n) 按 n 降序
     stuck_waiting: tuple[tuple[str, str, int], ...]      # (id8, title, age_days) 按 age 降序
     role_activity: tuple[tuple[str, int], ...]            # (role_name, count) 按 count 降序
+    #: 关系账：只列「有未结清账」的关系对象（id, name, 我欠他的承诺数, 我在等他的笔数）。
+    relationships: tuple[tuple[str, str, int, int], ...]  # 按（承诺+等候）账重降序
+    #: 承诺与目标：对外承诺（open）+ 记忆里的「约定 / 目标」。只摆事实，不评判。
+    commitments: tuple[tuple[str, str, bool], ...]        # (kind, text, overdue)
 
     @property
     def is_empty(self) -> bool:
         """没有任何可归纳的事实。
 
         角色活跃度不计入：只要有事务就一定有角色，它不能代表「有没有规律」。
+        关系账与承诺计入：有「跟谁还有账」或「还记着的目标」本身就是规律。
         """
         return (
             self.done_in_window == 0
             and self.rollover_total == 0
             and not self.stuck_waiting
+            and not self.relationships
+            and not self.commitments
         )
 
 
@@ -88,6 +102,9 @@ def build_personal_model(
     since_days: int = _DEFAULT_SINCE_DAYS,
     stuck_waiting_days: int = _STUCK_WAITING_DAYS,
     min_rollovers: int = _MIN_ROLLOVERS,
+    contacts: Sequence[Contact] = (),
+    open_promises: Sequence[Promise] = (),
+    memory_entries: Sequence[MemoryEntry] = (),
 ) -> PersonalModelView:
     """纯函数聚合。抽出它以便单测直接喂领域对象，不必扛一整只 App。
 
@@ -150,6 +167,51 @@ def build_personal_model(
         )
     )
 
+    # -- 关系账（V1.59）：只列「有未结清账」的关系对象 ------------------------
+    # 复用既有的「我欠 / 我等」两套计数口径（与 endpoints_pending.contacts
+    # 同逻辑，但这里是只读聚合，不新写判定）：从 open 承诺按 contact_id 数，
+    # 从 open 事务的 waiting_on.contact_id 数。没有未结清账的关系不出现 ——
+    # 列一堆「0/0」是噪音，而且会让人误以为「跟谁都有账」。
+    promise_count: Counter[str] = Counter()
+    for p in open_promises:
+        if p.contact_id:
+            promise_count[p.contact_id] += 1
+    waiting_count: Counter[str] = Counter()
+    for task in tasks:
+        waiting = task.waiting_on
+        if task.is_open and waiting is not None and waiting.contact_id:
+            waiting_count[waiting.contact_id] += 1
+    name_by_id = {c.id: c.name for c in contacts}
+    relationship_ids = (promise_count.keys() | waiting_count.keys()) & name_by_id.keys()
+    relationships = tuple(
+        sorted(
+            (
+                (cid, name_by_id[cid], promise_count.get(cid, 0), waiting_count.get(cid, 0))
+                for cid in relationship_ids
+            ),
+            key=lambda item: (-(item[2] + item[3]), item[1]),
+        )
+    )
+
+    # -- 承诺与目标（V1.59）：对外承诺（open）+ 记忆里的「约定 / 目标」 ------
+    # 只摆事实，不排序打分、不评判；承诺的「已逾期」是日期比较，不是违约判定
+    # （11.19.5：判违约是用户的事）。记忆只原样列出「约定 / 目标」原文。
+    commitments: list[tuple[str, str, bool]] = []
+    for p in open_promises:
+        commitments.append(
+            (
+                "承诺",
+                p.statement,
+                p.promised_for is not None and p.promised_for < now,
+            )
+        )
+    for entry in memory_entries:
+        if entry.kind in ("约定", "目标"):
+            commitments.append((entry.kind, entry.content, False))
+    # 逾期承诺排最前，其余承诺在约定/目标前，再按原文稳定排序。
+    commitments.sort(key=lambda item: (not item[2], item[0] != "承诺", item[1]))
+    commitments = tuple(commitments)
+
     return PersonalModelView(
         since=since,
         until=until,
@@ -161,6 +223,8 @@ def build_personal_model(
         tasks_rolled_over=tasks_rolled_over,
         stuck_waiting=tuple(stuck),
         role_activity=role_activity,
+        relationships=relationships,
+        commitments=commitments,
     )
 
 
@@ -172,20 +236,30 @@ class PersonalModelService:
         clock: Clock,
         *,
         role_repo: RoleRepo | None = None,
+        promise: "PromiseService | None" = None,
+        memory: "MemoryService | None" = None,
     ) -> None:
         self._tasks = tasks
         self._records = records
         self._clock = clock
         self._role_repo = role_repo
+        self._promise = promise
+        self._memory = memory
 
     def view(self, since_days: int = _DEFAULT_SINCE_DAYS) -> PersonalModelView:
         role_names: dict[str, str] = {}
         if self._role_repo is not None:
             role_names = {role.id: role.name for role in self._role_repo.list_all()}
+        contacts = self._promise.contacts() if self._promise is not None else ()
+        open_promises = self._promise.open_promises() if self._promise is not None else ()
+        memory_entries = self._memory.list_all() if self._memory is not None else ()
         return build_personal_model(
             self._tasks.list_all(),
             self._records.list_all(),
             role_names,
             self._clock.now(),
             since_days=since_days,
+            contacts=contacts,
+            open_promises=open_promises,
+            memory_entries=memory_entries,
         )

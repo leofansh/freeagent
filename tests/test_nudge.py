@@ -429,7 +429,16 @@ class TestNudgeCommands:
 
     def test_out_of_range_index_is_explained(self, env):
         app, _clock, role = env
-        _waiting(app, role, follow_up_at=datetime(2026, 10, 18, 9, 0))
+        # id 是随机 hex；`/nudge 5` 先试序号（越界）再试 id 前缀匹配，
+        # 若某候选 id 恰好以 "5" 开头（1/16 概率），会被 id 前缀匹配到草稿
+        # 而非「没有第 5 条」。所以要保证候选 id 不以 "5" 开头，序号 5
+        # 才**确定**越界。重试几乎必成（15/16 每建一次就中）。
+        for _ in range(100):
+            made = _waiting(
+                app, role, follow_up_at=datetime(2026, 10, 18, 9, 0)
+            )
+            if not made.id[:8].startswith("5"):
+                break
         repl, buf = self._repl(app)
         repl.handle("/nudge 5")
         assert "没有第 5 条" in buf.getvalue()

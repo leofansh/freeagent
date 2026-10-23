@@ -256,8 +256,31 @@ def render_model(view, names: dict[str, str]) -> str:
     else:
         lines.append("角色活跃度：还没有任何角色。")
 
+    # V1.60：关系账 + 承诺与目标两分面（只读聚合，只摆事实）。
     lines.append("")
-    lines.append("这些是**从你的记录里现推的规律**，不是评价 —— 要不要顺着它调整，由你决定。")
+    if view.relationships:
+        lines.append("关系账（还跟谁有未结清的账）：")
+        for _cid, name, promises, waitings in view.relationships:
+            bits = []
+            if promises:
+                bits.append(f"我欠他 {promises} 条承诺")
+            if waitings:
+                bits.append(f"在等他 {waitings} 笔")
+            lines.append(f"  · {name} —— " + "、".join(bits))
+    else:
+        lines.append("关系账：目前没有挂到具体人的未结清承诺或等候。")
+
+    lines.append("")
+    if view.commitments:
+        lines.append("承诺与目标：")
+        for kind, text, overdue in view.commitments:
+            tag = "（已逾期）" if overdue else ""
+            lines.append(f"  · [{kind}]{tag} {text}")
+    else:
+        lines.append("承诺与目标：没有未兑现的对外承诺，也没记过「约定 / 目标」。")
+
+    lines.append("")
+    lines.append("这些是**从你的记录里现推的事实**，不是评价 —— 要不要顺着它调整，由你决定。")
     return "\n".join(lines)
 
 

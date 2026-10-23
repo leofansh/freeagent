@@ -272,11 +272,6 @@ def build_app(
     artifact_service = ArtifactService(
         artifact_repo, task_repo, record_repo, the_clock
     )
-    # 连续性个人模型（11.17）：纯只读聚合，复用既有的 TaskRepo / RecordRepo，
-    # 不建表、不写库。role_repo 用于把 role_id 翻成名字（活跃度展示用）。
-    personal_model_service = PersonalModelService(
-        task_repo, record_repo, the_clock, role_repo=role_repo
-    )
     # 待处理收集器（11.18）。澄清要建事务，所以它拿 TaskService（唯一写入口）
     # 与 RoleService（默认脉络）；不自己拼 INSERT —— 一份能力一份实现。
     pending_service = PendingService(
@@ -317,6 +312,15 @@ def build_app(
     # 来源自报），但作用域不同：知识按角色，记忆分 global / role:<id>。
     # 同样只需要连接与角色仓储（role:<id> 要校验角色存在）。
     memory_service = MemoryService(conn, role_repo, the_clock)
+    # 连续性个人模型（11.17 / V1.59）：纯只读聚合，复用既有的 TaskRepo /
+    # RecordRepo，不建表、不写库。V1.59 起再并入关系账与承诺/目标，所以
+    # 也要拿 PromiseService（读 contacts / open_promises）与 MemoryService
+    # （读 约定 / 目标）—— 必须在这两个服务建好之后才建它。role_repo 用于
+    # 把 role_id 翻成名字（活跃度展示用）。
+    personal_model_service = PersonalModelService(
+        task_repo, record_repo, the_clock, role_repo=role_repo,
+        promise=promise_service, memory=memory_service,
+    )
     chat_service = ChatService(
         task_service, task_repo, role_service, restore_service,
         today_service, the_clock, the_llm,

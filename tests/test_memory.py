@@ -70,8 +70,9 @@ def test_orphan_role_scope_rejected(mem: MemoryService):
         mem.add("x", kind="偏好", scope=role_scope("no-such-role"))
 
 
-def test_kinds_are_three(mem):
-    assert MEMORY_KINDS == frozenset({"偏好", "约定", "修正"})
+def test_kinds_are_four(mem):
+    # V1.59 起新增「目标」类（前瞻自我期许），与「约定」正交。
+    assert MEMORY_KINDS == frozenset({"偏好", "约定", "修正", "目标"})
 
 
 def test_scope_label():

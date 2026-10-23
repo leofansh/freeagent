@@ -4,7 +4,7 @@
 
 `knowledge.py` 是**按角色**的脉络知识（`role_knowledge`，外键到 roles）；
 这一层是**跨角色的 core 记忆**（`memory` 表，作用域用 ``scope`` 文本表达）：
-关于「你这个人」和「助手自己」的偏好 / 约定 / 修正。
+关于「你这个人」和「助手自己」的偏好 / 约定 / 修正 / 目标。
 
 两者**共用同一套检索机制与来源自报**（:class:`~freeagent.services.knowledge.RetrievalResult`、
 ``index_text`` 的 CJK bigram 分词、BM25 + tail 两条腿）—— 这不是复用代码的洁癖，
@@ -64,7 +64,7 @@ GLOBAL_SCOPE = "global"
 #: 角色作用域的前缀。``role_scope(rid)`` -> ``'role:<rid>'``。
 _ROLE_PREFIX = "role:"
 
-MemoryKind = Literal["偏好", "约定", "修正"]
+MemoryKind = Literal["偏好", "约定", "修正", "目标"]
 
 #: 允许的记忆类别。写时校验（parse-don't-validate）。
 #:
@@ -72,7 +72,12 @@ MemoryKind = Literal["偏好", "约定", "修正"]
 #: 那是「某个角色这件事的口径」，这是「关于我和助手自己的东西」。
 #: 混用会让两边的检索都失去意义 —— 「口径」问的是工作事实，
 #: 「约定」问的是你我之间怎么协作，它们回答的不是同一类问题。
-MEMORY_KINDS: frozenset[str] = frozenset({"偏好", "约定", "修正"})
+#:
+#: ``目标`` 是 **前瞻、自我期许**（「我在追什么」），与 ``约定``（你我之间
+#: 说好的协作方式）正交：一句「今年把英语练到能开会」是目标，一句
+#: 「回复先给结论」是约定。它们被 /model 的「承诺与目标」分面并排呈现，
+#: 但语义不混（设计文档 3.7 / V1.59）。
+MEMORY_KINDS: frozenset[str] = frozenset({"偏好", "约定", "修正", "目标"})
 
 #: core 注入的预算：最多注入多少条。超预算**不静默截断**，见 :meth:`core_block`。
 CORE_BUDGET = 12

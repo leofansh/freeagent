@@ -44,6 +44,7 @@ STYLE_CSS = r"""  :root {
   .meta { color: var(--ink-3); font-size: 13px; }
   nav { display: flex; gap: 6px; margin: 18px 0 16px; flex-wrap: wrap; align-items: center; }
   nav .spacer { flex: 1; }
+  .badge { display: inline-block; margin-left: 6px; min-width: 18px; padding: 1px 5px; border-radius: 999px; font-size: 11px; line-height: 1.4; text-align: center; background: var(--accent); color: #fff; }
   nav button, .btn {
     font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 999px;
     border: 1px solid var(--line); background: var(--card); color: var(--ink-2);

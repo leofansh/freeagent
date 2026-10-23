@@ -22,14 +22,15 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
   </header>
   <nav id="nav" hidden>
     <button data-view="chat" aria-selected="true">对话</button>
-    <button data-view="today">今天</button>
+    <button data-view="today">今天<span class="badge" id="b-today" hidden></span></button>
     <button data-view="all">全部未结束</button>
     <button data-view="closed">已结束</button>
     <button data-view="roles">角色</button>
+    <button data-view="model">画像</button>
     <button data-view="contacts">关系</button>
-    <button data-view="promises">承诺</button>
-    <button data-view="pending">待处理</button>
-    <button data-view="nudge">催办</button>
+    <button data-view="promises">承诺<span class="badge" id="b-promises" hidden></span></button>
+    <button data-view="pending">待处理<span class="badge" id="b-pending" hidden></span></button>
+    <button data-view="nudge">催办<span class="badge" id="b-nudge" hidden></span></button>
     <button data-view="oc">编程</button>
     <span class="spacer"></span>
     <button data-view="services">后台服务</button>

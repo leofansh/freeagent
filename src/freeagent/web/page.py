@@ -28,6 +28,7 @@ from .js_contacts import JS_CONTACTS
 from .js_promises import JS_PROMISES
 from .js_pending import JS_PENDING
 from .js_nudge import JS_NUDGE
+from .js_model import JS_MODEL
 from .js_artifact import JS_ARTIFACT
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
@@ -84,6 +85,10 @@ INDEX_HTML = (
             # 分发 data-view=nudge 用）。只用 JS_CORE helper + js_detail 的
             # api，但必须在 JS_BOOT 之前进页面。
             JS_NUDGE,
+            # model 提供 renderModel（画像视图，boot 分发 data-view=model 用）。
+            # 只用 JS_CORE 的 helper + js_contacts 的 openContact，必须在
+            # JS_BOOT 之前进页面。
+            JS_MODEL,
             # artifact 提供 artifactBar（验收按钮），由 JS_DETAIL 的
             # renderTask 调用 —— 用的是 js_detail 里的 post/toast/openTask。
             # 声明提升让顺序无关，写成依赖序。

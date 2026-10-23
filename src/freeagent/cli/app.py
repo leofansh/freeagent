@@ -62,7 +62,7 @@ _USAGE: dict[str, str] = {
     "/today": "/today",
     "/week": "/week      本周回顾：完成了什么、卡在哪、下周承诺了什么",
     "/feedback": "/feedback   执行层履历：派了多少、成了多少、反复失败在哪",
-    "/model": "/model      连续性个人模型：从你的记录里现推的规律（完成时段/常顺延/卡住的等候/角色活跃度），只摆事实",
+    "/model": "/model      连续性个人模型：从你的记录现推的画像（节奏/关系账/承诺与目标），只读聚合，只摆事实不评价",
     "/pending": "/pending [N [标题]|drop N]   待处理收集器：收下的图片/文件；N 澄清成事务，drop N 明确忽略",
     "/all": "/all [open|closed|all]   默认 open",
     "/roles": "/roles [all]",
@@ -92,7 +92,7 @@ _USAGE: dict[str, str] = {
     # 记忆（设计文档 3.7）。用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
     "/remember": "/remember <内容>    记一条全局偏好（= /memory add 偏好）",
     "/memory": (
-        "/memory [list [global|角色]|add <偏好|约定|修正> <内容>|"
+        "/memory [list [global|角色]|add <偏好|约定|修正|目标> <内容>|"
         "add-role <角色> <类别> <内容>|search <关键词>|edit <id> <新内容>|del <id>]"
     ),
     # 刻意与 /note 分开成两条：/note 无校验，而这条要挡三种不许重派的情形。
@@ -224,7 +224,7 @@ _HELP = """\
   ── 记忆（设计文档 3.7）──
   /remember <内容>          记一条全局偏好（= /memory add 偏好 <内容>）
   /memory list [global|角色] 列出记过什么（全貌）
-  /memory add <类别> <内容>  记一条：类别是 偏好 / 约定 / 修正
+  /memory add <类别> <内容>  记一条：类别是 偏好 / 约定 / 修正 / 目标
   /memory add-role <角色> <类别> <内容>   记到某个角色名下
   /memory search <关键词>    检索记忆（返回「怎么找到的」，可反驳）
   /memory edit <id> <新内容> 改内容（类别与范围不可改）

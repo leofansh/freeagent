@@ -25,6 +25,8 @@ from . import (
     endpoints_nudge,
     endpoints_pending,
     endpoints_read,
+    endpoints_model,
+    endpoints_summary,
     serialize,
     serialize_api,
     endpoints_services,
@@ -118,5 +120,9 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     # 不写表、不发（20.1.4），故都在 GET 侧。
     "/api/nudge/candidates": endpoints_nudge.nudge_candidates,
     "/api/nudge/draft": endpoints_nudge.nudge_draft,
+    # 导航角标计数（V1.58）：只报数，不报内容，口径与对应端点一致。
+    "/api/summary": endpoints_summary.summary,
+    # 连续性个人模型（11.17 / V1.59）：节奏 / 关系 / 承诺 三面，只读聚合。
+    "/api/model": endpoints_model.model,
     **feishu_routes(),
 }
