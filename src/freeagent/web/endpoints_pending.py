@@ -18,7 +18,7 @@ from ..app import App
 from ..domain import FreeAgentError, NotFoundError
 from . import serialize, serialize_api
 
-__all__ = ["pending", "promises", "contacts", "contact_ledger", "pending_clarify"]
+__all__ = ["pending", "promises", "contacts", "contact_ledger", "pending_clarify", "pending_dismiss"]
 
 
 def pending(app: App) -> dict:
@@ -98,3 +98,18 @@ def pending_clarify(app: App, payload: dict) -> dict:
         title = str(title).strip() or None
     task = app.pending.clarify(item_id, title=title)
     return {"ok": True, "task_id": task.id, "title": task.title}
+
+
+def pending_dismiss(app: App, payload: dict) -> dict:
+    """忽略一条捕获（11.18 / V1.58，Web 待处理视图的「不要了」）。
+
+    与 CLI ``/pending drop N`` 同一个服务层入口（``PendingService.dismiss``），
+    只翻译用户显式动作，不自建判定（12.1.1）。**本版不提供「取消忽略」**：
+    忽略一条捕获的代价是「再想要得回飞书翻」，而翻得到 —— 15 章把代价
+    和「做取消忽略要加回收站视图」一起写了。
+    """
+    item_id = str(payload.get("id") or "").strip()
+    if not item_id:
+        raise FreeAgentError("要指定一条待处理项：{id: ...}")
+    app.pending.dismiss(item_id)
+    return {"ok": True}

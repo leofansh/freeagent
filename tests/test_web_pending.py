@@ -511,3 +511,82 @@ class TestPendingClarifyEndpoint:
         status, data = post(addr, "/api/pending/clarify", {"id": item.id})
         assert status == 400
         assert "已经澄清" in data["error"]
+
+# ---------------------------------------------------- 忽略（写端点，11.18）
+class TestPendingDismissEndpoint:
+    """忽略一条捕获（V1.58，Web 待处理视图的「不要了」）。
+
+    与 CLI `/pending drop N` 同一个服务层入口（PendingService.dismiss），
+    本版不提供「取消忽略」（代价写入第十五章）。
+    """
+
+    def test_dismiss_removes_from_pending(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        _capture(app, "报价单.xlsx")
+        item = app.pending.pending()[0]
+        status, data = post(addr, "/api/pending/dismiss", {"id": item.id})
+        assert status == 200
+        assert data["ok"] is True
+        assert app.pending.count() == 0
+
+    def test_dismiss_requires_id(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(addr, "/api/pending/dismiss", {})
+        assert status == 400
+        assert "待处理项" in data["error"]
+
+    def test_dismiss_unknown_id_is_400(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(addr, "/api/pending/dismiss", {"id": "nope"})
+        assert status == 400
+        assert "不存在" in data["error"]
+
+    def test_dismiss_twice_is_400(self, served_promise):
+        """忽略是不可逆动作（11.18）：同一条不能忽略两次。"""
+        addr, app, _role, _clock = served_promise
+        _capture(app, "a.txt")
+        item = app.pending.pending()[0]
+        assert post(addr, "/api/pending/dismiss", {"id": item.id})[0] == 200
+        status, data = post(addr, "/api/pending/dismiss", {"id": item.id})
+        assert status == 400
+        assert "已经处理过" in data["error"]
+
+
+# ---------------------------------------------------- 导航角标（读端点）
+class TestSummaryEndpoint:
+    """导航角标计数（V1.58）：只报数，不报内容，口径与对应端点一致。"""
+
+    def test_summary_aggregates_counts(self, served_promise):
+        addr, app, role, _clock = served_promise
+        _capture(app, "报价单.xlsx")  # pending=1
+        status, data, _h = get(addr, "/api/summary")
+        assert status == 200
+        assert data["kind"] == "summary"
+        assert data["pending"] == app.pending.count()
+        assert data["nudge"] == app.nudge.count()
+        assert data["promises_overdue"] == 0
+        assert "today" in data
+
+    def test_summary_counts_overdue_promise(self, served_promise):
+        addr, app, role, _clock = served_promise
+        task = app.tasks.create("给李会计转账", [role.id])
+        app.promise.promise(
+            "尽快转账", contact_name="李会计", task_id=task.id,
+            promised_for=datetime(2026, 10, 20, 15, 0),
+        )
+        status, data, _h = get(addr, "/api/summary")
+        assert data["promises_overdue"] == 1
+
+    def test_summary_counts_nudge_waiting(self, served_promise):
+        addr, app, role, _clock = served_promise
+        app.tasks.create(
+            "等张总回合同", [role.id], kind=TaskKind.WAIT,
+            waiting_on=WaitingOn(
+                kind=WaitingKind.PERSON, who_or_what="张总回合同",
+                since=datetime(2026, 10, 10, 9, 0),
+                follow_up_at=datetime(2026, 10, 18, 15, 0),
+            ),
+        )
+        status, data, _h = get(addr, "/api/summary")
+        assert data["nudge"] == 1
+

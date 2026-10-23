@@ -204,6 +204,14 @@ def dispatch_post(
             app, read_body()
         )
 
+    if parts == ["api", "pending", "dismiss"]:
+        # 忽略一条捕获（11.18 / V1.58，Web 待处理视图的「不要了」）。
+        # POST-only：忽略改数据（收下 → 忽略），不能挂在 GET 上。与 CLI
+        # `/pending drop N` 走同一个服务层入口（PendingService.dismiss）。
+        return HTTPStatus.OK, endpoints_pending.pending_dismiss(
+            app, read_body()
+        )
+
     # 承诺结账（11.19 / 11.20，Web「承诺」视图的操作）。白名单单列
     # （PROMISE_ACTIONS），理由同事务动作：动作名是 URL 的一部分，
     # 漏过一个就是一条没人看过的写路径。POST-only —— 改状态的按钮

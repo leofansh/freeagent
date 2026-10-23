@@ -42,6 +42,9 @@ JS_PENDING = r"""async function renderPending(root) {
     const cbtn = el("button", "btn primary", "澄清成事务");
     cbtn.onclick = () => openClarify(it.id, card, acts);
     acts.appendChild(cbtn);
+    const ibr = el("button", "btn", "忽略");
+    ibr.onclick = () => openIgnore(it.id, acts);
+    acts.appendChild(ibr);
     card.appendChild(acts);
     root.appendChild(card);
   });
@@ -74,5 +77,31 @@ async function clarify(id, title, btn) {
   } catch (e) {
     btn.disabled = false;
     toast("澄清失败：" + e.message);
+  }
+}
+
+function openIgnore(id, acts) {
+  // 忽略是不可逆动作（本版无「取消忽略」），所以要一步确认而不是一把梭：
+  // 点「忽略」只展开确认态，再点一次才真的忽略。
+  acts.innerHTML = "";
+  const tip = el("span", "meta", "明确说这条不要了（无取消）？");
+  const ok = el("button", "btn", "确认忽略");
+  const cancel = el("button", "btn", "取消");
+  ok.onclick = () => ignore(id, ok);
+  cancel.onclick = () => renderPending($("#root"));
+  acts.appendChild(tip);
+  acts.appendChild(ok);
+  acts.appendChild(cancel);
+}
+
+async function ignore(id, btn) {
+  btn.disabled = true;
+  try {
+    await post("/api/pending/dismiss", { id: id });
+    toast("已忽略。本版无取消忽略 —— 再想要得回飞书翻。");
+    renderPending($("#root"));
+  } catch (e) {
+    btn.disabled = false;
+    toast("忽略失败：" + e.message);
   }
 }"""
