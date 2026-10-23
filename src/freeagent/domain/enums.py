@@ -25,6 +25,9 @@ __all__ = [
     "CONTACT_KIND_LABELS",
     "PROMISE_STATUS_LABELS",
     "SIGNAL_LABELS",
+    "TriggerBoundary",
+    "TRIGGER_BOUNDARY_LABELS",
+    "CAPABILITY_BOUNDARIES",
 ]
 
 
@@ -260,4 +263,81 @@ SIGNAL_LABELS: dict[SortSignalCode, str] = {
     SortSignalCode.SCHEDULED_TODAY: "排在今天",
     SortSignalCode.INBOX_UNSORTED: "还没开始",
     SortSignalCode.ENERGY_FIT: "精力档位匹配",
+}
+
+
+class TriggerBoundary(str, Enum):
+    """能力触发边界：每个会碰状态或对外动作的能力，必须归入其一。
+
+    这是 FreeAgent 把散落各处的「只显式触发 / 不静默推断 / 无发送能力」纪律
+    （11.9.10、11.10.5、11.18.3、11.19.3、11.20.2）收敛成的**一张分类表**，
+    单一真源见 ``CAPABILITY_BOUNDARIES``（设计文档 11.22）。
+
+    为什么值得单列一张表：这些纪律原本写在五个不同章节，新增能力时容易
+    「漏想边界」—— 比如顺手给某个只读视图加个静默副作用。把边界显式列成
+    枚举 + 字典，新增能力**先选边界**，漏选会在 ``tests/test_trigger_boundary.py``
+    里被逼出来。
+
+    **fail-closed 默认**：不在 ``CAPABILITY_BOUNDARIES`` 里的能力，一律按
+    「禁止静默改动状态」处理 —— 系统不会替你下结论、不会替你发、不会替你建。
+    这与 11.10.5「沉默 ≠ 同意」同源，但把「沉默」从一句口号变成了可审计的默认。
+    """
+
+    EXPLICIT_ONLY = "explicit_only"
+    """显式触发才建 / 改状态。
+
+    建事务、记承诺、记记忆、挂等候、澄清待处理、状态流转 —— **全部只在用户敲
+    命令时出现**。从数据里猜「用户想记/想建什么」是弱信号，而自动落一条状态
+    比自动发一句提醒重得多，所以宁可不推断（第十五章）。
+    """
+
+    READ_ONLY = "read_only"
+    """只读聚合，永不改库。
+
+    /model、/today、/week、关系视图、记忆检索、所有 GET 端点 —— 它们读的是字段，
+    不是记录正文；改文案不会改变输出，也不落任何状态。
+    """
+
+    NO_SEND = "no_send"
+    """可主动提醒自己，但结构上无对外发送能力。
+
+    这是「主动」能力的天花板：最多把事实推到你自己的面前（飞书私聊 / 每日总览），
+    **绝不替你对外发任何东西、绝不替你决定**。催办草稿（NudgeService）甚至
+    连通道对象都不持有 —— 想顺手发出去的人会发现没有那条路（11.20.2）。
+    """
+
+    @property
+    def label(self) -> str:
+        return TRIGGER_BOUNDARY_LABELS[self]
+
+
+TRIGGER_BOUNDARY_LABELS: dict[TriggerBoundary, str] = {
+    TriggerBoundary.EXPLICIT_ONLY: "显式触发才建状态",
+    TriggerBoundary.READ_ONLY: "只读不可变",
+    TriggerBoundary.NO_SEND: "可主动提醒自己，结构上无发送能力",
+}
+
+
+#: 能力 → 边界 的单一真源（设计文档 11.22）。改这里等于改契约：
+#: ``tests/test_trigger_boundary.py`` 守着「字典与文档一致」「建状态能力都在
+#: EXPLICIT_ONLY」「NO_SEND 只有被点名的两个」。
+#:
+#: 字典的键是能力的稳定标识（不是命令名），新增能力时照此登记。
+CAPABILITY_BOUNDARIES: dict[str, TriggerBoundary] = {
+    # —— EXPLICIT_ONLY：只有用户显式命令才落状态 ——
+    "new_task": TriggerBoundary.EXPLICIT_ONLY,        # /new、飞书直接说 → 建事务
+    "clarify_pending": TriggerBoundary.EXPLICIT_ONLY,  # /pending N 把收集器澄清成事务
+    "promise": TriggerBoundary.EXPLICIT_ONLY,          # /promise 记「我答应别人」
+    "memory": TriggerBoundary.EXPLICIT_ONLY,           # /remember、/memory add 记记忆
+    "wait": TriggerBoundary.EXPLICIT_ONLY,             # /wait 挂「我在等谁」
+    "status_change": TriggerBoundary.EXPLICIT_ONLY,    # /start /done /drop /pause 状态流转
+    # —— READ_ONLY：只读聚合 ——
+    "model": TriggerBoundary.READ_ONLY,                # /model 个人画像
+    "today": TriggerBoundary.READ_ONLY,                # /today
+    "week": TriggerBoundary.READ_ONLY,                 # /week 周回顾
+    "contact_view": TriggerBoundary.READ_ONLY,         # /contact 视图、/api/contacts
+    "memory_search": TriggerBoundary.READ_ONLY,        # 记忆检索（BM25）
+    # —— NO_SEND：可主动提醒自己，但结构上无对外发送 ——
+    "nudge": TriggerBoundary.NO_SEND,                  # 催办草稿：拼文本但不发
+    "daily_digest": TriggerBoundary.NO_SEND,           # 每日总览：只提醒自己，绝不代发
 }
