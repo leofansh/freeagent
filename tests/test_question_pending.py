@@ -92,7 +92,11 @@ class TestMigration:
         # ——同一个索引位，两种完全不同的理由：v8/v17 是"被前移的坑"，
         # 这里只是"这一格必须有行"。若不写清楚，后人照 v8 的教训去查
         # 索引 17，会查出一个并不存在的 bug。
-        assert SCHEMA_VERSION == 19
+        #
+        # v20（daily_digests）是单语句 CREATE TABLE，直接走 _MIGRATIONS
+        # 索引 18（源版本 19 → 20）—— 没有域步骤、没有占位，最简单的一种。
+        # 表只存「哪天推过每日总览」，不绑 task_id（每日总览无自然事务）。
+        assert SCHEMA_VERSION == 20
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

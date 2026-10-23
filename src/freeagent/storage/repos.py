@@ -1413,6 +1413,35 @@ def _progress_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
 _T = TypeVar("_T")
 
 
+
+
+# --------------------------------------------------------------------------- #
+# DailyDigestRepo
+# --------------------------------------------------------------------------- #
+class DailyDigestRepo(_RepoBase):
+    """每日「该看总览」的已推去重（V1.60）。
+
+    **只记「哪天推过」，不做任何业务判断。** ``day`` 是 ``YYYY-MM-DD``。
+    表与事务级提醒（挂 ``task_records`` 令牌）不同 —— 每日总览没有自然
+    事务，去重令牌独立存这里。
+    """
+
+    def already_sent(self, day: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM daily_digests WHERE day = ?", (day,)
+        ).fetchone()
+        return row is not None
+
+    def mark_sent(self, day: str, ts: datetime) -> None:
+        """记下这天已推。``INSERT OR IGNORE``：重复确认也只有一个令牌。"""
+        with self._tx():
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daily_digests (day, pushed_at)"
+                " VALUES (?, ?)",
+                (day, ts.isoformat()),
+            )
+
+
 def _replace(obj: _T, **changes: object) -> _T:
     """``dataclasses.replace`` 的薄封装，避免各处重复 import。"""
     return cast(_T, dataclasses.replace(obj, **changes))

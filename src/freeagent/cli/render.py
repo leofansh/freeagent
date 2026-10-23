@@ -624,6 +624,37 @@ def render_digest(digest: ReminderDigest) -> str:
     return digest.text() or ""
 
 
+def render_daily_digest(
+    day: str,
+    *,
+    today_items: Iterable[ScoredTask],
+    today_count: int,
+    pending_count: int,
+    nudge_count: int,
+    overdue_count: int,
+) -> str:
+    """渲染每日「该看总览」（V1.60）。
+
+    **只摆事实、不替用户决定**：报数 + 关键标题，具体详情去 Web 看。
+    刻意克制 —— 今天排期最多列前 3 条标题，其余用计数兜住；总览是
+    「知道今天有没有事」的入口，不是让用户在这里把一天过完。
+    """
+    lines = [f"该看 · {day}（今天）"]
+    if today_count:
+        titles = [s.task.title for s in list(today_items)[:3]]
+        shown = "、".join(titles)
+        extra = f" …共 {today_count} 件" if today_count > len(titles) else ""
+        lines.append(f"今天排了 {today_count} 件：{shown}{extra}")
+    if pending_count:
+        lines.append(f"待处理 {pending_count} 条（未澄清的收件，/pending 或 Web 待处理看）")
+    if nudge_count:
+        lines.append(f"该催 {nudge_count} 件（跟人 follow_up 已过或承诺逾期，/nudge 或 Web 催办看）")
+    if overdue_count:
+        lines.append(f"承诺逾期 {overdue_count} 条（我欠对方，/promise 或 Web 承诺看）")
+    lines.append("系统只摆事实，不替你决定先做哪个。详情点开 Web 看。")
+    return "\n".join(lines)
+
+
 def render_suggestion(text: str) -> str:
     return f"排期参考（{DISCLAIMER}）：{text}"
 

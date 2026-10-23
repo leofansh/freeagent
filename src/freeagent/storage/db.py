@@ -47,7 +47,8 @@ __all__ = [
 #: 17 → memory（3.7 / V1.47）。
 #: 18 → captured_items（待处理收集器，11.18 / V1.50）。
 #: 19 → contacts + promises（关系对象与对外承诺，11.19 / V1.51）。
-SCHEMA_VERSION = 19
+#: 20 → daily_digests（每日「该看总览」的已推去重，V1.60）。
+SCHEMA_VERSION = 20
 
 #: 按版本递增的迁移。**每一步都必须能在已有库上原地跑**：
 #: ``init_schema`` 只建新表，不会给已存在的表加列，所以列变更必须显式 ALTER。
@@ -284,6 +285,13 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         "18 → 19：占位 —— v19 的真实步骤是多语句（contacts + promises + 索引），"
         "走 _DOMAIN_STEPS keyed-19。",
         "SELECT 1",
+    ),
+    (
+        "19 → 20：daily_digests（每日「该看总览」的已推去重，V1.60）",
+        # 整表新建，走 CREATE TABLE IF NOT EXISTS —— 幂等，不需要兜底。
+        # 只记「哪天推过总览」，不绑 task_id：每日总览没有自然事务
+        # （它与单条到点提醒不同，后者挂 task_records 的令牌）。
+        "CREATE TABLE IF NOT EXISTS daily_digests (day TEXT PRIMARY KEY, pushed_at TEXT NOT NULL)",
     ),
 )
 
@@ -763,6 +771,16 @@ CREATE TABLE IF NOT EXISTS captured_items (
 #: 理由见 _PROMISE_SCHEMA 的注释（为什么是两张表、为什么 task_id 一对一）。
 _SCHEMA = _SCHEMA + _PROMISE_SCHEMA
 
+#: 每日「该看总览」的已推去重（V1.60）。整表独立：只记「哪天推过」，
+#: 不绑 task_id —— 每日总览没有自然事务，与单条到点提醒（挂 task_records
+#: 令牌）是两种东西。表只存去重，业务判断在服务层。
+_DAILY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS daily_digests (
+    day         TEXT PRIMARY KEY,
+    pushed_at   TEXT NOT NULL
+);
+"""
+
 
 def resolve_db_path(home: str | Path | None = None) -> Path:
     """解析数据库文件路径。
@@ -805,6 +823,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.executescript(_KNOWLEDGE_SCHEMA)
     conn.executescript(_MEMORY_SCHEMA)
+    conn.executescript(_DAILY_SCHEMA)
     conn.commit()
 
 

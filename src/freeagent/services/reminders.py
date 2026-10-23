@@ -91,6 +91,19 @@ class QuietHours:
         text = f"{self.start:%H:%M}–{self.end:%H:%M}"
         return f"{text}（跨天）" if self.crosses_midnight else text
 
+    def quiet_note(self, moment: datetime) -> str:
+        """窗口内（``moment`` 落在窗口里）的压后说明（V1.60）。
+
+        供每日总览这类**独立于到点提醒**的推送用：窗口内不落去重令牌，
+        把「压后到何时」说出来，窗口一过自然再推 —— 与 ``ReminderDigest``
+        的 ``quiet_note`` 同一语义，只是不依赖 digest 自己的 ``quiet_until``。
+        """
+        until = _end_of_quiet(self, moment)
+        return (
+            f"安静窗口内（到 {until:%H:%M}），每日总览已压后，"
+            "窗口结束会自动推送。"
+        )
+
 
 def _end_of_quiet(hours: QuietHours, moment: datetime) -> datetime:
     """窗口内时，返回本窗口结束的**瞬时**（供 `due()` 报告「压后到何时」）。"""

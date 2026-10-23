@@ -1226,6 +1226,14 @@ class FeishuBridge:
                     self.channel.confirm_reminders(batch)
             except Exception:
                 log.exception("推送提醒时出错")
+            # 每日「该看总览」（V1.60）：与到点提醒同一轮询，各推各的。
+            # 每天一次（day 令牌去重）、只在有事时推、安静窗口外。
+            try:
+                daily = self.channel.due_daily()
+                if daily.text and self._notify_operators(daily.text):
+                    self.channel.confirm_daily(daily)
+            except Exception:
+                log.exception("推送每日总览时出错")
 
     def _notify_operators(self, text: str) -> bool:
         """推给每个白名单用户。**返回是否至少有一个送达。**

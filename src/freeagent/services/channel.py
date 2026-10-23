@@ -207,6 +207,21 @@ class ReminderBatch:
     digest: ReminderDigest | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DailyBatch:
+    """每日「该看总览」推送的两半（V1.60）：要发的话 + 去重日。
+
+    与 :class:`ReminderBatch` 同一模式 —— 取与确认分开，纯数据不自落库。
+    去重令牌是 ``day``（``YYYY-MM-DD``），确认走
+    :meth:`ChannelService.confirm_daily`。
+    """
+
+    #: 总览正文；空串表示今天无需推送（没事 / 已推过 / 窗口内）。
+    text: str
+    #: 去重日；``text`` 为空时为 ``None``。
+    day: str | None = None
+
+
 class ChannelService:
     """把聊天消息路由到与终端**完全一致**的命令语义。"""
 
@@ -509,6 +524,61 @@ class ChannelService:
             return
         with self.app.lock:
             self.app.reminders.acknowledge(batch.digest)
+
+    # -- 每日「该看总览」 ----------------------------------------------------- #
+    def due_daily(self) -> DailyBatch:
+        """每天一次的「该看总览」（V1.60），**不落去重令牌**。
+
+        由传输层按节奏调用（与 ``due_reminders`` 同一轮询）。送达后必须调
+        :meth:`confirm_daily` —— 失败不调，下次再来。
+
+        三条纪律（设计文档 11.21 / V1.60）：
+
+        * **只在有事时推**：今天有排期 / 待处理 >0 / 该催 >0 / 承诺逾期 >0
+          至少其一才推；全空返回空串 —— 不推「今天没事」的噪音。
+        * **每天一次**：以 ``day``（``YYYY-MM-DD``）为去重令牌，表
+          ``daily_digests`` 记已推。今天推过就不再推，明天自动再来。
+        * **quiet_hours**：窗口内返回说明、**不落令牌** —— 窗口过后
+          自然再推（复用 9.8 的「压后」语义）。
+        * **只摆事实**：报数 + 关键标题，不替用户决定先做哪个。
+        """
+        from ..cli import render
+
+        now = self.app.clock.now()
+        day = now.date().isoformat()
+        with self.app.lock:
+            if self.app.daily_digests.already_sent(day):
+                return DailyBatch(text="", day=None)
+            # 窗口内压后：不落令牌，说明里带 quiet_until。
+            if self.app.quiet_hours is not None and self.app.quiet_hours.contains(now):
+                note = self.app.quiet_hours.quiet_note(now)
+                return DailyBatch(text=note, day=None)
+            today = self.app.today.view()
+            pending_count = self.app.pending.count()
+            nudge_count = self.app.nudge.count()
+            overdue_count = sum(
+                1
+                for p in self.app.promise.open_promises()
+                if p.promised_for is not None and p.promised_for <= now
+            )
+            if not today.items and pending_count == 0 and nudge_count == 0 and overdue_count == 0:
+                return DailyBatch(text="", day=None)
+            text = render.render_daily_digest(
+                day,
+                today_items=today.items,
+                today_count=len(today.items),
+                pending_count=pending_count,
+                nudge_count=nudge_count,
+                overdue_count=overdue_count,
+            )
+        return DailyBatch(text=text, day=day)
+
+    def confirm_daily(self, batch: DailyBatch) -> None:
+        """确认今日总览已送达，落 ``day`` 去重令牌。**送达成功之后才调。**"""
+        if batch.day is None:
+            return
+        with self.app.lock:
+            self.app.daily_digests.mark_sent(batch.day, self.app.clock.now())
 
     # -- 事件去重 ----------------------------------------------------------- #
     def _is_duplicate(self, event_id: str) -> bool:

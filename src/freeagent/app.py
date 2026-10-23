@@ -37,6 +37,7 @@ from .storage.repos import (
     ArtifactRepo,
     CapturedRepo,
     ContactRepo,
+    DailyDigestRepo,
     PromiseRepo,
     RecordRepo,
     RoleRepo,
@@ -85,6 +86,7 @@ class App:
     role_repo: RoleRepo
     record_repo: RecordRepo
     artifact_repo: ArtifactRepo
+    daily_digests: DailyDigestRepo
     energy_windows: EnergyWindows | None
     #: 安静窗口（9.8）。``None`` = 不启用。与 ``energy_windows`` **并列而不嵌套**——
     #: 见 :class:`~freeagent.config.Config` 与设计文档 9.8 的「为什么不复用」。
@@ -257,6 +259,7 @@ def build_app(
     captured_repo = CapturedRepo(conn)
     contact_repo = ContactRepo(conn)
     promise_repo = PromiseRepo(conn)
+    daily_digest_repo = DailyDigestRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
     # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
@@ -369,6 +372,7 @@ def build_app(
         role_repo=role_repo,
         record_repo=record_repo,
         artifact_repo=artifact_repo,
+        daily_digests=daily_digest_repo,
         energy_windows=energy_windows,
         quiet_hours=quiet_hours,
         config=the_config,
