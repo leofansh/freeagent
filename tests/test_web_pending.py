@@ -590,3 +590,62 @@ class TestSummaryEndpoint:
         status, data, _h = get(addr, "/api/summary")
         assert data["nudge"] == 1
 
+
+# ---------------------------------------------------- 文本录入口（V1.88）
+class TestWebTextCapture:
+    """Web 批量倾倒 / 邮件入口（POST /api/capture、/api/mail）。
+
+    与 CLI `/capture`、`/mail`、飞书 `_route_capture` 走同一服务层入口
+    （PendingService.capture_batch / capture_text）—— 一份能力一份实现。
+    只入队不建事务（11.18）：澄清是 /pending 端点。
+    """
+
+    def test_capture_batch_splits_and_enqueues(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(
+            addr, "/api/capture",
+            {"source": "web", "text": "周三和张总确认\n周四交季度报告"},
+        )
+        assert status == 201
+        assert data["count"] == 2
+        assert app.pending.count() == 2
+        items = app.pending.pending()
+        assert [i.name for i in items] == ["周三和张总确认", "周四交季度报告"]
+        assert all(i.source == "web" and i.kind == "text" for i in items)
+
+    def test_capture_batch_defaults_source_web(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(addr, "/api/capture", {"text": "一件事\n两件事"})
+        assert status == 201 and data["count"] == 2
+        assert all(i.source == "web" for i in app.pending.pending())
+
+    def test_capture_batch_empty_text_is_400(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(addr, "/api/capture", {"text": "   "})
+        assert status == 400
+        assert "粘贴文本" in data["error"]
+
+    def test_mail_enqueues_single_with_title(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(
+            addr, "/api/mail", {"text": "张总确认合同\n（正文细节）", "name": "转发：合同确认"}
+        )
+        assert status == 201
+        assert data["name"] == "转发：合同确认"
+        assert app.pending.count() == 1
+        item = app.pending.pending()[0]
+        assert item.source == "mail" and item.name == "转发：合同确认"
+
+    def test_mail_without_name_uses_first_line(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(addr, "/api/mail", {"text": "周三和张总确认\n正文"})
+        assert status == 201
+        item = app.pending.pending()[0]
+        assert item.name == "周三和张总确认"
+
+    def test_mail_empty_is_400(self, served_promise):
+        addr, app, _role, _clock = served_promise
+        status, data = post(addr, "/api/mail", {"text": ""})
+        assert status == 400
+        assert "邮件正文" in data["error"]
+

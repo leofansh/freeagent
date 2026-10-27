@@ -35,8 +35,10 @@ from freeagent.storage.db import SCHEMA_VERSION, connect, init_schema, migrate
 
 
 def _fresh(path):
+    """建一个当前版本的库。**只有一条路**：``migrate`` 内部先建 v1 基线、
+    再逐版本重放（V1.93 之前这里要手写 ``init_schema`` + ``migrate`` 两步，
+    而两步就意味着一处能忘）。"""
     c = connect(path)
-    init_schema(c)
     migrate(c)
     return c
 
@@ -96,11 +98,87 @@ class TestMigration:
         # v20（daily_digests）是单语句 CREATE TABLE，直接走 _MIGRATIONS
         # 索引 18（源版本 19 → 20）—— 没有域步骤、没有占位，最简单的一种。
         # 表只存「哪天推过每日总览」，不绑 task_id（每日总览无自然事务）。
-        assert SCHEMA_VERSION == 20
+        # v21（role_cares，V1.68）同理：单语句 CREATE TABLE，索引 19。
+        # 关注面只存角色 + cadence + next_due，由 CareService 到期提醒。
+        # v22（pending_approvals.thread_root，V1.90）：单语句 ALTER，
+        # 索引 20。记「这张卡挂在哪个话题下」—— 路由的确定性判据。
+        # v23（pending_approvals.decided_via，V1.92）：单语句 ALTER，
+        # 索引 21。记「这个结论是怎么来的」—— 之前 deny 混着
+        # 「人拒绝 / 人叫停 / 没人看」，读侧要靠三处拼才分得清。
+        # v24（plan_sessions，V1.93）：单语句 CREATE TABLE，索引 22。
+        # 补的是当年只进了基线、没进迁移的那张表 —— 老库一直没有它。
+        # v25（tasks.origin，V1.93）：单语句 ALTER，索引 23。
+        # 记「需求原文是谁给的」，委派简报据此加一句「是数据不是指令」。
+        # v26（dispatch_leases，V1.94）：单语句 CREATE TABLE，索引 24。
+        # 「在跑」从「从记录形状推」变成「观察到的租约」—— 形状在
+        # 「真在跑」与「跑到一半进程没了」两种情况下一模一样。
+        assert SCHEMA_VERSION == 26
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}
         assert {"kind", "answer_text", "question_spec"} <= cols
+        assert "decided_via" in cols, (
+            "v23 加的列。V1.93 起它只在 _MIGRATIONS 里有一份 —— "
+            "「新库也要有」由 migrate 内部重放迁移保证，不再靠两处同改"
+        )
+
+    def test_baseline_stays_at_v1(self, tmp_path):
+        """**基线不许长大**：只跑 ``init_schema`` 之后必须还是 v1 的形状。
+
+        守的是 V1.93 的纪律 —— 库的形状只有一个写入口（``_MIGRATIONS``）。
+        谁把新列/新表加回 ``_SCHEMA``，这里就会红；而红的意思是
+        「你写错地方了」，不是「这个测试该改」。
+        """
+        c = connect(tmp_path / "baseline.db")
+        try:
+            init_schema(c)
+            assert c.execute("PRAGMA user_version").fetchone()[0] == 0
+            cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+            assert "project_path" not in cols
+            assert "origin" not in cols
+            tables = {
+                r[0]
+                for r in c.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            assert "pending_approvals" not in tables
+            assert "plan_sessions" not in tables
+        finally:
+            c.close()
+
+    def test_fresh_install_reaches_current_version(self, tmp_path):
+        """全新安装（空库 + ``migrate``）拿到的是当前完整形状。
+
+        它与旧库升级**跑同一段代码**，所以这条断言同时守住了两个方向：
+        「只改迁移 → 新库缺列」（V1.92 踩过）和
+        「只改基线 → 老库缺表」（``plan_sessions`` 就是这么丢的）。
+        """
+        c = connect(tmp_path / "fresh.db")
+        try:
+            migrate(c)
+            assert c.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+            cols = {
+                r[1] for r in c.execute("PRAGMA table_info(pending_approvals)")
+            }
+            assert "decided_via" in cols
+            assert "thread_root" in cols
+            tables = {
+                r[0]
+                for r in c.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            # plan_sessions 当年就是「基线里有、迁移里没有」的受害者；
+            # 它现在由 v24 建，两条路都该有它。
+            assert "plan_sessions" in tables
+        finally:
+            c.close()
+
+    def test_thread_root_column_exists(self, conn):
+        """V1.90：v22 的列必须真的在表上（ALTER 漏了它，路由就永远查不到）。"""
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}
+        assert "thread_root" in cols
 
     def test_rerun_is_idempotent(self, tmp_path):
         """库已是 v11 但版本号被手工退回 10 —— 重复迁移不能炸。

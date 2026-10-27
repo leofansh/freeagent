@@ -181,8 +181,18 @@ def ask_executor(
 
                 if kind == "session.error":
                     _abort_quietly(oc, session_id)
+                    # 报出执行器给的**真话**（若有）。opencode 的载荷里没有
+                    # ``message`` 键，所以这里默认仍是笼统的「执行器报错」；
+                    # hermes 的 ``run.failed`` 带 ``error``（如模型到期/余额
+                    # 不足），被 hermes 适配器折进 ``{"message": ...}`` ——
+                    # 有才带上，别让用户对着「执行器报错」四个字猜。
+                    reason = "执行器报错。"
+                    if isinstance(props, dict):
+                        msg = props.get("message")
+                        if isinstance(msg, str) and msg.strip():
+                            reason = f"执行器报错：{msg.strip()[:200]}"
                     return AskOutcome(
-                        ok=False, reason="执行器报错。",
+                        ok=False, reason=reason,
                         tool_calls=tool_calls,
                         partial=text,
                     )

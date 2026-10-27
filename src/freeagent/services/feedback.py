@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import difflib
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,7 +46,14 @@ from ..domain import RecordType
 from ..domain.models import TaskRecord
 from .delegate import attempt_state
 
-__all__ = ["DelegationOutcome", "FeedbackReport", "read_outcome", "feedback_report"]
+__all__ = [
+    "DelegationOutcome",
+    "FeedbackReport",
+    "RevisionDrift",
+    "read_outcome",
+    "revision_drift",
+    "feedback_report",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +101,63 @@ class FeedbackReport:
         if ran == 0:
             return None
         return self.succeeded / ran
+
+
+@dataclass(frozen=True, slots=True)
+class RevisionDrift:
+    """两版产出之间的**事实差异**。
+
+    只有增删行数与几行样本，**没有**「他是想把语气改软」这类解释 ——
+    解释是替他讲自己的动机，而本模块的全部职能是摆事实（同 11.19.5
+    「不写违约」的纪律：判断留给用户）。
+    """
+
+    added: int
+    removed: int
+    #: 变更样本 ``(符号, 行文本)``，符号为 ``"+"`` / ``"-"``。
+    samples: tuple[tuple[str, str], ...]
+
+
+def revision_drift(old: str, new: str, *, sample: int = 4) -> RevisionDrift:
+    """算相邻两版之间的增删。**纯函数，不碰库、不判优劣。**
+
+    ## 这是「人改了什么」唯一可算的地方
+
+    审批卡上没有「改一下」这个动作（只有同意 / 拒绝 / 叫停），所以审批
+    那条线记不下「改动」。真正的改动发生在 :meth:`ArtifactService.revise`
+    —— 它**永远产生新版本，旧版留在库里**。于是两版文本摆在一起，
+    差多少行是可以**算出来**的，而且这个算不依赖任何推断。
+
+    ## 为什么不叫 diff、不做摘要
+
+    一版一版比下去，很容易滑向「他连续三次都在删开头那段，是不是
+    不喜欢这种写法」—— 那不是事实，是归纳出来的偏好，且样本只有三次。
+    所以这里只回答「加了 12 行、删了 3 行、动的是这几行」，剩下的
+    一个字都不多说。同 :mod:`freeagent.services.approval` 的 ``evidence``：
+    两者都是把已经发生的事原样摆出来。
+
+    :param sample: 最多列几行样本。**不能是 0 以下**，负数按 0 处理
+        （切片会给出意外结果，而那个意外会静默变成「没有样本」）。
+    """
+    take = max(0, sample)
+    added = removed = 0
+    samples: list[tuple[str, str]] = []
+    for line in difflib.unified_diff(
+        old.splitlines(), new.splitlines(), lineterm="", n=0,
+    ):
+        # 只吃正文行：``---`` / ``+++`` 是文件头，``@@`` 是 hunk 头。
+        # 不跳过它们的话，每一处变更都会多算两行「增删」。
+        if line.startswith(("---", "+++", "@@")):
+            continue
+        if line.startswith("+"):
+            added += 1
+            if len(samples) < take:
+                samples.append(("+", line[1:]))
+        elif line.startswith("-"):
+            removed += 1
+            if len(samples) < take:
+                samples.append(("-", line[1:]))
+    return RevisionDrift(added=added, removed=removed, samples=tuple(samples))
 
 
 def read_outcome(records: Sequence[TaskRecord]) -> DelegationOutcome:

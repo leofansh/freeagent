@@ -284,10 +284,10 @@ class _FakeSender:
         # 于是下面 ``resolve(credential, self.auto, …)`` 报「str 不能赋给 Decision」。
         self.auto: Decision = auto
         self.cards: list[dict[str, Any]] = []
-        #: 每张卡唯一 id（``om_1``、``om_2``…）。V1.41 滚动瘦身要按
-        #: **消息 id** 撤卡 —— 全部同串的话，「撤的是哪张」就断言不出来了。
+        #: 每张卡唯一 id（``om_1``、``om_2``…）。收尾要按**消息 id** 改写
+        #: 终态 —— 全部同串的话，「收的是哪张」就断言不出来了。
         self._seq = 0
-        #: 收到过的撤回请求（录制）：V1.41 断言「旧卡在新卡发出前被撤」。
+        #: 收到过的收尾请求（录制）：断言「旧卡在新卡发出前被改写终态」。
         self.retired_ids: list[str] = []
         self._store: ApprovalStore | None = None
 
@@ -311,9 +311,10 @@ class _FakeSender:
             self._store.resolve(credential, self.auto, decided_by=open_id)
         return message_id
 
-    def delete_message(self, message_id: str) -> None:
-        # 生产语义是「真的飞书撤回」；替身只**录制**，什么也不删 ——
-        # 断言的恰恰是「哪张卡的 id 在什么时机被交给撤回」。
+    def settle_card(self, message_id: str, *, subject: str = "",
+                    verdict: str = "") -> None:
+        # 生产语义是「PATCH 原地改写终态」；替身只**录制**，什么也不改 ——
+        # 断言的恰恰是「哪张卡的 id 在什么时机被交给收尾」。
         self.retired_ids.append(message_id)
 
 

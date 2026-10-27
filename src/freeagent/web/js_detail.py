@@ -226,7 +226,7 @@ function newForm(options) {
     errBox.hidden = true;
     const day = f.querySelector("#d").value;
     try {
-      await api("/api/task", {
+      const r = await api("/api/task", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -238,6 +238,7 @@ function newForm(options) {
       });
       f.querySelector("#t").value = "";
       toast(day ? "已记下，已排到 " + day : "已记下（未排期）");
+      if (r && r.relation_hint) toast(r.relation_hint); // V1.84 可挂账提示：只提示不静默挂
       load(view);
     } catch (e) {
       errBox.hidden = false;

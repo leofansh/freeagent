@@ -15,6 +15,7 @@ from .config import Config, load_config
 from .services.artifacts import ArtifactService
 from .services.approval import ApprovalStore
 from .services.capability import CapabilityRouter, CapabilityView
+from .services.care import CareService
 from .services.chat import ChatService
 from .services.clock import Clock, SystemClock
 from .services.knowledge import KnowledgeService
@@ -36,8 +37,10 @@ from .storage.db import connect, migrate, resolve_db_path
 from .storage.repos import (
     ArtifactRepo,
     CapturedRepo,
+    CareRepo,
     ContactRepo,
     DailyDigestRepo,
+    LeaseRepo,
     PromiseRepo,
     RecordRepo,
     RoleRepo,
@@ -73,6 +76,9 @@ class App:
     #: 催办草稿（20.1.4）。**只读 + 拼文本**：不持有任何发送通道，
     #: 想代发的人找不到那条路 —— 见模块纪律 1。
     nudge: NudgeService
+    #: 人生角色关注面（11.24）。给角色定义「该周期性关心的东西」，
+    #: 到点并进每日总览提醒 —— 持续责任，不是待办。
+    care: CareService
     restore: RestoreService
     reminders: ReminderEngine
 
@@ -260,6 +266,7 @@ def build_app(
     contact_repo = ContactRepo(conn)
     promise_repo = PromiseRepo(conn)
     daily_digest_repo = DailyDigestRepo(conn)
+    care_repo = CareRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
     # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
@@ -270,15 +277,21 @@ def build_app(
         return any(p.task_id == task_id for p in store.pending_for_web())
 
     task_service = TaskService(
-        task_repo, record_repo, the_clock, has_pending=_has_pending
+        task_repo, record_repo, the_clock, has_pending=_has_pending,
+        # 租约（12.11.3 / V1.94）：只用来判断一条「在跑」形状的事务是不是
+        # **失联**。装配在这里，是因为判定要读墙上时钟，而时钟属于 app。
+        leases=LeaseRepo(conn),
     )
     artifact_service = ArtifactService(
         artifact_repo, task_repo, record_repo, the_clock
     )
     # 待处理收集器（11.18）。澄清要建事务，所以它拿 TaskService（唯一写入口）
     # 与 RoleService（默认脉络）；不自己拼 INSERT —— 一份能力一份实现。
+    # attachments_dir = 状态目录下的 attachments/：文本捕获（批量倾倒/邮件）
+    # 落盘到它，与飞书收图片落盘同一条惯例（原件在盘上）。
     pending_service = PendingService(
-        captured_repo, task_service, role_service, the_clock
+        captured_repo, task_service, role_service, the_clock,
+        attachments_dir=path.parent / "attachments",
     )
     # 关系对象与对外承诺（11.19）。承诺要挂兑现物，所以拿 TaskService
     # （唯一写入口）；关系对象只做记账，不碰事务。
@@ -290,6 +303,9 @@ def build_app(
     nudge_service = NudgeService(
         task_service, promise_repo, contact_repo, the_clock
     )
+    # 人生角色关注面（11.24 / V1.68）。拿角色仓储（校验角色存在 + 翻名字），
+    # 不碰任务 —— 关注面不是事务。care_repo 只做存储，到期现算在服务里。
+    care_service = CareService(care_repo, role_repo, the_clock)
     # 今天视图**排在**承诺服务之后建：它要用承诺算「逾期未兑现」的权重
     # （11.19），所以得先有承诺服务才能给出那个查找回调。
     # 回调而不是直接依赖仓储 —— 见 TodayService.__init__ 的注释。
@@ -299,9 +315,6 @@ def build_app(
         promise_of=promise_service.promise_of,
     )
     # 周回顾复用今天视图的顺延实现（不复制）。见 services/week.py 模块文档。
-    week_service = WeekService(
-        task_repo, record_repo, the_clock, today=today_service
-    )
     restore_service = RestoreService(
         task_service, artifact_service, record_repo, role_service, the_clock
     )
@@ -323,6 +336,12 @@ def build_app(
     personal_model_service = PersonalModelService(
         task_repo, record_repo, the_clock, role_repo=role_repo,
         promise=promise_service, memory=memory_service,
+    )
+    # 周回顾（6.5 / V1.71）：成长目标分区读 memory「目标」类 —— 必须在这两个
+    # 服务建好之后才建它；memory 可空（空则成长头为空）。
+    week_service = WeekService(
+        task_repo, record_repo, the_clock,
+        today=today_service, memory=memory_service,
     )
     chat_service = ChatService(
         task_service, task_repo, role_service, restore_service,
@@ -363,6 +382,7 @@ def build_app(
         pending=pending_service,
         promise=promise_service,
         nudge=nudge_service,
+        care=care_service,
         restore=restore_service,
         reminders=reminder_engine,
         chat=chat_service,

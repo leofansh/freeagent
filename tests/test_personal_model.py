@@ -208,6 +208,7 @@ class TestPersonalModelService:
         app.record_repo.append(task.id, RecordType.ROLLOVER, "顺延", datetime(2026, 10, 20, 9, 0))
         app.record_repo.append(task.id, RecordType.ROLLOVER, "又顺延", datetime(2026, 10, 21, 9, 0))
         _waiting(app, role, "等合同", "张总", clock.now() - timedelta(days=10))
+        app.memory.add("我最近在学赛艇", kind="偏好")
         text = render_model(_view(env), {})
         assert "连续性个人模型" in text
         assert "完成" in text
@@ -217,6 +218,9 @@ class TestPersonalModelService:
         # V1.59 两分面也出现。
         assert "关系账" in text
         assert "承诺与目标" in text
+        # V1.69 滋养兴趣分面：记下的偏好原样带出。
+        assert "滋养兴趣" in text
+        assert "我最近在学赛艇" in text
         # 收尾是「事实」而非「规律」，且不给建议。
         assert "事实" in text
         assert "建议你" not in text
@@ -306,6 +310,33 @@ class TestRelationshipsAndCommitments:
             for c in view.commitments
             if c[1] in ("回复先给结论", "今年把英语练到能开会")
         )
+
+    # ------------------------------------------------- 滋养兴趣（V1.69，记录优先）
+    def test_preferences_carry_interest_layer(self):
+        mems = [
+            _mem("m1", "偏好", "我最近在学赛艇"),
+            _mem("m2", "偏好", "不喝冰"),
+            _mem("m3", "目标", "今年把英语练到能开会"),   # 目标仍留在「承诺与目标」
+        ]
+        view = build_personal_model([], [], {}, WEDNESDAY, memory_entries=mems)
+        texts = {t for _, t in view.preferences}
+        assert "我最近在学赛艇" in texts
+        assert "不喝冰" in texts
+        # 偏好进「滋养兴趣」面，不进「承诺与目标」面（两者刻意分开）。
+        ctexts = {c[1] for c in view.commitments}
+        assert "我最近在学赛艇" not in ctexts
+        assert "今年把英语练到能开会" in ctexts
+        # 只原样列出，不评价、不标逾期。
+        assert all(_kind == "偏好" for _kind, _ in view.preferences)
+
+    def test_is_empty_counts_preferences(self):
+        # 只记了「偏好」也算有内容，不算空模型 —— 有爱好本身就是规律。
+        view = build_personal_model(
+            [], [], {}, WEDNESDAY,
+            memory_entries=[_mem("m1", "偏好", "我最近在学赛艇")],
+        )
+        assert not view.is_empty
+
 
 
 class TestRelationshipsCommitmentsIntegration:

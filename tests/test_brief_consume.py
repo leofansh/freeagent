@@ -64,6 +64,15 @@ class _Msg:
         #: 附件，走富文本分支只回提示）。真类 ``IncomingMessage`` 是同名
         #: 字段，缺了就是 AttributeError —— 替身必须跟真接口同形状。
         self.attachment = None
+        #: V1.88 起 ``_process`` 的时效窗口会读 ``create_time``（空 = 放弃
+        #: 判定，退回旧行为）。同上：真类有的字段替身必须有，否则
+        #: ``_process`` 一进来就 AttributeError，而这些测试验的根本不是
+        #: 时效窗口。
+        self.create_time = ""
+        #: V1.90 起 ``_route_answer`` 按话题根路由（空 = 不在话题里）。
+        #: 用 ``getattr`` 兜底的写法能容忍缺失，但替身与真类同形状更省事：
+        #: 将来若改成直接 ``msg.root_id``，这里不会莫名红。
+        self.root_id = ""
 
     @property
     def dedup_key(self) -> str:

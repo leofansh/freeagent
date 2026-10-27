@@ -51,13 +51,15 @@ class _Msg:
     """Just the attributes `_route_answer` reads."""
 
     def __init__(self, text: str, *, who: str = ALICE,
-                 unsupported: str = "") -> None:
+                 unsupported: str = "", root_id: str = "") -> None:
         self.text = text
         self.sender_open_id = who
         self.unsupported_type = unsupported
         self.chat_id = "oc_chat"
         self.event_id = "ev_1"
         self.message_id = "om_1"
+        #: V1.90：话题根（在话题里说话时飞书才给）。空 = 在主聊天流里说。
+        self.root_id = root_id
 
 
 class _Sender:
@@ -248,4 +250,56 @@ class TestNewestQuestionWins:
         new = _ask(store, "新问题?", cred="q_new_0000000002")
         b._route_answer(_Msg("答案"))
         assert store.answers_of(new.credential) == [["答案"]]
+        assert store.answers_of(old.credential) == [[]]
+
+class TestTopicRouting:
+    """V1.90：话题里说话 → 答案只进**那个话题**对应的提问。
+
+    ## 为什么「取最新一条」不够
+
+    多委派并行时两条委派可能同时在提问。``TestNewestQuestionWins`` 记的
+    旧判据（取最新）在那一刻会**稳定串台**：先发起的那条永远等不到人，
+    而用户以为自己答过了 —— 比不答更坏。
+
+    有了话题就有确定性判据：用户在哪条委派的话题里说话，飞书事件里的
+    ``root_id`` 就是那张进度卡（真机实证见 ``tools/probe_topic.py``），
+    而发卡时同一个值记进了 ``pending_approvals.thread_root``。
+
+    ## 话题里没有对应提问时**不退回**最新一条
+
+    那是 fail-closed：这句话不是答案（照常走命令/闲聊），
+    总好过被写进另一条委派的问答槽位。
+    """
+
+    def test_answer_lands_in_the_topic_it_was_typed_in(self, wired):
+        b, store, _ = wired
+        a = _ask(store, "A 的问题?", cred="q_a_000000000001")
+        c = _ask(store, "B 的问题?", cred="q_b_000000000002")
+        store.record_card(a.credential, "om_a1", thread_root="om_root_a")
+        store.record_card(c.credential, "om_b1", thread_root="om_root_b")
+
+        got = b._route_answer(_Msg("答给 A", root_id="om_root_a"))
+        assert got is not None
+        assert store.answers_of(a.credential) == [["答给 A"]]
+        assert store.answers_of(c.credential) == [[]], "B 的槽位不许被填"
+
+    def test_unknown_topic_does_not_steal_another_question(self, wired):
+        """话题不在任何提问名下 → 不当答案（fail-closed）。"""
+        b, store, _ = wired
+        a = _ask(store, "A 的问题?", cred="q_a_000000000001")
+        store.record_card(a.credential, "om_a1", thread_root="om_root_a")
+
+        assert b._route_answer(_Msg("随便一句", root_id="om_root_zzz")) is None
+        assert store.answers_of(a.credential) == [[]]
+
+    def test_message_outside_any_topic_keeps_old_judgement(self, wired):
+        """主聊天流里说的（无 root_id）仍按「最新一条」—— 旧路径不许断。"""
+        b, store, _ = wired
+        old = _ask(store, "旧问题?", cred="q_old_0000000001")
+        new = _ask(store, "新问题?", cred="q_new_0000000002")
+        store.record_card(old.credential, "om_o1", thread_root="om_root_o")
+        store.record_card(new.credential, "om_n1", thread_root="om_root_n")
+
+        b._route_answer(_Msg("主聊天流的回答"))
+        assert store.answers_of(new.credential) == [["主聊天流的回答"]]
         assert store.answers_of(old.credential) == [[]]

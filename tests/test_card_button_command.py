@@ -326,8 +326,27 @@ class TestCardIsActuallySent:
                 event_id="ev-1",
             )
             assert reply.task_action is not None, "建了委派却没有动作卡"
-            task_id, title = reply.task_action
+            task_id, title, _ = reply.task_action
             assert task_id and title, "动作卡必须带事务 id 与标题"
+        finally:
+            app.close()
+
+    def test_delegate_visibly_discloses_privacy(self, tmp_path):
+        """⑩ 委派隐私的正面声明：建单回话里**显式**说「不隔离、读执行器配置」。
+
+        放弃隔离后委派看得见你的执行器配置（默认加载你配的插件 / MCP / 技能）。
+        告知必须落在「确认要派的话」之前 —— 用户是看到它之后才决定派不派的。
+        """
+        app = _delegate_app(tmp_path)
+        try:
+            channel = ChannelService(app, allowed_senders=frozenset({WHO}))
+            reply = channel.handle(
+                CHAT, WHO, f"/delegate {tmp_path} | 工作 | 加个登录",
+                event_id="ev-1",
+            )
+            assert "执行器配置" in reply.text, "委派回话没有显式告知隐私"
+            assert reply.text.index("执行器配置") < reply.text.index(
+                "确认要派的话"), "告知必须出现在「确认要派」之前"
         finally:
             app.close()
 
@@ -344,7 +363,7 @@ class TestCardIsActuallySent:
                 CHAT, WHO, f"/delegate {tmp_path} | 工作 | 加个登录",
                 event_id="ev-1",
             )
-            task_id, _ = reply.task_action
+            task_id, _, _ = reply.task_action
             got = app.tasks.get(task_id)
             assert got.project_path, "卡上指的那条不是委派事务"
             assert got.delegate_chat_id == CHAT, "卡的来源会话记错了"
@@ -366,7 +385,9 @@ class TestCardIsActuallySent:
                 event_id="ev-1",
             )
             assert first.task_action is not None
-            second = channel.handle(CHAT, WHO, "/today", event_id="ev-2")
+            # 下一句是**普通消息**（非查询命令）—— 不许带卡。查询命令
+            # today/pending 可带操作卡（V1.61），但普通问答仍纯文本。
+            second = channel.handle(CHAT, WHO, "你好", event_id="ev-2")
             assert second.task_action is None, (
                 "动作卡粘到了下一条消息上 —— 用户问天气也会看到「做完」按钮"
             )
@@ -374,15 +395,16 @@ class TestCardIsActuallySent:
             app.close()
 
     def test_ordinary_reply_gets_no_card(self, tmp_path):
-        """不是委派的那一轮**不许**发动作卡。
+        """不是查询命令的那一轮**不许**发动作卡。
 
-        每条飞书消息都发一张卡，界面就变成「每句话一张卡」，而卡片是用来
-        省一次交互的 —— 滥发等于没有。
+        查询命令 today（有排期时）可带操作卡（V1.61），但普通问答
+        照旧纯文本 —— 每条飞书消息都发一张卡，界面就变成「每句话一张卡」，
+        而卡片是用来省一次交互的，滥发等于没有。
         """
         app = _delegate_app(tmp_path)
         try:
             channel = ChannelService(app, allowed_senders=frozenset({WHO}))
-            reply = channel.handle(CHAT, WHO, "/today", event_id="ev-x")
+            reply = channel.handle(CHAT, WHO, "今天天气不错", event_id="ev-x")
             assert reply.task_action is None
         finally:
             app.close()
@@ -418,5 +440,119 @@ class TestCardIsActuallySent:
             assert card["chat_id"] == CHAT, "卡片的会话 id 不对"
             assert card["task_id"], "卡片没有指向任何事务"
             assert card["title"], "卡片没有标题"
+        finally:
+            app.close()
+
+
+class TestTodayCard:
+    """today 查询命令在飞书带一张动作卡（V1.61）。
+
+    边界：**有排期**（今天视图有内容）才对最高优先那条带卡；普通问答、
+    无排期的今天视图仍纯文本 —— 卡片是「省一次交互」用的，滥发等于没有。
+    """
+
+    def _app(self, tmp_path, *, scheduled=True):
+        app = build_app(tmp_path / "a.db")
+        role = app.roles.create("工作")
+        if scheduled:
+            app.tasks.create("交周报", [role.id],
+                             scheduled_for=app.clock.now().date())
+        else:
+            app.tasks.create("未排期的事", [role.id])
+        channel = ChannelService(app, allowed_senders=frozenset({WHO}))
+        return app, channel
+
+    def test_today_with_schedule_carries_top_action_card(self, tmp_path):
+        app, channel = self._app(tmp_path)
+        try:
+            reply = channel.handle(CHAT, WHO, "/today", event_id="ev-1")
+            assert reply.task_action is not None, "今天有排期该带动作卡"
+            tid, title, state = reply.task_action
+            assert title == "交周报", "卡带的是最高优先那条"
+            assert tid and state, "id 与状态文案都要有"
+        finally:
+            app.close()
+
+    def test_today_without_schedule_no_card(self, tmp_path):
+        app, channel = self._app(tmp_path, scheduled=False)
+        try:
+            reply = channel.handle(CHAT, WHO, "/today", event_id="ev-1")
+            assert reply.task_action is None, "今天视图没内容就不该发卡"
+        finally:
+            app.close()
+
+    def test_today_card_button_really_changes_state(self, tmp_path, monkeypatch):
+        """端到端那一下：today 卡上的「做完啦」按钮走真实回调改状态。"""
+        app, channel = self._app(tmp_path)
+        sender = _Sender()
+        monkeypatch.setattr(B, "_card_channel", channel, raising=False)
+        monkeypatch.setattr(B, "_card_sender", sender, raising=False)
+        try:
+            reply = channel.handle(CHAT, WHO, "/today", event_id="ev-1")
+            tid, _, _ = reply.task_action
+            B._run_card_command(
+                {"action": "command", "cmd": "/done", "id": tid, "chat": CHAT},
+                who=WHO,
+            )
+            assert app.tasks.get(tid).state.value == "done"
+        finally:
+            app.close()
+
+
+class TestTaskCard:
+    """``/task <id>`` 打开单条事务时带它自己的动作卡（V1.66）。
+
+    边界与 today 卡一致（11.23.2）：查询命令可带操作卡、普通问答纯文本；
+    但只对**未结束**的事务发 —— DONE / DROPPED 的按钮没有意义。
+    """
+
+    def _app(self, tmp_path, *, state="open"):
+        app = build_app(tmp_path / "a.db")
+        role = app.roles.create("工作")
+        task = app.tasks.create("修 bug", [role.id])
+        if state == "done":
+            app.tasks.complete(task.id)
+        channel = ChannelService(app, allowed_senders=frozenset({WHO}))
+        return app, channel, task
+
+    def test_open_task_carries_its_action_card(self, tmp_path):
+        app, channel, task = self._app(tmp_path)
+        try:
+            reply = channel.handle(
+                CHAT, WHO, f"/task {task.id[:8]}", event_id="ev-1",
+            )
+            assert reply.task_action is not None, "打开未结束事务该带动作卡"
+            tid, title, state = reply.task_action
+            assert tid == task.id and title == "修 bug", "卡带的是刚打开那条"
+            assert state, "状态文案要有"
+        finally:
+            app.close()
+
+    def test_done_task_no_card(self, tmp_path):
+        app, channel, task = self._app(tmp_path, state="done")
+        try:
+            reply = channel.handle(
+                CHAT, WHO, f"/task {task.id[:8]}", event_id="ev-1",
+            )
+            assert reply.task_action is None, "已结束事务不该带动作卡"
+        finally:
+            app.close()
+
+    def test_task_card_button_really_changes_state(self, tmp_path, monkeypatch):
+        """端到端那一下：``/task`` 卡上的「开始做」按钮走真实回调改状态。"""
+        app, channel, task = self._app(tmp_path)
+        sender = _Sender()
+        monkeypatch.setattr(B, "_card_channel", channel, raising=False)
+        monkeypatch.setattr(B, "_card_sender", sender, raising=False)
+        try:
+            reply = channel.handle(
+                CHAT, WHO, f"/task {task.id[:8]}", event_id="ev-1",
+            )
+            tid, _, _ = reply.task_action
+            B._run_card_command(
+                {"action": "command", "cmd": "/start", "id": tid, "chat": CHAT},
+                who=WHO,
+            )
+            assert app.tasks.get(tid).state.value == "active"
         finally:
             app.close()

@@ -14,7 +14,7 @@ import pytest
 
 from freeagent.services.approval import ApprovalStore
 from freeagent.services.localops import DirectoryAccess, DirectoryRefused
-from freeagent.storage.db import connect, init_schema
+from freeagent.storage.db import connect, migrate
 
 
 class FakeClock:
@@ -47,7 +47,7 @@ class FakeSender:
 @pytest.fixture
 def env(tmp_path):
     conn = connect(Path(tmp_path) / "a.db")
-    init_schema(conn)
+    migrate(conn)
     clock = FakeClock(datetime.datetime(2026, 9, 29, 12, 0))
     store = ApprovalStore(conn, clock=clock)
     return store, clock, conn

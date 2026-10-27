@@ -76,6 +76,54 @@ class TestCountedButNotListed:
         assert app.today.view().unscheduled_count == 2
 
 
+class TestFutureIsCountedNotListed:
+    """排在未来（``scheduled_for > today``）的**同样**不进今天视图（V1.84）。
+
+    它与「没排期」是同构的静默：记一条「排到下周三」的事，回 /today 却
+    拿到「今天没有」—— 用户会以为没记上。所以空态也要报它。这里补上
+    ``future_count`` / ``earliest_future`` 的计数契约。
+    """
+
+    def test_future_is_counted_not_shown(self, app, clock) -> None:
+        from datetime import timedelta
+
+        role = _role_id(app)
+        future = clock.today() + timedelta(days=5)
+        app.tasks.create("下周的事", [role], scheduled_for=future)
+        view = app.today.view()
+        assert view.items == ()
+        assert view.unscheduled_count == 0, "未来不是「没排期」，是两个桶"
+        assert view.future_count == 1
+        assert view.earliest_future == future
+
+    def test_today_is_not_future(self, app, clock) -> None:
+        role = _role_id(app)
+        app.tasks.create("今天的事", [role], scheduled_for=clock.today())
+        view = app.today.view()
+        assert len(view.items) == 1
+        assert view.future_count == 0
+
+    def test_done_future_is_not_counted(self, app, clock) -> None:
+        from datetime import timedelta
+
+        role = _role_id(app)
+        task = app.tasks.create(
+            "做完的下周事", [role], scheduled_for=clock.today() + timedelta(days=3)
+        )
+        app.tasks.complete(task.id)
+        assert app.today.view().future_count == 0
+
+    def test_earliest_is_the_min_future_day(self, app, clock) -> None:
+        from datetime import timedelta
+
+        role = _role_id(app)
+        app.tasks.create("较晚", [role], scheduled_for=clock.today() + timedelta(days=9))
+        app.tasks.create("较早", [role], scheduled_for=clock.today() + timedelta(days=2))
+        view = app.today.view()
+        assert view.future_count == 2
+        assert view.earliest_future == clock.today() + timedelta(days=2)
+
+
 class TestWebPayloadCarriesTheCount:
     """``/api/today`` 的形状里必须有这个字段，界面才能说。"""
 
@@ -92,6 +140,17 @@ class TestWebPayloadCarriesTheCount:
         payload = today_payload(app.today.view(), {})
         assert payload["count"] == 1
         assert payload["unscheduled_count"] == 0
+
+    def test_payload_carries_future(self, app, clock) -> None:
+        from datetime import timedelta
+
+        role = _role_id(app)
+        future = clock.today() + timedelta(days=5)
+        app.tasks.create("下周的事", [role], scheduled_for=future)
+        payload = today_payload(app.today.view(), {})
+        assert payload["count"] == 0
+        assert payload["future_count"] == 1
+        assert payload["earliest_future"] == future.isoformat()
 
 
 class TestChatReplyAdmitsThem:
@@ -113,3 +172,14 @@ class TestChatReplyAdmitsThem:
         view = app.today.view()
         assert view.unscheduled_count == 0
         assert view.items, "这条应当真的出现在今天视图里"
+
+    def test_empty_today_names_the_future_ones(self, app, clock) -> None:
+        """空态要说出「排在后面」的 —— 否则排到下周三的事像凭空消失。"""
+        from datetime import timedelta
+
+        role = _role_id(app)
+        app.tasks.create("下周的事", [role], scheduled_for=clock.today() + timedelta(days=5))
+        reply = app.chat.respond("今天该做什么？")
+        assert reply.route == "today"
+        assert str(app.today.view().future_count) in reply.text
+        assert "排在后面" in reply.text

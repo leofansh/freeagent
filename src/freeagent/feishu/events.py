@@ -99,6 +99,30 @@ class IncomingMessage:
     #: 时显式发起，保持「非文字消息不建事务」这个前提（见
     #: ``tests/test_doc_contract.py`` 的用户文档断言）。
     attachment: "AttachmentRef | None" = None
+    #: 消息创建时刻（飞书给的是**毫秒字符串**，如 ``"1730000000000"``）。
+    #:
+    #: 为什么要有它：去重键（event_id/message_id）**可能双双缺失**，而
+    #: 飞书长连接对未确认事件会重投 —— 没有键就挡不住重投。创建时刻是
+    #: 不依赖任何 id 的最后防线：晚到超过时效窗口的消息判为重投残件，
+    #: 直接忽略（设计方案 11.9.2 的时效窗口）。缺这个字段时桥接只能
+    #: 退回「只记日志、照常处理」的旧行为，所以**有值就必带**。
+    create_time: str = ""
+    #: 这条消息所在的**话题** id（``omt_`` 开头）。空 = 不在话题里。
+    #:
+    #: V1.90 起授权卡/提问卡挂在「以进度卡为根」的话题下（私聊也成立，
+    #: 见 ``tools/probe_topic.py``），于是「这句话属于哪条委派」有了
+    #: 确定性判据 —— 但不靠它，靠 :attr:`root_id`（见下）。
+    thread_id: str = ""
+    #: 话题的**根消息** id（``root_id``）。空 = 不在话题里。
+    #:
+    #: **这是路由判据**，不是 ``thread_id``：根消息就是那张进度卡的
+    #: ``message_id``，而我们记在库里的（``pending_approvals.thread_root``）
+    #: 也正是它。用 ``thread_id`` 也行，但 ``thread_id`` 要等**第一条回复
+    #: 发出去之后**才存在 —— 发卡那一刻还没拿到，记不下来。
+    #:
+    #: 真机实证（``probe_topic.py`` 拉回的话题消息列表）：话题里每条消息的
+    #: ``root_id`` 与 ``parent_id`` 都指向话题根，``thread_id`` 相同。
+    root_id: str = ""
 
     @property
     def sender_ids(self) -> frozenset[str]:
@@ -312,6 +336,9 @@ def parse_event(
             unsupported_type=str(message_type or "未知"),
             message_id=message_id,
             attachment=attachment,
+            create_time=str(message.get("create_time") or ""),
+            thread_id=str(message.get("thread_id") or ""),
+            root_id=str(message.get("root_id") or ""),
         )
 
     raw_content = message.get("content")
@@ -343,6 +370,9 @@ def parse_event(
         mentioned=mentioned,
         mention_note=note,
         message_id=message_id,
+        create_time=str(message.get("create_time") or ""),
+        thread_id=str(message.get("thread_id") or ""),
+        root_id=str(message.get("root_id") or ""),
     )
 
 
@@ -564,7 +594,10 @@ def _extract_attachment(
     """从非文字消息的 content 抽附件引用。抽不到返回 ``None``。
 
     飞书 image 消息 content 形如 ``{"image_key": "..."}``；
-    file 消息形如 ``{"file_key": "...", "file_name": "...", "file_size": N}``。
+    file 消息形如 ``{"file_key": "...", "file_name": "...", "file_size": N}``；
+    **post（富文本）**消息是段落列表，内联图片/文件藏在元素里 ——
+    「图片+文字一起发」就是这种类型（对方生态 ``opencode-feishu-plugin``
+    v0.2.25 踩的同款坑：只按 image/file 解析时，post 里的图**整张丢**）。
     """
     if not isinstance(raw_content, str):
         return None
@@ -584,4 +617,45 @@ def _extract_attachment(
             name=inner.get("file_name") or "file",
             size=int(raw_size) if isinstance(raw_size, (int, float)) else 0,
         )
+    if message_type == "post":
+        return _attachment_from_post(inner)
+    return None
+
+
+def _attachment_from_post(post: "dict[str, Any]") -> "AttachmentRef | None":
+    """从 post（富文本）content 里抽**第一个**可下载的附件引用。
+
+    飞书的 post content 有两种形状，都要认（老事件格式多一层 ``post`` 壳）::
+
+        {"title": ..., "content": [[{"tag": "text", ...}, {"tag": "img",
+          "image_key": "..."}], ...]}                       # receive_v1
+        {"post": {"title": ..., "content": [...]}}          # 旧事件格式
+
+    只收**第一个**：``IncomingMessage.attachment`` 是单引用（多附件要改
+    结构、波及桥接与落盘命名），而「一张图 + 一句话」是绝对主流的用法。
+    漏掉的图用户重发一张即可 —— 比为了多图改一串结构划算。
+    """
+    body = post.get("post") if isinstance(post.get("post"), dict) else post
+    content = body.get("content") if isinstance(body, dict) else None
+    if not isinstance(content, list):
+        return None
+    for paragraph in content:
+        if not isinstance(paragraph, list):
+            continue
+        for element in paragraph:
+            if not isinstance(element, dict):
+                continue
+            tag = element.get("tag")
+            if tag == "img" and isinstance(element.get("image_key"), str):
+                return AttachmentRef(
+                    type="image", key=element["image_key"], name="image", size=0,
+                )
+            if tag == "file" and isinstance(element.get("file_key"), str):
+                raw_size = element.get("file_size") or 0
+                return AttachmentRef(
+                    type="file",
+                    key=element["file_key"],
+                    name=element.get("file_name") or "file",
+                    size=int(raw_size) if isinstance(raw_size, (int, float)) else 0,
+                )
     return None

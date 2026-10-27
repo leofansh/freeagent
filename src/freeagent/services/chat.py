@@ -30,7 +30,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
 
-from ..domain import ArtifactStatus, ScoredTask, Task, TaskKind, TaskState
+from ..domain import (
+    ORIGIN_SELF,
+    ArtifactStatus,
+    ScoredTask,
+    Task,
+    TaskKind,
+    TaskState,
+)
 from typing import TYPE_CHECKING
 
 from ..services.clock import Clock
@@ -674,6 +681,7 @@ class ChatService:
             kind=kind,
             scheduled_for=scheduled,
             reminder_time=reminder,
+            origin=ORIGIN_SELF,
         )
         bits = [f"形状 {task.kind.label}", f"角色 {'、'.join(self._role_names(task))}"]
         if scheduled is not None:
@@ -699,10 +707,17 @@ class ChatService:
         if not view.items:
             # 「没有排进来的」不等于「没有事」。没排期的那些按设计不进
             # 今天视图，但**必须报出来** —— 否则用户刚记的事凭空消失，
-            # 而回答还斩钉截铁地说「没有」。
+            # 而回答还斩钉截铁地说「没有」。V1.84 把**排在未来**的也算上
+            # （排到哪天就该哪天看，但空态得让用户知道它们在排队）。
+            extras = []
+            if view.unscheduled_count:
+                extras.append(f"{view.unscheduled_count} 条没排期")
+            if view.future_count:
+                when = f"，最早 {view.earliest_future}" if view.earliest_future else ""
+                extras.append(f"{view.future_count} 条排在后面{when}")
             extra = (
-                f"另有 {view.unscheduled_count} 条没排期，它们也不在今天视图里。"
-                if view.unscheduled_count
+                f"（另有 {'、'.join(extras)}，它们都不在今天视图里）"
+                if extras
                 else ""
             )
             return ChatReply(

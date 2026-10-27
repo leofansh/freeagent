@@ -78,7 +78,7 @@ class _Reply:
     """
 
     def __init__(self, text: str, *, denied: bool = False,
-                 task_action: tuple[str, str] | None = None) -> None:
+                 task_action: tuple[str, str, str] | None = None) -> None:
         self.text = text
         self.denied = denied
         self.task_action = task_action
@@ -135,7 +135,8 @@ def wired(monkeypatch):
     sender = _Sender()
     # 成功的回话**必须**带 ``task_action`` —— 桥接靠它判「建出来了」。
     channel = _Channel(_Reply(
-        "已建委派事务 abc12345", task_action=("abc12345", "改一下登录页"),
+        "已建委派事务 abc12345",
+        task_action=("abc12345", "改一下登录页", "待办（执行器不会碰它）"),
     ))
     monkeypatch.setattr(bridge_mod, "_card_sender", sender, raising=False)
     monkeypatch.setattr(bridge_mod, "_card_channel", channel, raising=False)

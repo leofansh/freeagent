@@ -18,7 +18,10 @@ from ..app import App
 from ..domain import FreeAgentError, NotFoundError
 from . import serialize, serialize_api
 
-__all__ = ["pending", "promises", "contacts", "contact_ledger", "pending_clarify", "pending_dismiss"]
+__all__ = [
+    "pending", "promises", "contacts", "contact_ledger",
+    "pending_clarify", "pending_dismiss", "capture_batch", "capture_mail",
+]
 
 
 def pending(app: App) -> dict:
@@ -113,3 +116,34 @@ def pending_dismiss(app: App, payload: dict) -> dict:
         raise FreeAgentError("要指定一条待处理项：{id: ...}")
     app.pending.dismiss(item_id)
     return {"ok": True}
+
+
+def capture_batch(app: App, payload: dict) -> dict:
+    """批量倾倒（录入口三件之一，V1.88）：一大坨文本按行切分入队。
+
+    三端共用同一服务层入口（``PendingService.capture_batch``）—— 一份能力
+    一份实现。``source`` 缺省 ``web``。**只入队，不建事务**（11.18：澄清是
+    ``/pending N``，由用户显式触发）。
+    """
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise FreeAgentError("要粘贴文本：{text: ...}")
+    source = str(payload.get("source") or "web").strip() or "web"
+    items = app.pending.capture_batch(source=source, text=text)
+    return {"ok": True, "count": len(items)}
+
+
+def capture_mail(app: App, payload: dict) -> dict:
+    """邮件入口（录入口三件之一，V1.88）：整段邮件正文一条入队，首行当标题。
+
+    ``source='mail'`` 标记「这来自一封邮件」；整段一条（**不是按行切分**）。
+    标题缺省时走服务层首行兜底。**只入队，不建事务**，澄清由用户显式触发。
+    """
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise FreeAgentError("要粘贴邮件正文：{text: ...}")
+    name = payload.get("name")
+    if name is not None:
+        name = str(name).strip() or None
+    item = app.pending.capture_text(source="mail", text=text, name=name)
+    return {"ok": True, "id": item.id, "name": item.name}

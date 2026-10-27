@@ -15,9 +15,53 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from freeagent.services import executor_probe as P
+
+
+def _synthetic_unverified(major: int = 7, executor: str = "opencode"):
+    """造一个**认识但没验过**的适配器（协议函数全抛）。
+
+    与 ``tests/test_executors.py`` 的同名助手同构 —— 各自持有，避免跨测试
+    文件的脆弱导入。见那里的 docstring：hermes 已转正，不再是「未验证」载体，
+    所以这条纪律改用合成适配器承载。
+    """
+    import dataclasses
+
+    from freeagent.services import executors as ex
+
+    _PIECES = {
+        "build_permission_config": "permission 配置形状",
+        "build_read_only_config": "只读配置形状",
+        "parse_request": "授权请求事件形状",
+        "build_reply": "答复载荷形状",
+        "parse_question": "提问事件形状",
+        "build_question_reply": "提问答复载荷形状",
+    }
+
+    def _make_raiser(piece: str):
+        def _raise(*_a: object, **_k: object) -> Any:
+            raise ex.UnverifiedExecutorError(
+                f"{executor} 主版本 {major} 的 {piece}尚未验证。"
+                "要接它：对着真实实例实测，填 "
+                "`freeagent/services/executors.py` 里对应适配器的形状函数，"
+                "再把 `verified` 改成 True。"
+            )
+        return _raise
+
+    base = ex.adapter_for(1)
+    assert base is not None
+    return dataclasses.replace(
+        base,
+        executor=executor,
+        major=major,
+        verified=False,
+        dispatchable=False,
+        **{method: _make_raiser(piece) for method, piece in _PIECES.items()},
+    )
 
 
 @pytest.fixture()
@@ -44,19 +88,16 @@ def major(monkeypatch):
 
 @pytest.fixture()
 def unverified_major(monkeypatch):
-    """造一个**认识但没验过**的 opencode 主版本（借 hermes 的 verified=False）。
+    """造一个**认识但没验过**的 opencode 主版本（合成的未验证适配器）。
 
-    为什么需要这个夹具：V1 与 V2 现在**都** ``verified=True``，
-    拿其中任何一个当「未验证」的反例都不成立 —— 那会让
-    「未验证时一桶都不给」这条纪律失去载体。
+    为什么需要合成：V1 与 V2 现在**都** ``verified=True``，hermes 也对着真机
+    验过 /ask 那条线转正了 —— 拿任何一个真适配器当「未验证」的反例都不成立，
+    那会让「未验证时一桶都不给」这条纪律失去载体。于是测试自己造一个
+    ``verified=False`` 的适配器注入注册表（协议函数全抛）。
     """
-    import dataclasses
-
     from freeagent.services import executors as ex
 
-    hermes = ex.adapter_for(0, "hermes")
-    assert hermes is not None and not hermes.verified
-    fake = dataclasses.replace(hermes, executor="opencode", major=7)
+    fake = _synthetic_unverified(major=7)
     monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, fake))
     return 7
 
@@ -221,3 +262,43 @@ class TestRender:
         which(True)
         major(1)
         assert "为什么不可派发" not in P.render_probe(P.probe_opencode())
+
+
+# --------------------------------------------------------------------------- #
+# hermes 探针（11.10.8）
+# --------------------------------------------------------------------------- #
+
+class TestProbeHermes:
+    def test_disabled_gets_no_buckets(self, monkeypatch):
+        """hermes 已停用（V1.83）→ 一桶都不给、verified 不给。
+
+        ``verified=False`` / ``capabilities == ()`` 是为了**不读成「能读」**：
+        它不是没验过，是决定不用了（审批闸失效，做不了受控执行器）。
+        """
+        import freeagent.delegate as D
+
+        monkeypatch.setattr(D, "detect_hermes_version", lambda _cmd="hermes": 0)
+        monkeypatch.setattr(P.shutil, "which", lambda _cmd: "C:/x/hermes")
+        got = P.probe_hermes()
+        assert got.installed is True
+        assert got.verified is False
+        assert got.dispatchable is False
+        assert got.capabilities == (), "已停用的执行器不给任何能力桶"
+
+    def test_reason_says_disabled_not_unverified(self, monkeypatch):
+        """理由必须区分「已停用」与「未验证」—— 前者是决定不用了，后者是没验。"""
+        import freeagent.delegate as D
+
+        monkeypatch.setattr(D, "detect_hermes_version", lambda _cmd="hermes": 0)
+        monkeypatch.setattr(P.shutil, "which", lambda _cmd: "C:/x/hermes")
+        reason = P.probe_hermes().unavailable_reason
+        assert "已停用" in reason
+        assert "未验证" not in reason, "hermes 不是没验过，是已停用"
+
+    def test_probe_hermes_takes_only_command(self):
+        """探针只接受 ``command``，不许有任何能派发的参数。"""
+        import inspect
+
+        sig = inspect.signature(P.probe_hermes)
+        assert list(sig.parameters) == ["command"]
+        assert sig.parameters["command"].default == "hermes"

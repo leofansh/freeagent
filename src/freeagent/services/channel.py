@@ -177,15 +177,18 @@ class ChannelReply:
     #: 走审批凭据，而漏判的后果是「点一下就建了事务」。
     plan_confirm: tuple[str, ...] = ()
 
-    #: 本轮要发的**事务动作卡**（``(task_id, title)``）。空 = 本轮不发。
+    #: 本轮要发的**事务动作卡**（``(task_id, title, state_label)``）。空 = 本轮不发。
     #:
     #: 与 :attr:`choices` / :attr:`plan_confirm` 分开而不合并：那张卡回答的是
     #: 「我选哪个」（读），这张卡回答的是「对这条事务做什么」（写）。混在一个
     #: 字段里桥接就得猜「点了要不要落库」，而漏判的后果是「点一下就改了状态」。
     #:
-    #: 只在**委派建好**这一轮非空（:meth:`Repl._cmd_delegate` 置位）。那时
-    #: 文本里让人手打 ``/start <id>``，而这张卡就是那句话的按钮版。
-    task_action: tuple[str, str] | None = None
+    #: 非空的两个来源（V1.61 起）：**委派建好**（:meth:`Repl._cmd_delegate`，
+    #: 文本里让人手打 ``/start <id>``，这张卡就是那句话的按钮版）与
+    #: **today 最高优先事务**（:meth:`Repl._cmd_today`，今天排期第一条附
+    #: 开始 / 做完 / 放一放按钮）。第三项 ``state_label`` 是卡上「当前状态」
+    #: 文案 —— 委派卡是「待办（执行器不会碰它）」，today 卡是事务实际状态。
+    task_action: tuple[str, str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,7 +489,16 @@ class ChannelService:
         # 卡」，而 :meth:`_cmd_delegate` 的**文本**已经说了要 ``/start``，
         # 所以功能并没有因此消失。
         action = getattr(repl, "_last_task_action", None)
-        self._last_task_action = (str(action[0]), str(action[1])) if action else None
+        # V1.61 起是三元组 (task_id, title, state_label)：桥接用第三项做卡上
+        # 「当前状态」文案。老替身/旧形态若只有两项，缺第三项退化成空串，
+        # 与「少张卡」同一条安全兜底 —— 不该把整条消息带崩。
+        if action:
+            self._last_task_action = (
+                str(action[0]), str(action[1]),
+                str(action[2]) if len(action) > 2 else "",
+            )
+        else:
+            self._last_task_action = None
         return buffer.getvalue().strip()
 
     @staticmethod
@@ -561,7 +573,17 @@ class ChannelService:
                 for p in self.app.promise.open_promises()
                 if p.promised_for is not None and p.promised_for <= now
             )
-            if not today.items and pending_count == 0 and nudge_count == 0 and overdue_count == 0:
+            # 人生角色关注面（V1.68）：今天到期的「该看看」。它也是「有事」
+            # 的判据之一 —— 哪怕今天没有排期/待处理/该催/逾期，只要有关注面
+            # 到期就该推（关心父母健康不该被「今天没任务」压掉）。
+            care_due = self.app.care.due(now.date())
+            if (
+                not today.items
+                and pending_count == 0
+                and nudge_count == 0
+                and overdue_count == 0
+                and not care_due
+            ):
                 return DailyBatch(text="", day=None)
             text = render.render_daily_digest(
                 day,
@@ -570,6 +592,7 @@ class ChannelService:
                 pending_count=pending_count,
                 nudge_count=nudge_count,
                 overdue_count=overdue_count,
+                cares=care_due,
             )
         return DailyBatch(text=text, day=day)
 

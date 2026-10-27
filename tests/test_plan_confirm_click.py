@@ -183,3 +183,44 @@ def test_no_channel_refuses_without_claiming_success(tmp_path, monkeypatch):
         assert "已确认" not in str(out)
     finally:
         app.close()
+
+# --------------------------------------------------------------------------- #
+# V1.91：卡上第三个选择「不弄了」—— 进得去就得出得来
+# --------------------------------------------------------------------------- #
+def test_card_offers_three_choices_including_discard():
+    """卡上必须有「不弄了」。
+
+    此前只有「确认执行 / 再想想」，而「再想想」的语义是**计划留着** ——
+    想彻底放弃的人在卡上**没有出路**，只能靠敲命令；而这张卡存在的意义
+    恰恰是别让他敲命令。
+    """
+    from freeagent.feishu.sender import plan_confirm_card
+
+    card = plan_confirm_card("确认执行这些？", ["一件事"], chat_id=CHAT)
+    actions = [e for e in card["elements"] if e.get("tag") == "action"][0]
+    choices = [b["value"]["choice"] for b in actions["actions"]]
+    assert choices == ["ok", "cancel", "discard"], f"按钮变了：{choices}"
+
+
+def test_click_discard_creates_nothing_and_drops_plan(wired):
+    """点「不弄了」→ 一条不建、计划清空、回正常模式，且回话要说清。"""
+    from freeagent.cli.app import MODE_BUILD
+
+    app, channel, sender, _reply = wired
+    _click(sender, "discard")
+
+    assert app.tasks.list_all() == [], "「不弄了」竟然建了事务"
+    r = channel._repls[CHAT]
+    assert r._plan == [], f"计划还在：{r._plan}"
+    assert r._mode == MODE_BUILD, "没回正常模式"
+    assert "丢掉" in sender.last, f"回话没交代计划去哪了：{sender.last!r}"
+
+
+def test_click_discard_after_cancel_still_works(wired):
+    """「再想想」之后再点「不弄了」—— 卡片仍然有效，不许当成已收卡。"""
+    app, channel, sender, _reply = wired
+    _click(sender, "cancel")
+    assert channel._repls[CHAT]._plan == ["改一下 README"]
+    _click(sender, "discard")
+    assert app.tasks.list_all() == []
+    assert channel._repls[CHAT]._plan == []

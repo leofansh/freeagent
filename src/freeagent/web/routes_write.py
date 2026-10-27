@@ -212,6 +212,22 @@ def dispatch_post(
             app, read_body()
         )
 
+    if parts == ["api", "capture"]:
+        # 批量倾倒（录入口三件之一，V1.88）：一大坨文本按行切分入队。
+        # POST-only：写数据（收下 → 入队）。与 CLI `/capture` 走同一个服务层
+        # 入口（PendingService.capture_batch）—— 一份能力一份实现。
+        return HTTPStatus.CREATED, endpoints_pending.capture_batch(
+            app, read_body()
+        )
+
+    if parts == ["api", "mail"]:
+        # 邮件入口（录入口三件之一，V1.88）：整段邮件正文一条入队。
+        # POST-only：写数据。与 CLI `/mail` 走同一个服务层入口
+        # （PendingService.capture_text）—— 一份能力一份实现。
+        return HTTPStatus.CREATED, endpoints_pending.capture_mail(
+            app, read_body()
+        )
+
     # 承诺结账（11.19 / 11.20，Web「承诺」视图的操作）。白名单单列
     # （PROMISE_ACTIONS），理由同事务动作：动作名是 URL 的一部分，
     # 漏过一个就是一条没人看过的写路径。POST-only —— 改状态的按钮

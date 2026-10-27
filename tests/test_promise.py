@@ -51,6 +51,33 @@ class TestPromiseService:
             app.promise.promise("周三前交报价单")
         assert "兑现物" in str(exc.value), f"要说清缺什么：{exc.value}"
 
+    def test_mentioned_only_registered_names(self, env):
+        """建事务的「可挂账」提示**只认已登记**的关系名（V1.84）。
+
+        张总还没 /contact 登记时，提到它**不**返回 —— 我们不猜谁是
+        关系人（守 11.19「只显式触发绝不静默推断」）。一旦登记，再提
+        就命中。零误判，可测。
+        """
+        app, _clock, _role = env
+        assert app.promise.mentioned_contacts("和张总确认合同") == ()
+        app.promise.contact("张总")
+        hits = app.promise.mentioned_contacts("和张总确认合同")
+        assert tuple(c.name for c in hits) == ("张总",)
+
+    def test_mentioned_ignores_unrelated_text(self, env):
+        app, _clock, _role = env
+        app.promise.contact("张总")
+        assert app.promise.mentioned_contacts("买牛奶") == ()
+        assert app.promise.mentioned_contacts("") == ()
+
+    def test_mentioned_stable_registration_order(self, env):
+        """按登记序返回，稳定可测（界面提示顺序不该随库游走）。"""
+        app, _clock, _role = env
+        app.promise.contact("张总")
+        app.promise.contact("李哥")
+        hits = app.promise.mentioned_contacts("和张总、李哥都对一下")
+        assert tuple(c.name for c in hits) == ("张总", "李哥")
+
     def test_promise_rejects_unknown_task(self, env):
         app, _clock, _role = env
         with pytest.raises(Exception):

@@ -51,7 +51,8 @@ def env(tmp_path):
 
 def _week(env) -> WeekService:
     app, clock, _role = env
-    return WeekService(app.task_repo, app.record_repo, clock, today=app.today)
+    return WeekService(app.task_repo, app.record_repo, clock,
+                       today=app.today, memory=app.memory)
 
 
 def _view(env):
@@ -246,3 +247,54 @@ class TestRenderWeek:
         # 分区在且说了实话 —— 有悬空事务，所以那行不该出现。
         assert "没排期：没有悬空的事务。" not in text
         assert "没排期 1 件" in text
+
+
+# ------------------------------------------------- 成长目标（V1.71，有意提示 / 20.1.12）
+class TestGrowthGoals:
+    """/week 把 memory「目标」类作为**独立**成长头带回（〇.8.6 有意提示）。
+
+    刻意与事务四个分区、与 care 的责任提醒分开 —— 目标是长期自我期许，
+    不是「这一周该干什么」。
+    """
+
+    def test_growth_goals_carry_memory_goals(self, env):
+        app, _clock, _role = env
+        app.memory.add("今年把英语练到能开会", kind="目标")
+        app.memory.add("每天读 20 分钟书", kind="目标")
+        view = _view(env)
+        texts = {t for _k, t in view.growth_goals}
+        assert "今年把英语练到能开会" in texts
+        assert "每天读 20 分钟书" in texts
+        # 只原样列出，kind 恒为「目标」，不评价不标逾期。
+        assert all(_k == "目标" for _k, _ in view.growth_goals)
+
+    def test_preferences_not_in_growth_goals(self, env):
+        app, _clock, _role = env
+        app.memory.add("我最近在学赛艇", kind="偏好")
+        app.memory.add("今年把英语练到能开会", kind="目标")
+        texts = {t for _k, t in _view(env).growth_goals}
+        assert "今年把英语练到能开会" in texts
+        assert "我最近在学赛艇" not in texts
+
+    def test_empty_growth_goals_is_honest(self, env):
+        assert _view(env).growth_goals == ()
+
+    def test_growth_goals_count_as_content(self, env):
+        # 只记了成长目标也算有内容，不算空周 —— 有自我期许本身就是要带回的事实。
+        app, _clock, _role = env
+        app.memory.add("今年把英语练到能开会", kind="目标")
+        assert not _view(env).is_empty
+
+    def test_render_lists_growth_goals(self, env):
+        app, _clock, _role = env
+        app.memory.add("今年把英语练到能开会", kind="目标")
+        text = render_week(_view(env), {})
+        assert "成长目标（记下的自我期许）" in text
+        assert "今年把英语练到能开会" in text
+
+    def test_render_empty_growth_goal_guides(self, env):
+        # 没记过目标时给一句轻引导（周回顾低频，不烦）。
+        app, _clock, role = env
+        _new(app, role, "一件杂事")
+        text = render_week(_view(env), {})
+        assert "成长目标：还没记过" in text

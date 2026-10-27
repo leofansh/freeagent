@@ -112,6 +112,25 @@ def test_new_command_skips_inference(repl):
     assert "明天要交的材料" in out
 
 
+def test_create_hints_registered_relation(repl):
+    """提到**已登记**的关系对象，建事务回复顺势提一句可挂账（V1.84）。
+
+    只提示不静默挂（守 11.19）—— 用户知道能挂，但挂不挂由他拍板。
+    """
+    r, buf = repl
+    r.app.promise.contact("张总")
+    out = _run(r, buf, "/new 工作项目A 和张总确认合同")
+    assert "可挂关系账" in out
+    assert "张总" in out
+
+
+def test_create_skips_unregistered_relation(repl):
+    """张总还没登记成关系对象时，**不**提示 —— 我们不猜谁是关系人。"""
+    r, buf = repl
+    out = _run(r, buf, "/new 工作项目A 和张总确认合同")
+    assert "可挂关系账" not in out
+
+
 def test_today_view_renders_disclaimer(repl):
     r, buf = repl
     _run(r, buf, "/new 工作项目A 今天要交的周报")

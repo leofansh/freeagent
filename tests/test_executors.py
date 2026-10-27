@@ -26,12 +26,61 @@ from freeagent.services import executors as ex
 from freeagent.services import opencode_server as oc
 
 
+def _synthetic_unverified(major: int = 7, executor: str = "opencode") -> ex.ExecutorAdapter:
+    """造一个**认识但没验过**的适配器（协议函数全抛）。
+
+    ## 为什么现在需要一个「合成」的反例，而不是借 hermes
+
+    早些时候 hermes 是注册表里那个 ``verified=False`` 的载体，测试借它来
+    验证「未验证的执行器每个协议入口都要响」。hermes 后来对着真机验过
+    （/ask 那条线，11.10.8），``verified`` 转正了 —— 它不再是「未验证」。
+    但「未验证必须响」这条纪律**依然成立**（哪天又登记一个只读文档没实测的
+    执行器时，它不能给出一个猜的形状）。所以这里用合成的未验证适配器来
+    承载这条纪律的测试，而不是改坏真适配器。
+
+    每个入口的报错**指名缺的是哪一块**（``_PIECES`` 那张表）—— 这是
+    :func:`test_error_names_the_missing_piece` 逐入口断言的基础：漏一个入口
+    = 那个入口给出一个猜的形状，而笼统的「不支持」让人没法照着做。
+    """
+    _PIECES = {
+        "build_permission_config": "permission 配置形状",
+        "build_read_only_config": "只读配置形状",
+        "parse_request": "授权请求事件形状",
+        "build_reply": "答复载荷形状",
+        "parse_question": "提问事件形状",
+        "build_question_reply": "提问答复载荷形状",
+    }
+
+    def _make_raiser(piece: str):
+        def _raise(*_a: object, **_k: object) -> Any:
+            raise ex.UnverifiedExecutorError(
+                f"{executor} 主版本 {major} 的 {piece}尚未验证。"
+                "要接它：对着真实实例实测，填 "
+                "`freeagent/services/executors.py` 里对应适配器的形状函数，"
+                "再把 `verified` 改成 True。"
+            )
+        return _raise
+
+    base = ex.adapter_for(1)
+    assert base is not None
+    return dataclasses.replace(
+        base,
+        executor=executor,
+        major=major,
+        verified=False,
+        dispatchable=False,
+        **{method: _make_raiser(piece) for method, piece in _PIECES.items()},
+    )
+
+
 class TestRegistry:
     def test_known_is_not_the_same_as_dispatchable(self):
         """「知道」与「能派发」是两个概念，混淆它就是闸门失效的前置。
 
-        opencode 的 V1/V2 都 ``verified=True``，所以它俩已知即可派；
-        未验证的那条纪律改由 ``hermes`` 承载（见 TestUnverifiedRefusesLoudly）。
+        opencode 的 V1/V2 都 ``verified=True`` 且 ``dispatchable=True``，
+        所以它俩已知即可派。hermes ``verified=True`` 但 ``dispatchable=False``
+        （只 /ask、不委派，11.10.8）—— 所以「知道它、验过它」不等于
+        「能委派它」。
         """
         assert ex.known_majors("opencode") == (1, 2)
         assert ex.dispatchable_majors("opencode") == (1, 2)
@@ -64,14 +113,14 @@ class TestUnverifiedRefusesLoudly:
     """**未验证**的执行器，每个协议入口都要抛，而不是给一个猜的形状。
 
     原名 ``TestV2RefusesLoudly``，写的是「V2 照文档写、没实测」。
-    V2 后来对着真机验过了，于是这条纪律换了载体：守的不再是
-    「V2 不许用」，而是「**没对着真机验过的执行器不许用**」——
-    由 ``hermes``（``verified=False``、``major=0``）继续承载。
+    V2 后来对着真机验过了；hermes 也验过 /ask 那条线了。于是这条纪律
+    **换成了合成载体**（:func:`_synthetic_unverified`）：守的不再是
+    「某具名的执行器不许用」，而是「**任何没对着真机验过的执行器不许用**」——
+    哪天又登记一个只读文档没实测的执行器时，它必须响。
 
     注意抛错的机制：不是 ``verified`` 字段自动生效，而是适配器里的
-    协议函数**本身**被换成了抛错的桩（``_hermes_unverified``）。
-    所以这个测试守的是「桩真的在每个入口都装上了」——
-    漏一个入口，就等于在那个入口给出了一个猜的形状。
+    协议函数**本身**被换成抛错的桩。所以这个测试守的是「桩真的在每个入口
+    都装上了」—— 漏一个入口，就等于在那个入口给出了一个猜的形状。
 
     换载体而不是删测试：猜形状会让 permission 被静默忽略、
     闸门失效且方向回到 allow，那是本仓最恨的一类失败。
@@ -86,22 +135,23 @@ class TestUnverifiedRefusesLoudly:
         ],
         ids=["permission_config", "parse_request", "reply_payload"],
     )
-    def test_every_entry_point_raises(self, call):
-        a = ex.adapter_for(0, "hermes")
-        assert a is not None, "hermes 必须已登记 —— 它是这条纪律的载体"
+    def test_every_entry_point_raises(self, monkeypatch, call):
+        a = _synthetic_unverified()
+        monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, a))
         with pytest.raises(ex.UnverifiedExecutorError) as exc:
             call(a)
         msg = str(exc.value)
         # 错误信息要能照着做：说清缺的是什么、要去哪改
         assert "尚未验证" in msg
-        assert "设计文档" in msg or "executors.py" in msg or "官方文档" in msg
+        assert "executors.py" in msg
 
-    def test_error_names_the_missing_piece(self):
+    def test_error_names_the_missing_piece(self, monkeypatch):
         """要指名**缺的是哪一块**，而不是笼统的「不支持」。
 
         逐入口点名，因为漏一个入口 = 那个入口会给出一个猜的形状。
         """
-        a = ex.adapter_for(0, "hermes")
+        a = _synthetic_unverified()
+        monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, a))
         expected = {
             "build_permission_config": ("permission 配置形状", ()),
             "build_read_only_config": ("只读配置形状", ()),
@@ -115,11 +165,20 @@ class TestUnverifiedRefusesLoudly:
                 getattr(a, method)(*args)
             assert piece in str(exc.value), f"{method} 要指名缺「{piece}」"
 
-    def test_hermes_is_registered_but_not_dispatchable(self):
-        """登记 ≠ 能派 —— 清单里要有它，闸门不许放。"""
-        assert ex.adapter_for(0, "hermes") is not None
+    def test_hermes_is_verified_but_not_dispatchable(self):
+        """hermes 验过 /ask、不可委派、且**已停用**（V1.83）。
+
+        ``verified``（验过接线）与 ``dispatchable``（能委派）是两个概念，
+        V1.83 又加了 ``disabled``（决定不用它、代码保留作接缝）——
+        见 :class:`~freeagent.services.executors.ExecutorAdapter` 的字段说明。
+        """
+        a = ex.adapter_for(0, "hermes")
+        assert a is not None
         assert "hermes" in ex.known_executors()
         assert ex.known_majors("hermes") == (0,)
+        assert a.verified is True, "hermes 的 /ask 那条线已对着真机验过"
+        assert a.dispatchable is False, "hermes 不委派（11.10.8）"
+        assert a.disabled is True, "hermes 已停用（V1.83）"
         assert ex.dispatchable_majors("hermes") == ()
 
     def test_known_renames_are_recorded_as_data(self):
@@ -156,10 +215,8 @@ class TestVersionGate:
         # 「未验证」与「不认识」是**两条不同的拒绝分支**，做的事不同：
         # 前者是「本仓知道有这个版本但没对着真机验过」，后者是「压根没见过」。
         # 触发前者需要注册表里**存在**一个 verified=False 的条目 ——
-        # 借 hermes（真·未验证）改一个主版本号来当例子，比伪造一个假适配器更真。
-        hermes = ex.adapter_for(0, "hermes")
-        assert hermes is not None and not hermes.verified
-        as_v7 = dataclasses.replace(hermes, executor="opencode", major=7)
+        # 用合成的未验证适配器当例子（hermes 已转正，不再是载体）。
+        as_v7 = _synthetic_unverified(major=7)
         monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, as_v7))
         r = dg.version_mismatch_reason(7) or ""
         assert "未验证" in r
@@ -170,8 +227,7 @@ class TestVersionGate:
 
     def test_unknown_major_is_refused_with_a_different_reason(self, monkeypatch):
         """两种拒绝必须**各不相同** —— 该做的事不同，说法就该不同。"""
-        hermes = ex.adapter_for(0, "hermes")
-        as_v7 = dataclasses.replace(hermes, executor="opencode", major=7)
+        as_v7 = _synthetic_unverified(major=7)
         monkeypatch.setattr(ex, "_ADAPTERS", (*ex._ADAPTERS, as_v7))
         unknown = dg.version_mismatch_reason(99) or ""
         unverified = dg.version_mismatch_reason(7) or ""
@@ -337,3 +393,88 @@ class TestAdapterSwapping:
         oc.set_current_adapter(ex.adapter_for(2))
         oc.set_current_adapter(None)
         assert oc.current_adapter().major == original.major
+
+
+class TestHermesAdapter:
+    """hermes 适配器**停用**后的行为（V1.83 瘦身）。
+
+    hermes 曾 ``verified=True``（/ask 那条线对着真机验过）但
+    ``dispatchable=False``（unattended 面做不了 11.8 委派）；V1.83 起加
+    ``disabled=True`` —— **决定不用它了，代码保留作接缝**。适配器仍在
+    注册表里（``adapter_for`` 仍返回它，好让内部 / 接缝测试能继续对
+    ``parse_event`` 等做回归），但探针 / ``/ask`` 按停用对待。
+    """
+
+    def test_verified_but_not_dispatchable_and_disabled(self):
+        a = ex.adapter_for(0, "hermes")
+        assert a is not None
+        assert a.verified is True
+        assert a.dispatchable is False
+        assert a.disabled is True, "hermes 已停用（V1.83）"
+
+    def test_dispatchable_majors_excludes_hermes(self):
+        """``dispatchable_majors`` 只按 ``dispatchable`` 过滤 —— 不按 verified。"""
+        assert ex.dispatchable_majors("hermes") == ()
+        assert ex.known_majors("hermes") == (0,)
+
+    def test_read_only_config_is_empty(self):
+        """hermes 无「按工具写 permission 配置」的面 —— 返回空。注意：/ask 的
+        「只读改不了」对 hermes 保证不了（V1.81 真机证伪「unattended deny
+        双重强制」），所以它只作知识问答、不能开放执行；这里空配置是「没有
+        那套面」，不是「有只读保障」。"""
+        assert ex.adapter_for(0, "hermes").build_read_only_config() == {}
+
+    def test_permission_config_is_empty(self):
+        """委派配置对她不存在 —— 返回空 + 调用方判断不可派，别给假配置。"""
+        assert ex.adapter_for(0, "hermes").build_permission_config() == {}
+
+    def test_delegation_only_entries_refuse_loudly(self):
+        """只走 /ask 的执行器，委派入口要**响**，不静默返回假形状。"""
+        a = ex.adapter_for(0, "hermes")
+        with pytest.raises(ValueError, match="不可委派"):
+            a.build_reply("allow")
+        with pytest.raises(ValueError, match="不可委派"):
+            a.build_question_reply(["a"])
+        assert a.parse_request({"id": "p", "permission": "bash"}) is None
+        assert a.parse_question({"id": "q"}) is None
+
+    @pytest.mark.parametrize(
+        "frame, expected",
+        [
+            ({"event": "message.delta", "delta": "你"}, ("message.part.delta", {"delta": "你"})),
+            ({"event": "tool.completed", "tool": "bash"}, ("tool", {"tool": "bash"})),
+            ({"event": "tool.started", "tool": "read"}, ("tool.started", {"tool": "read"})),
+            ({"event": "run.completed"}, ("session.idle", None)),
+            ({"event": "run.cancelled"}, ("session.idle", None)),
+            ({"event": "run.failed", "error": "HTTP 404 ..."}, ("session.error", {"message": "HTTP 404 ..."})),
+        ],
+        ids=["delta", "tool_completed", "tool_started", "completed", "cancelled", "failed_with_error"],
+    )
+    def test_parse_event_maps_to_ask_vocabulary(self, frame, expected):
+        """事件名 + 载荷都要折成 ask 认得的形状 —— 只改名不改形状是 V2 的坑。"""
+        a = ex.adapter_for(0, "hermes")
+        assert a is not None and a.api is not None
+        assert a.api.parse_event(frame) == expected
+
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            "not a dict",
+            {"event": "reasoning.available"},
+            {"event": "message.delta", "delta": 123},
+            {"event": "tool.completed", "tool": ""},
+            {},
+        ],
+        ids=["non_dict", "unmapped_event", "non_str_delta", "empty_tool", "no_event"],
+    )
+    def test_parse_event_drops_what_it_cannot_use(self, frame):
+        """不翻译 / 载荷不整形的帧直接丢掉 —— 不返回猜的形状。"""
+        a = ex.adapter_for(0, "hermes")
+        assert a is not None and a.api is not None
+        assert a.api.parse_event(frame) is None
+
+    def test_run_id_field_is_run_id_not_id(self):
+        """真机实测（判据 5）：POST /v1/runs 的响应字段名是 ``run_id``。"""
+        assert ex._hermes_run_id_of({"run_id": "run_abc", "status": "started"}) == "run_abc"
+        assert ex._hermes_run_id_of({"id": "run_abc"}) == "run_abc", "兼容旧形状但不依赖"
+        assert ex._hermes_run_id_of({"status": "started"}) is None

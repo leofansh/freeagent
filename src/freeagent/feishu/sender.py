@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -506,45 +507,49 @@ class FeishuSender:
             )
         return str(((body.get("data") or {}).get("message_id")) or "")
 
-    def delete_message(self, message_id: str) -> None:
-        """撤回一条 **bot 自己发的**消息（V1.41 授权回复串滚动瘦身）。
+    def settle_card(
+        self, message_id: str, *, subject: str = "", verdict: str = "",
+    ) -> None:
+        """把已定案的卡**原地改写成一行终态**（V1.88，取代 V1.41 的撤回）。
 
-        ## 这个能力是给「滚动瘦身」用的，不是通用的删消息口
+        ## 为什么从「撤回」改成「PATCH 终态」
 
-        授权卡挂在进度卡下面（11.16 聚拢），而飞书回复串**逐条占位**：
-        N 次工具调用 = N 张卡，把固定位置的进度卡一路顶出屏幕。撤已定案的
-        旧卡是唯一能把串收短的飞行书操作（消息只能撤，没有「收起」）。
-        谁调它、什么时候调，见 :func:`freeagent.delegate._retire_settled_cards`
-        —— 发送与撤回**同一份生命周期**，别在第二个地方自己调这个方法。
+        旧方案（``DELETE``）在飞书里**每张留一条「撤回了一条消息」墓碑** ——
+        内容没了、占位还在，N 张卡 = N 条墓碑（真机 9 连实证），清理行为
+        本身成了最大的噪音。而「飞书只有撤、没有收起」这个旧前提是**错的**：
+        ``PATCH /im/v1/messages/{id}`` 可以原地改写卡片内容，把一张授权卡
+        折叠成一行收据。改写后聊天里留下的是**可回看的收据**，不是残骸
+        —— 对治理层产品，这是资产不是负担。
 
-        ## 两条边界，都是**只删自己的**
+        ## 两条边界（从撤回语义原样继承）
 
-        - 飞书只许 bot 撤 **自己发的**消息；`message_id` 一律来自
+        - 只改 **bot 自己发的**卡：``message_id`` 一律来自
           :meth:`send_tool_card` / `send_question_card` 的返回值（已落库
-          `pending_approvals.open_message_id`），不存在「撤别人的」这条路径。
-        - **进度卡永远不在撤回之列**：它是授权卡的回复锚点（reply 挂在
-          它下面），把它撤了，之后每次 reply 都会失败（99992354），整条
-          聚拢机制当场失效 —— 识别凭 `open_message_id` 只记授权/提问卡，
-          `card_id` 是另一码事（见 :class:`ProgressCard` 的两 id 说明）。
+          ``pending_approvals.open_message_id``）。
+        - **进度卡永远不在改写之列**：它是授权卡的回复锚点（reply 挂在
+          它下面），识别凭 ``open_message_id`` 只记授权/提问卡（见
+          :class:`ProgressCard` 的两 id 说明）。
 
-        失败抛 :class:`FeishuError`（带 code/msg）。撤回失败是**外观损失**
-        （串没瘦下来），调用方必须接住、只记日志，**不许**把授权流程搞停
-        —— 判据与 11.16「reply 失败退回独立发送」同一条：分清外观损失与
-        功能损失。
+        ## 失败语义
+
+        抛 :class:`FeishuError`（带 code/msg）。改写失败是**外观损失**
+        （旧卡原样保留 —— **绝不降级成撤回**，那等于把墓碑请回来），调用方
+        必须接住、只记日志。失败的常见原因：14 天窗口已过（230031）、
+        卡是 ``update_multi`` 缺失的旧版卡 —— 都不会因为重试而变好。
         """
         if not message_id:
-            # 空串只有一个来源：发出时飞书没回 message_id（已有这条纪律：
-            # 卡「发出去了」却没有 id，本身就是异常）。拿着空串去 DELETE
-            # 只会得到一个指不出原因的 404，所以在入口就拦下。
-            raise ValueError("撤回消息必须给 message_id")
+            # 空串只有一个来源：发出时飞书没回 message_id（已有这条纪律）。
+            # 拿着空串去 PATCH 只会得到一个指不出原因的 404，入口就拦下。
+            raise ValueError("改写已定案卡片必须给 message_id")
         raw = self._transport(
             f"{self.config.base_url}/open-apis/im/v1/messages/{message_id}",
-            None,
+            {"content": json.dumps(_settled_card(subject, verdict),
+                                   ensure_ascii=False)},
             {"Authorization": f"Bearer {self.token()}"},
             self.timeout,
-            method="DELETE",
+            method="PATCH",
         )
-        _require_ok(raw, "撤回消息")
+        _require_ok(raw, "改写已定案卡片")
 
     # -- CardKit 2.0 流式进度卡片（设计文档 11.16） ---------------------- #
     #
@@ -649,13 +654,34 @@ class FeishuSender:
 
         - **reply**：``POST /messages/{message_id}/reply``。**不带
           ``receive_id_type``** —— 收件人由被回复的那条消息决定，
-          带着它飞书会拒。``reply_in_thread: False`` 是因为私聊没有话题，
-          true 会把被回复的那条也拖进话题串。
+          带着它飞书会拒。``reply_in_thread: True`` 让这张卡**进话题**
+          （话题根 = 被回复的那条进度卡，见下面的 V1.90 说明）。
         - **send**：``POST /messages?receive_id_type=…``，收件人在
           ``receive_id`` 里。
 
         ``id_type`` 只在 send 路径有意义；reply 路径返回空串 —— 它**只用于
         报错文案**，而那一支根本不会走到（reply 失败报的是锚点）。
+
+        ## V1.90：``reply_in_thread`` 从 False 翻成 True
+
+        原来写 False，理由是一句**没验过的话**：「私聊没有话题，true 会把
+        被回复的那条也拖进话题串」。``tools/probe_topic.py`` 真机七项全绿
+        把它推翻了：
+
+        - 私聊（p2p）**可以**开话题，``reply_in_thread=true`` 就开，
+          响应里直接回 ``thread_id``（``omt_`` 开头）；
+        - ``interactive`` 授权卡、**CardKit 2.0 实体卡**都能进话题，
+          进去之后流式更新、PATCH 折叠终态**都照常生效**；
+        - 话题里每条消息的 ``root_id`` 都指向话题根 —— 也就是这张进度卡的
+          ``message_id``，于是「这句话属于哪条委派」有了确定性判据。
+
+        所以现在：一次委派 = 一张进度卡（留在主聊天流）+ 一个它下面的话题，
+        授权卡与提问卡全进话题。并行的两条委派各自一个话题，**审批不串台**，
+        主聊天流也不会被 N 张授权卡刷屏。
+
+        这不是「为了好看」：它同时是 11.9.4「按钮在、归属不明就会点错」的
+        解法。没有进度卡可挂（``reply_to`` 为空）时仍走 send 路径，
+        不进任何话题 —— 那种情况下没有根，也就没有归属可言。
         """
         if reply_to:
             return (
@@ -664,7 +690,10 @@ class FeishuSender:
                 {
                     "msg_type": "interactive",
                     "content": json.dumps(content, ensure_ascii=False),
-                    "reply_in_thread": False,
+                    # V1.90：进话题（根 = 被回复的进度卡）。理由见方法
+                    # 文档「reply_in_thread 从 False 翻成 True」一节 ——
+                    # 旧值  False 的依据（私聊没有话题）已被真机探针推翻。
+                    "reply_in_thread": True,
                 },
                 "",
             )
@@ -830,20 +859,47 @@ class FeishuSender:
         _require_ok(raw, "发消息")
 
 
+def _card_plain(text: str) -> str:
+    """``plain_text`` 元素的净化。
+
+    飞书卡片对 ``plain_text`` **完全不解析 markdown**：``**粗体**`` 与
+    ``行内代码`` 反引号都**原样显示**（真机截图实证：标题里出现
+    ``opencode 想 `shell` ``、note 里出现「只批准**这一个**动作」）。
+    所以进 ``plain_text`` 的字符串必须先把这两类记号剥掉。
+    """
+    return text.replace("`", "").replace("**", "")
+
+
+def _card_md(text: str) -> str:
+    """``lark_md`` 元素的净化。
+
+    ``lark_md`` 支持 ``**粗体**``，但**不支持行内代码反引号** ——
+    ``动作：`shell` `` 会原样把反引号印出来。成对的反引号换成中文引号
+    （比直接删可读），漏网的散反引号再剥一遍。
+    """
+    text = re.sub(r"`([^`]*)`", r"「\1」", text)
+    return text.replace("`", "")
+
+
 def _approval_card(subject: str, detail: str, credential: str) -> dict[str, Any]:
     """待确认的卡片。**按钮**还在，可点。
 
     卡上刻意写明三件事：做什么、影响哪个范围、这次授权多久。
     少任何一项，用户就只能凭「信任机器人」点按钮 —— 那不叫确认。
+
+    ⚠️ ``config`` 必须显式带 ``update_multi: True``（见
+    :func:`_progress_card` 的长注释：省略 = 独享卡片 = 只有签发方可见；
+    而且 V1.88 起已定案的卡要被 :meth:`FeishuSender.settle_card` 用
+    PATCH 原地改写成终态 —— PATCH 的前提就是共享卡片）。
     """
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "orange",
-            "title": {"tag": "plain_text", "content": subject},
+            "title": {"tag": "plain_text", "content": _card_plain(subject)},
         },
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": detail}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": _card_md(detail)}},
             {"tag": "note", "elements": [{"tag": "plain_text", "content":
                   "不点就算拒绝 —— 沉默不等于同意。"}]},
             {"tag": "action", "actions": [
@@ -953,13 +1009,13 @@ def _question_card(subject: str, detail: str, ttl_seconds: int) -> dict[str, Any
     否则用户会以为不限时。
     """
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "turquoise",
-            "title": {"tag": "plain_text", "content": subject},
+            "title": {"tag": "plain_text", "content": _card_plain(subject)},
         },
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": detail}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": _card_md(detail)}},
             {"tag": "note", "elements": [{"tag": "plain_text", "content":
                   "这不是确认卡，没有允许/拒绝按钮。"
                   f"直接回消息回答就行，{ttl_seconds}s 内不答按超时处理。"}]},
@@ -977,16 +1033,19 @@ def _tool_card(subject: str, detail: str, credential: str) -> dict[str, Any]:
     2.0 卡不能更新成 1.0，反之亦然（实测踩过）。
     """
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": subject},
+            "title": {"tag": "plain_text", "content": _card_plain(subject)},
         },
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": detail}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": _card_md(detail)}},
+            # note 只说**这一句**：授权范围（仅这一次 + 下次再问）detail 里
+            # 已经写了（「授权范围：仅这一次动作……下一次动作会再问一次」），
+            # note 再复述一遍就是两行占三行高（真机截图实证）。而且
+            # plain_text 不解析 markdown，原来的「**这一个**」会原样印出来。
             {"tag": "note", "elements": [{"tag": "plain_text", "content":
-                  "只批准**这一个**动作 —— 下一个动作还会再问。"
-                  "不点就算拒绝，沉默不等于同意。"}]},
+                  "不点就算拒绝 —— 沉默不等于同意。"}]},
             # 三个按钮，**顺序与语义都要说清**（设计文档 12.7.2）：
             #   允许 / 拒绝 —— 只针对**这一个动作**，agent 还能换个方向继续
             #   停止这条委派 —— 中止**整条**，会话作废
@@ -1146,6 +1205,10 @@ def plan_confirm_card(
             {"tag": "action", "actions": [
                 _btn("确认执行", "ok", True),
                 _btn("再想想", "cancel", False),
+                # V1.91：卡上必须能「不弄了」。此前只有「再想想」——
+                # 而它的语义是**计划留着**，于是想彻底放弃的人在卡上没有出路，
+                # 只能靠敲命令（而这张卡存在的意义就是别让他敲命令）。
+                _btn("不弄了", "discard", False),
             ]},
         ],
     }
@@ -1830,13 +1893,46 @@ def _decided_card(subject: str, line: str, *, granted: bool) -> dict[str, Any]:
     飞书整条应答判失败，用户看到「出错了」。
     """
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "template": "green" if granted else "red",
             "title": {"tag": "plain_text", "content": subject},
         },
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": line}},
+        ],
+    }
+
+
+def _settled_card(subject: str, verdict: str) -> dict[str, Any]:
+    """已定案卡被 :meth:`FeishuSender.settle_card` PATCH 成的**终态**。
+
+    ## 为什么是一行结论 + 一行说明，而不是留着原卡
+
+    撤回（旧方案）会在聊天里留下一条「撤回了一条消息」墓碑 —— 内容没了、
+    占位还在，N 张卡就是 N 条墓碑（真机 9 连实证），比不清理还吵。
+    原地改写成一行终态既把回复串收短，又留下**可回看的收据**。
+
+    ⚠️ 三条硬约束（都实测踩过）：
+    - **1.0 结构**（顶层 ``config``/``header``/``elements``）：错误码 200830，
+      2.0 卡不能更新成 1.0（与 :func:`_decided_card` 同一条注释）；
+    - **``update_multi: True``**：PATCH 共享卡片的前提 —— 点击回调替换出的
+      ``_decided_card`` 也带它，否则 PATCH 永远失败；
+    - header 用 **``grey``**（飞书模板名没有 ``default``）：定案 = 中性收据，
+      不再占绿/红的情绪位。
+    """
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {
+            "template": "grey",
+            "title": {"tag": "plain_text",
+                      "content": _card_plain(subject) or "已处理"},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md",
+                                    "content": verdict or "**已处理。**"}},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content":
+                  "这张卡已定案；明细见进度卡与 WEB 面板。"}]},
         ],
     }
 

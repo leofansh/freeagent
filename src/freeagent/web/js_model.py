@@ -70,6 +70,17 @@ JS_MODEL = r"""async function renderModel(root) {
     });
   }
 
+  // 滋养兴趣（V1.69，记录优先）：记下的「偏好」原样带出，不催促不评价。
+  root.appendChild(el("h3", null, "滋养兴趣（记下的偏好）"));
+  if (!m.preferences.length) {
+    root.appendChild(el("div", "note",
+      "还没记过「偏好」——用 /remember 记一条（如「我最近在学赛艇」）。"));
+  } else {
+    m.preferences.forEach((p) => {
+      root.appendChild(el("div", "meta", esc(p.text)));
+    });
+  }
+
   root.appendChild(el("div", "note",
     "以上是从你的记录里现推的**事实**，不是评价 —— 要不要顺着它调整，由你决定。"));
 }"""

@@ -43,6 +43,9 @@ __all__ = [
     "ApprovalStore",
     "ApprovalContext",
     "ApprovalPolicy",
+    "AuditEntry",
+    "AuditOutcome",
+    "AuditReport",
     "new_credential",
     "unattended_deny",
     "is_bypass_active",
@@ -399,6 +402,12 @@ class PendingApproval:
     #: 被答复掉了）；本地操作类待批（services/localops）不来自委派，
     #: 也一样没有归属。读侧按「空 = 不归属」处理，**不猜**。
     task_id: str | None = None
+    #: 这个结论是怎么来的（V1.92）：``"card"`` 卡片点击、``"stop"`` 叫停。
+    #:
+    #: **空不是「卡片」** —— 历史行没有这个值。默认成「卡片」的话，
+    #: 任何一个忘了传的调用方都会把它的结论冒名成「人在卡片上点的」，
+    #: 而那恰恰是审计视图唯一当成治理信号的一类。
+    decided_via: str = ""
 
     @property
     def spec(self) -> dict:
@@ -455,6 +464,58 @@ class PendingApproval:
         加列前的历史行不该因为新规则而永远点不动。
         """
         return self.requested_by or None
+
+
+#: 一次审核的**结局**（V1.92）。七类，互斥。
+#:
+#: 刻意把 ``deny`` 拆成三种：在拆之前它们都是 ``decision='deny'``，
+#: 而它们的含义与后果**完全不同** ——
+#:
+#: * ``allow`` 允许 —— 他看过了，同意。
+#: * ``deny`` 明确拒绝 —— 他看过了，不同意。**这是唯一带判断的信号。**
+#: * ``stop`` 叫停 —— 不是这一步不对，是整件事别做了。
+#: * ``late`` 迟到点击 —— 点了，但卡已过期，没生效。
+#: * ``timeout`` 没人答 —— 卡躺到过期。**不是拒绝，是没看见。**
+#: * ``open`` 还挂着 —— 有效期没过，等答复。
+AuditOutcome = Literal["allow", "deny", "stop", "late", "timeout", "open"]
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEntry:
+    """审核留痕里的一行。**全部是已经发生过的事实，没有一项是推断。**"""
+
+    subject: str
+    outcome: AuditOutcome
+    #: 结论是怎么来的：``"card"`` / ``"stop"`` / ``""``（未记 —— 历史行）。
+    via: str
+    #: 批的人。``""`` = 没人答或历史行。
+    who: str
+    #: 问出来的时刻（判定「躺了多久」用它，不用 decided_at）。
+    asked_at: datetime.datetime
+    #: 结论定下的时刻；``None`` = 未决（含 ``timeout``）。
+    at: datetime.datetime | None
+    #: 这张卡躺了多少秒才被答（或躺到过期）。``None`` = 还挂着。
+    waited_seconds: int | None
+    task_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditReport:
+    """一段窗口内的审核账。**只摆事实**。
+
+    刻意不给「审批效率」「打扰率」这类比值：分子分母都还没被验证过
+    该不该这么比。窗口内就是这几个数，加起来等于总数，自己看。
+    """
+
+    since_days: int
+    total: int
+    allow: int
+    deny: int
+    stop: int
+    late: int
+    timeout: int
+    open: int
+    entries: tuple[AuditEntry, ...]
 
 
 class ApprovalStore:
@@ -756,31 +817,45 @@ class ApprovalStore:
                 return None
             time.sleep(poll_seconds)
 
-    def record_card(self, credential: str, open_message_id: str) -> None:
+    def record_card(
+        self, credential: str, open_message_id: str, thread_root: str = "",
+    ) -> None:
         """记下卡片 id —— 拿到答复后要把**那张卡**改成「已允许」。
 
         刻意单独一个方法而不是 ``ask`` 的参数：发卡是**发卡之后**才知道
         message_id 的，而 ``ask`` 必须先于发卡执行（凭据要嵌进按钮里）。
+
+        ``thread_root``（V1.90）：这张卡**挂在哪个话题下**，也就是发卡时
+        的 ``reply_to``（进度卡的 message_id）。空 = 没挂话题（没配进度卡、
+        或发卡失败退回独立发送）—— 那种情况下路由只能退回旧判据。
+
+        为什么与 ``open_message_id`` 同一个方法写：两者都是「发卡之后才知道
+        的事实」，分开两个方法就多一次 UPDATE、也多一个能忘的调用点。
         """
         self._conn.execute(
-            "UPDATE pending_approvals SET open_message_id = ? WHERE credential = ?",
-            (open_message_id, credential),
+            "UPDATE pending_approvals SET open_message_id = ?, thread_root = ?"
+            " WHERE credential = ?",
+            (open_message_id, thread_root or None, credential),
         )
         self._conn.commit()
 
-    def card_message_ids_for_task(self, task_id: str) -> tuple[str, ...]:
-        """这条委派**已发出去**的全部卡片消息 id（授权卡 + 提问卡）。
+    def settled_cards_for_task(
+        self, task_id: str,
+    ) -> "tuple[tuple[str, str, str | None, str], ...]":
+        """这条委派**已发出去**的全部卡片：
+        ``(message_id, subject, decision, kind)`` 四元组。
 
         服务对象只有一个：:func:`freeagent.delegate._retire_settled_cards`
-        （V1.41 滚动瘦身）—— 发下一张卡之前把已定案的旧卡从聊天里撤掉。
-        所以这里**刻意不发一个通用的「按 task 列记录」口子**：那会引来
-        第二个调用方，而第二个调用方要的是结论（decided_by / decision），
-        不是消息 id —— 口子一多，谁在写谁在撤就说不清了。
+        （V1.41 撤回瘦身 → V1.88 原地改写终态）。所以这里**刻意不发一个
+        通用的「按 task 列记录」口子**：那会引来第二个调用方，而第二个
+        调用方要的是别的字段 —— 口子一多，谁在写谁在收就说不清了。
+        ``subject``/``decision``/``kind`` 是终态收据的原料（改写要拿旧卡
+        的主题和结论拼一行字），不是给查询用的。
 
         ## 为什么「包含还没定案的行」是安全的
 
         判据是**时序**而不是状态列：`open_message_id` 在**发卡之后**才
-        落（:meth:`record_card`），而撤回只发生在**发下一张卡之前**和
+        落（:meth:`record_card`），而收尾只发生在**发下一张卡之前**和
         收尾两处 —— 那两个时刻，执行循环是**串行**的（前一张必然已经
         等到了结论，本张还没发出去、还没记 id），所以查出来的 id 全部
         属于已定案的卡。当前挂起的卡**永远不在结果里**，不需要再查
@@ -794,18 +869,39 @@ class ApprovalStore:
         if not task_id:
             return ()
         rows = self._conn.execute(
-            "SELECT open_message_id FROM pending_approvals"
+            "SELECT open_message_id, subject, decision, kind"
+            " FROM pending_approvals"
             " WHERE task_id = ? AND open_message_id IS NOT NULL"
             " AND open_message_id != ''"
             " ORDER BY asked_at ASC",
             (task_id,),
         ).fetchall()
-        return tuple(row["open_message_id"] for row in rows)
+        # 旧行的 kind 为 NULL（迁移只加列不回填）：读侧按「授权」处理，
+        # 与 PendingApproval.kind 的默认值同一把尺。
+        return tuple(
+            (
+                row["open_message_id"],
+                row["subject"] or "",
+                row["decision"],
+                row["kind"] or "approval",
+            )
+            for row in rows
+        )
 
     def resolve(
-        self, credential: str, decision: Decision, *, decided_by: str | None = None
+        self, credential: str, decision: Decision, *, decided_by: str | None = None,
+        via: str = "",
     ) -> bool:
         """写入答复。**过期的一律拒绝**，无论调用方想写什么。
+
+        ``via``（V1.92）：**这个结论是怎么来的** —— ``"card"`` 卡片点击、
+        ``"stop"`` 叫停。默认空串表示**未记**，不是「卡片」。
+
+        为什么要这个参数、又为什么默认是「未记」而不是「卡片」：默认成
+        「卡片」的话，将来任何一个新调用方忘了传，它的结论都会被冒名成
+        「人在卡片上点的」—— 而「人手点过」恰恰是**唯一有判断价值**的
+        那一类（审计视图拿它当治理信号用）。宁可是诚实的未知，也不要
+        编出来的已知。历史行同样是 NULL，两边读法一致。
 
         刻意不提供「强制写入过期项」的口子 —— 那种口子迟早被用来
         「就这一次」绕过，而它绕过的正是「授权有时效」这件事本身。
@@ -856,15 +952,15 @@ class ApprovalStore:
             # 这次点击在时间上无效，记下是谁点的会让人误以为那次点击算数。
             self._conn.execute(
                 "UPDATE pending_approvals SET decision = 'deny', decided_at = ?,"
-                " decided_by = ? WHERE credential = ?",
-                (now.isoformat(), "expired", credential),
+                " decided_by = ?, decided_via = ? WHERE credential = ?",
+                (now.isoformat(), "expired", via or None, credential),
             )
             self._conn.commit()
             return True
         self._conn.execute(
             "UPDATE pending_approvals SET decision = ?, decided_at = ?,"
-            " decided_by = ? WHERE credential = ?",
-            (decision, now.isoformat(), decided_by, credential),
+            " decided_by = ?, decided_via = ? WHERE credential = ?",
+            (decision, now.isoformat(), decided_by, via or None, credential),
         )
         self._conn.commit()
         return True
@@ -894,8 +990,131 @@ class ApprovalStore:
         ).fetchone()
         return _row_to_obj(row) if row is not None else None
 
+    def evidence(
+        self, *, since_days: int = 90, limit: int = 12,
+    ) -> AuditReport:
+        """窗口内的**审核账**：每条授权请求最后怎么了。**纯只读。**
 
-    def pending_question_for(self, who: str) -> PendingApproval | None:
+        ## 它回答的问题
+
+        「我一共答了多少次、多少是同意、多少是没看见。」在拆开
+        :data:`AuditOutcome` 之前，这些数根本答不出来 —— 一个 ``deny``
+        既可能是「他看过了不同意」，也可能是「卡躺到过期没人看」。
+        两者都落成 ``decision='deny'``，读侧只能靠 ``decided_by='expired'``
+        这个「拿谁当怎么用」的约定去猜。
+
+        ## 沉默为什么不落库
+
+        ``timeout`` 是这里**现推**的，不是一条写进库的记录：条件为
+        ``decision IS NULL`` 且 ``expires_at < now``。
+
+        理由与 :func:`decide` 那边同源 —— 沉默不是决定。落一条「超时」的
+        行，等于替用户写下一个他从未做过的动作。而「授权过期即失效」这件事
+        已经被 ``expires_at`` 完整表达了，再写一遍就是第二个真源。
+
+        ## 只统计授权，不统计提问
+
+        ``kind='question'`` 的行被排除。提问没有 allow/deny，只有「答了/
+        没答」，混进来会让「没人答」这一列被提问量淹没 —— 而这一列恰恰
+        是用来判断「提醒是不是太吵」的，被稀释就失去了用处。提问的
+        「没人答」是另一个问题（问题问得对不对），不该共用一张账。
+
+        ## 为什么给 ``waited_seconds``
+
+        「他多久之后才答」比「他答了什么」更能说明卡片的实际位置：
+        秒回 = 他正盯着；隔四小时 = 他在忙别的、回来才看见；躺满 TTL =
+        根本没看见。三者对「要不要继续这么打扰」的答案完全不同。
+
+        ``waited_seconds`` **兜底不小于 0**：``expires_at`` 早于 ``asked_at``
+        只可能是有人手工改过库，那是脏数据；把它显示成「等了 -27 天」
+        会让人以为系统坏了，而真正该被看见的是那张卡本身。
+        """
+        import datetime as _dt
+
+        now = self._clock()
+        since = (now - _dt.timedelta(days=since_days)).isoformat()
+        rows = self._conn.execute(
+            "SELECT a.subject, a.decision, a.decided_by, a.decided_at,"
+            " a.decided_via, a.expires_at, a.asked_at, a.task_id,"
+            " EXISTS(SELECT 1 FROM stop_requests s"
+            "        WHERE s.credential = a.credential) AS stopped"
+            " FROM pending_approvals a"
+            " WHERE (a.kind IS NULL OR a.kind = 'approval')"
+            "   AND a.asked_at >= ?"
+            " ORDER BY a.asked_at DESC",
+            (since,),
+        ).fetchall()
+
+        tally = {k: 0 for k in
+                 ("allow", "deny", "stop", "late", "timeout", "open")}
+        entries: list[AuditEntry] = []
+        keys: set[str] = set()
+        for r in rows:
+            keys = set(r.keys())
+            asked = _dt.datetime.fromisoformat(r["asked_at"])
+            expires = _dt.datetime.fromisoformat(r["expires_at"])
+            decided = (
+                _dt.datetime.fromisoformat(r["decided_at"])
+                if r["decided_at"] else None
+            )
+            decision = r["decision"]
+            if decision == "allow":
+                outcome: AuditOutcome = "allow"
+            elif decision == "deny":
+                # 三选一的顺序有讲究：**先查叫停**。叫停走的也是 resolve(deny)，
+                # 但它不是「这一步被否」，而是否掉了整件事 —— 哪天有人
+                # 把 stop 也写成 decided_by='expired'（不会，但假设），
+                # 顺序倒了就会把「叫停」错记成「迟到点击」。
+                if r["stopped"]:
+                    outcome = "stop"
+                elif r["decided_by"] == "expired":
+                    outcome = "late"
+                else:
+                    outcome = "deny"
+            else:
+                # 未决：过期了就是没人看，没过期就是还挂着。
+                outcome = "open" if now < expires else "timeout"
+            tally[outcome] += 1
+            if outcome == "timeout":
+                waited: int | None = max(
+                    0, int((expires - asked).total_seconds())
+                )
+            elif decided is not None:
+                waited = max(0, int((decided - asked).total_seconds()))
+            else:
+                waited = None
+            entries.append(
+                AuditEntry(
+                    subject=r["subject"],
+                    outcome=outcome,
+                    via=(r["decided_via"] if "decided_via" in keys else None) or "",
+                    who=(
+                        (r["decided_by"] or "")
+                        if outcome in ("allow", "deny", "stop", "late")
+                        else ""
+                    ),
+                    asked_at=asked,
+                    at=decided,
+                    waited_seconds=waited,
+                    task_id=(r["task_id"] if "task_id" in keys else None),
+                )
+            )
+
+        return AuditReport(
+            since_days=since_days,
+            total=len(entries),
+            allow=tally["allow"],
+            deny=tally["deny"],
+            stop=tally["stop"],
+            late=tally["late"],
+            timeout=tally["timeout"],
+            open=tally["open"],
+            entries=tuple(entries[:limit]),
+        )
+
+    def pending_question_for(
+        self, who: str, thread_root: str | None = None,
+    ) -> PendingApproval | None:
         """还在等**这个人**报答的提问，没完成的那一条。没有返回 ``None``。
 
         用于桥接判断「这条消息该不该当成答案」——一条消息
@@ -906,6 +1125,21 @@ class ApprovalStore:
         一个人可能同时被两个委派问题（上一个还在等，新的又开始）。
         返回旧的会把答案写进已经派醒的旧事务里，而新的继续无人答。
         所以取**最新**一条 —— 对人来说也才是他刚那个要回答的。
+
+        ## ``thread_root``（V1.90）：话题才是真判据，最新只是兜底
+
+        「取最新一条」在多委派并行时**必然串台**：两条委派同时提问，
+        答案永远写进后发起的那条，先发起的那条饿死。有了话题就不靠猜了
+        —— 用户在哪条委派的话题里说话，``root_id`` 就指向那张进度卡，
+        而 :meth:`record_card` 把同一个值记进了 ``thread_root``。
+
+        传了 ``thread_root``（非空）= **只认这个话题里的提问**，
+        话题里没有就问返回 ``None``：
+        宁可不把这句话当答案（它会照常走命令/闲聊路径），
+        也不能把它写进另一条委派的问答槽位 —— 那等于替人答错题。
+
+        ``None`` / 空串 = 不按话题过滤（旧行为）：没挂话题的卡、
+        以及消息本身不在话题里（直接发在主聊天流）都走这条。
 
         终端发起的无法被提问（它记的是**谁发起的委派**）——那不是遗漏，
         而是**正确**：那条路径上根本没有人在飞书里等它。
@@ -919,6 +1153,12 @@ class ApprovalStore:
             item = _row_to_obj(row)
             if item is None or not item.is_question:
                 continue
+            if thread_root:
+                # 行里没有这一列（旧库/旧行）时 ``row.keys()`` 里也没有它，
+                # 直接下标会炸 —— 取不到就当「不归属任何话题」，跳过。
+                got = row["thread_root"] if "thread_root" in row.keys() else None
+                if got != thread_root:
+                    continue
             if self._clock() >= item.expires_at:
                 continue                      # 过期的等于没存在
             if self.is_complete(item.credential):
@@ -1216,4 +1456,8 @@ def _row_to_obj(row) -> PendingApproval:
         ),
         # 同上（v15 新列）：旧行没有归属就是没有，**不猜**。
         task_id=(row["task_id"] if "task_id" in row.keys() else None),
+        # 同上：旧库没有这一列时 row 里也没这个键。
+        decided_via=(
+            (row["decided_via"] if "decided_via" in row.keys() else None) or ""
+        ),
     )

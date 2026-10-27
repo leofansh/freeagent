@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from freeagent.services.approval import ApprovalStore
-from freeagent.storage.db import connect, init_schema
+from freeagent.storage.db import connect, migrate
 
 
 class FakeClock:
@@ -31,7 +31,7 @@ class FakeClock:
 @pytest.fixture
 def store(tmp_path):
     conn = connect(Path(tmp_path) / "a.db")
-    init_schema(conn)
+    migrate(conn)
     return ApprovalStore(conn, clock=FakeClock(datetime.datetime(2026, 9, 29, 12, 0)))
 
 

@@ -17,7 +17,7 @@ from freeagent.domain import (
     WaitingKind,
     WaitingOn,
 )
-from freeagent.storage.db import connect, init_schema, resolve_db_path
+from freeagent.storage.db import connect, migrate, resolve_db_path
 from freeagent.storage.repos import ArtifactRepo, RecordRepo, RoleRepo, TaskRepo
 from freeagent.domain import RecordType
 
@@ -27,7 +27,7 @@ NOW = datetime(2026, 9, 26, 9, 0)
 @pytest.fixture()
 def conn(tmp_path):
     connection = connect(resolve_db_path(tmp_path))
-    init_schema(connection)
+    migrate(connection)
     yield connection
     connection.close()
 
@@ -53,8 +53,8 @@ def _task(**kw) -> Task:
 
 
 def test_schema_is_idempotent(conn):
-    init_schema(conn)
-    init_schema(conn)
+    migrate(conn)
+    migrate(conn)
     tables = {
         r[0]
         for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -278,18 +278,19 @@ class TestSchemaMigration:
     """
 
     def _make_v1_db(self, path):
-        """用**真实** schema 还原 v1：删掉 project_path 列，版本号设 1。
+        """还原 v1：``init_schema`` 就是 v1 基线，直接跑它，版本号设 1。
 
-        刻意不用手写的简化表 —— 上一次这么干，测出来的失败是「表没有
-        body 列」这种假象，跟迁移毫无关系，结论是错的。
+        V1.93 之前这里要「拿当前完整定义删掉 project_path 那一行」——
+        那是一种**猜**：删出来的库既不是 v1 也不是当前版，只是碰巧能跑。
+        冻基线之后不需要猜了。
         """
+        import sqlite3
+
         from freeagent.storage.db import _SCHEMA, connect
 
-        v1 = "\n".join(
-            line for line in _SCHEMA.splitlines() if "project_path" not in line
-        ) + "\nPRAGMA user_version = 1;\n"
         c = connect(path)
-        c.executescript(v1)
+        c.executescript(_SCHEMA)
+        c.execute("PRAGMA user_version = 1")
         # raw SQL 播种，**必须挂上角色** —— 否则读出来报的是
         # 「没有关联角色」这种无关错误，掩盖真正的迁移问题。
         c.execute(
@@ -347,20 +348,16 @@ class TestSchemaMigration:
             app.close()
 
     def _make_v2_db(self, path):
-        """还原 v2：有 ``project_path``、还没有 ``delegate_chat_id``。
+        """还原 v2：迁移链停在 2（有 ``project_path``、还没有 ``delegate_chat_id``）。
 
         加这列时（委派结果回推飞书）升到了 v3。**每一版都要有迁移测试**：
         只测「从最早那版升上来」会漏掉「从上一版升上来」这条真实路径 ——
         而绝大多数用户升级时，起点正是上一版。
         """
-        from freeagent.storage.db import _SCHEMA, connect
+        from freeagent.storage.db import connect, migrate
 
-        v2 = "\n".join(
-            line for line in _SCHEMA.splitlines()
-            if "delegate_chat_id" not in line
-        ) + "\nPRAGMA user_version = 2;\n"
         c = connect(path)
-        c.executescript(v2)
+        migrate(c, 2)
         c.execute(
             "INSERT INTO roles (id, name, active, created_at, updated_at)"
             " VALUES (?, ?, 1, ?, ?)",
@@ -416,32 +413,14 @@ class TestSchemaMigration:
     def _make_v15_db(self, path):
         """还原 v15：``task_records`` 还没有 ``seq`` 列（V1.35 时代）。
 
-        照抄 ``_make_v1_db`` 的手法：用**真实** schema 过滤行 + 设版本号，
-        不写手写的简化表。过滤词是 ``seq`` —— 它只出现在 task_records
-        的 seq 列（含列定义与注释行），不会误伤其他表。
-        ⚠️ 滤掉 seq 列定义后，task_records 的 ``content TEXT NOT NULL,``
-        会留着**悬空逗号**且中间隔着注释行 —— executescript 直接语法错。
-        v1 那版没踩到是因为 project_path 不在列尾；这里滤 seq 时
-        **越过注释行回溯**找到行尾逗号摘掉（只影响这个位置）。
+        迁移链停在 15。以前这里要拿完整定义逐行滤掉 ``seq``、还得回头
+        处理删列留下的**悬空逗号**（注释行挡在中间，得越过注释行回溯）——
+        那段取巧现在整段删掉：旧库长什么样由迁移链回答。
         """
-        from freeagent.storage.db import _SCHEMA, connect
+        from freeagent.storage.db import connect, migrate
 
-        kept: list[str] = []
-        for line in _SCHEMA.splitlines():
-            if "seq" in line:
-                # 滤列定义时越过紧邻的注释行，把真正的上一行（含悬空逗号
-                # 的列定义）修好 —— 注释行留着无所谓。
-                for j in range(len(kept) - 1, -1, -1):
-                    if kept[j].lstrip().startswith("--"):
-                        continue
-                    if kept[j].rstrip().endswith(","):
-                        kept[j] = kept[j].rstrip()[:-1]
-                    break
-                continue
-            kept.append(line)
-        v15 = "\n".join(kept) + "\nPRAGMA user_version = 15;\n"
         c = connect(path)
-        c.executescript(v15)
+        migrate(c, 15)
         c.execute(
             "INSERT INTO roles (id, name, active, created_at, updated_at)"
             " VALUES (?, ?, 1, ?, ?)",

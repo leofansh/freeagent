@@ -359,6 +359,26 @@ class TestCreate:
         records = seeded.record_repo.list_for_task(data["task"]["id"])
         assert records[0].type.value == "created"
 
+    def test_create_carries_relation_hint(self, served, seeded):
+        """建事务带回「提到已登记关系对象可挂账」提示（V1.84）。
+
+        只提示不静默挂（守 11.19）。未登记的不带提示 —— 我们不猜。
+        """
+        role = seeded.roles.get_by_name("家庭")
+        # 未登记：不带提示
+        _s, no_hint = post(
+            served[0], "/api/task", {"title": "和张总对合同", "role_ids": [role.id]}
+        )
+        assert no_hint["relation_hint"] is None
+        # 登记后：带提示
+        seeded.promise.contact("张总")
+        _s, with_hint = post(
+            served[0], "/api/task", {"title": "和张总对合同", "role_ids": [role.id]}
+        )
+        assert with_hint["relation_hint"] is not None
+        assert "张总" in with_hint["relation_hint"]
+        assert "可挂关系账" in with_hint["relation_hint"]
+
     def test_create_shows_up_in_today(self, served, seeded):
         role = seeded.roles.get_by_name("家庭")
         _s, created = post(

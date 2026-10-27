@@ -65,6 +65,14 @@ class TodayView:
     #: 却没有任何一处说它不在今天。所以计数**照报**，由界面去说。
     unscheduled_count: int = 0
 
+    #: 排在**今天之后**（未来某天）且未结束的事务条数（V1.84）。
+    #: 它们同样按设计不进今天视图（6.2），但**空态必须报出来**：
+    #: 否则用户刚记一条「排到下周三」的事，回 /today 看到「今天没有
+    #: 排进来的事务」，会误以为没记上 —— 与 :attr:`unscheduled_count`
+    #: 同构的静默。带最早那个未来日期，让提示更具体。
+    future_count: int = 0
+    earliest_future: date | None = None
+
     @property
     def rolled_over_ids(self) -> frozenset[str]:
         return frozenset(item.task_id for item in self.rollover.items)
@@ -150,11 +158,22 @@ class TodayService:
             for t in self._tasks.list_all()
             if t.is_open and t.scheduled_for is None
         )
+        # 排在未来的**同样**不进今天视图（6.2），空态也要报 —— 否则
+        # 「排到下周三」的事记完，回 /today 却像凭空消失（V1.84）。
+        future_open = [
+            t
+            for t in self._tasks.list_all()
+            if t.is_open
+            and t.scheduled_for is not None
+            and t.scheduled_for > today
+        ]
         return TodayView(
             day=today,
             items=tuple(scored),
             rollover=report,
             unscheduled_count=unscheduled,
+            future_count=len(future_open),
+            earliest_future=min((t.scheduled_for for t in future_open), default=None),
         )
 
     def scheduled_for(self, day: date) -> list[ScoredTask]:

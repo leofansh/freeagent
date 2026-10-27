@@ -200,3 +200,79 @@ def test_confirm_without_a_card_is_refused(repl):
 
     assert app.tasks.list_all() == [], "没发卡就确认 = 批准了没展示过的东西"
     assert "/mode-build" in out, f"要告诉他怎么走：{out!r}"
+
+
+# =========================================================================== #
+# V1.91：`/mode-build discard` —— Plan 状态机的那条出边
+# =========================================================================== #
+class TestDiscardPlan:
+    """进得去就得出得来：**丢弃计划**必须是一条不建任何东西的出路。
+
+    ## 这组测试挡的是什么（真实缺陷，不是假想）
+
+    此前退出 Plan 的唯一路径是 ``/mode-build ok``（确认建事务），而
+    ``cancel`` 的语义是「计划留着、继续规划」。于是：
+
+    - 进了 ``/mode-plan`` 又改主意「算了不弄了」→ **没有任何命令能回正常
+      模式**，只能确认一份自己不想要的东西；
+    - Plan 是**落盘**的（``plan_sessions`` + 启动 ``restore_plan``），
+      所以「关掉重开」也逃不掉；
+    - 恢复提示当时还写着「不想继续就 /mode-build 或直接重说」——
+      而 ``/mode-build`` 无参只是重新出一张确认卡，**提示在指错路**。
+
+    最容易被撞到的形态是「进错模式、一句没说、想退出」：此时 ``_plan`` 为空，
+    旧代码的早退分支会回一句「已经在 build 模式」（假话），然后把用户卡在那儿。
+    所以 ``test_discard_works_with_empty_plan`` 是这组的核心，不是补充。
+    """
+
+    def test_discard_works_with_empty_plan(self, repl):
+        """进 Plan 什么都没说就要退出 —— 这是最常撞到的形态。"""
+        r, _app = repl
+        out = _run(r, "/mode-plan", "/mode-build discard")
+        assert r._mode == MODE_BUILD, f"没退出规划：{out!r}"
+        assert "正常模式" in out
+        assert "已经在 build" not in out, \
+            f"回了一句假话（它其实在 Plan 里，只是空手）：{out!r}"
+
+    def test_discard_clears_plan_and_builds_nothing(self, repl):
+        """丢掉 = 真的丢掉：计划清空，且**一条事务都不许建**。"""
+        r, app = repl
+        out = _run(r, "/mode-plan", "第一件", "第二件", "/mode-build discard")
+        assert r._plan == [], f"计划没清空：{r._plan}"
+        assert app.tasks.list_all() == [], "丢弃竟然建了事务"
+        assert "2 条" in out, f"没说清丢了几条 —— 用户会以为还在：{out!r}"
+
+    def test_discard_after_pending_card_invalidates_the_card(self, repl):
+        """确认卡挂着时点「不弄了」→ 那张卡必须作废，不能再建出计划。
+
+        留着快照比不丢更坏：卡片还挂着，用户回头点「确认执行」，
+        会把一份他说过要丢掉的东西建出来 —— 而他会以为自己已经取消了。
+        """
+        r, app = repl
+        _run(r, "/mode-plan", "一件")
+        _run(r, "/mode-build")                 # 出卡，快照落定
+        assert r._last_plan_confirm == ("一件",)
+        _run(r, "/mode-build discard")
+        assert r._last_plan_confirm == (), "卡片快照没作废"
+        out = _run(r, "/mode-build ok")
+        assert "没有待确认的计划" in out, f"盘点还在：{out!r}"
+        assert app.tasks.list_all() == [], "作废的卡还是把事务建出来了"
+
+    def test_cancel_still_keeps_the_plan(self, repl):
+        """``cancel`` 的语义**不许**被这次改动带走 —— 它是「先留着」。"""
+        r, _app = repl
+        _run(r, "/mode-plan", "一件")
+        out = _run(r, "/mode-build cancel")
+        assert r._plan == ["一件"], f"cancel 把计划丢了：{r._plan}"
+        assert "先留着" in out
+
+    def test_help_reports_current_mode(self, repl):
+        """/help 第一行报模式 —— 替掉「我在哪」这条查询，不新增命令。"""
+        r, _app = repl
+        out = _run(r, "/mode-plan", "两件", "三件", "/help")
+        assert "Plan 模式" in out and "2 条" in out, f"帮助没报模式：{out[:200]!r}"
+
+    def test_help_outside_plan_says_nothing_about_mode(self, repl):
+        r, _app = repl
+        out = _run(r, "/help")
+        assert "Plan 模式" not in out, "正常模式下多嘴报模式是噪声"

@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import date
 
 from ..app import App
-from ..domain import FreeAgentError, TaskKind, WaitingKind, WaitingOn
+from ..domain import ORIGIN_SELF, FreeAgentError, TaskKind, WaitingKind, WaitingOn
 from ..services.llm import InputIntent, read_intent
 from . import serialize_api
 from .endpoints_read import resolve_task, role_names, task_state
@@ -80,12 +80,21 @@ def create_task(app: App, payload: dict) -> dict:
         kind=kind,
         intent=str(payload.get("intent") or "").strip() or None,
         scheduled_for=scheduled,
+        origin=ORIGIN_SELF,
     )
+    # V1.84：提到已登记的关系对象就顺势带一句可挂账（只提示不静默挂，
+    # 守 11.19）。零误判 —— 只认已登记的名字。
+    mentioned = app.promise.mentioned_contacts(title)
+    relation_hint = None
+    if mentioned:
+        first = mentioned[0].name
+        relation_hint = f"提到 {first}，可挂关系账（/contact {first}）"
     return {
         "kind": "created",
         "task": serialize_api.task_payload(
             app.restore.build_view(created), role_names(app)
         )["task"],
+        "relation_hint": relation_hint,
     }
 
 

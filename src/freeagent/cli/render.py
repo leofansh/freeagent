@@ -23,6 +23,7 @@ from ..services.reminders import ReminderDigest
 from ..services.sorting import DISCLAIMER_MARKER
 from ..services.today import TodayView
 from ..services.week import WeekView
+from ..services.care import CareDue
 
 __all__ = [
     "DISCLAIMER",
@@ -85,7 +86,16 @@ def render_today(
         lines.append("")
     lines.append(f"今天 · {view.day} · {len(view.items)} 件事（{DISCLAIMER}）")
     if not view.items:
-        lines.append("今天没有排进来的事务。直接说一句话就能新建。")
+        # 空态别斩钉截铁说「没有」—— 没排期 / 排未来的都在库里（V1.84，
+        # 与 unscheduled_count 同构）。不报出来用户会以为刚记的事丢了。
+        extras = []
+        if view.unscheduled_count:
+            extras.append(f"另有 {view.unscheduled_count} 条没排期")
+        if view.future_count:
+            when = f"，最早 {view.earliest_future}" if view.earliest_future else ""
+            extras.append(f"还有 {view.future_count} 条排在后面{when}")
+        tail = "；" + "；".join(extras) if extras else ""
+        lines.append(f"今天没有排进来的事务。{tail}直接说一句话就能新建。")
         return _with_pending_hint(lines, pending_count)
 
     lines.append("")
@@ -202,6 +212,16 @@ def render_week(view: WeekView, names: dict[str, str]) -> str:
             assert waiting is not None        # WeekView 只收在等的
             lines.append(f"  · {task.title} —— {waiting.describe()}")
 
+    # V1.71 成长目标（有意提示 / 20.1.12）：独立于四个事务分区，不与 care 的责任
+    # 提醒并。只原样列出、不催促不评价 —— 每周回顾时把「你承诺的自我提高」带回视野。
+    lines.append("")
+    if view.growth_goals:
+        lines.append("成长目标（记下的自我期许）:")
+        for _kind, text in view.growth_goals:
+            lines.append(f"  · {text}")
+    else:
+        lines.append("成长目标：还没记过 —— 用 /remember 记一条（如「今年把英语练到能开会」）。")
+
     lines.append("")
     lines.append("这些是**事实**，不是建议 —— 要改什么，由你决定。")
     return "\n".join(lines)
@@ -278,6 +298,16 @@ def render_model(view, names: dict[str, str]) -> str:
             lines.append(f"  · [{kind}]{tag} {text}")
     else:
         lines.append("承诺与目标：没有未兑现的对外承诺，也没记过「约定 / 目标」。")
+
+    # V1.69：滋养兴趣分面（记录优先，20.1.11）——「偏好」是我是谁，不是义务。
+    # 只原样列出，不催促不评价；与「承诺与目标」分开，避免把爱好读成该兑现的事。
+    lines.append("")
+    if view.preferences:
+        lines.append("滋养兴趣（记下的偏好）：")
+        for kind, text in view.preferences:
+            lines.append(f"  · {text}")
+    else:
+        lines.append("滋养兴趣：还没记过「偏好」—— 用 /remember 记一条（如「我最近在学赛艇」）。")
 
     lines.append("")
     lines.append("这些是**从你的记录里现推的事实**，不是评价 —— 要不要顺着它调整，由你决定。")
@@ -632,12 +662,15 @@ def render_daily_digest(
     pending_count: int,
     nudge_count: int,
     overdue_count: int,
+    cares: Iterable[CareDue] = (),
 ) -> str:
     """渲染每日「该看总览」（V1.60）。
 
     **只摆事实、不替用户决定**：报数 + 关键标题，具体详情去 Web 看。
     刻意克制 —— 今天排期最多列前 3 条标题，其余用计数兜住；总览是
     「知道今天有没有事」的入口，不是让用户在这里把一天过完。
+    ``cares``（V1.68）是今天到期的**人生角色关注面** —— 只报「该看看」，
+    是持续责任不是待办（看完推到下周期，不因做了而消失）。
     """
     lines = [f"该看 · {day}（今天）"]
     if today_count:
@@ -651,7 +684,48 @@ def render_daily_digest(
         lines.append(f"该催 {nudge_count} 件（跟人 follow_up 已过或承诺逾期，/nudge 或 Web 催办看）")
     if overdue_count:
         lines.append(f"承诺逾期 {overdue_count} 条（我欠对方，/promise 或 Web 承诺看）")
+    cares = list(cares)
+    if cares:
+        lines.append(
+            "该看看（人生角色关注面）："
+            + "；".join(f"{a.area.text}（{a.role_name}）" for a in cares)
+        )
     lines.append("系统只摆事实，不替你决定先做哪个。详情点开 Web 看。")
+    return "\n".join(lines)
+
+
+_CARE_WEEKDAY_LABELS = {
+    "1": "一", "2": "二", "3": "三", "4": "四",
+    "5": "五", "6": "六", "7": "日",
+}
+
+
+def _cadence_label(cadence: str) -> str:
+    """把 ``weekly:5`` / ``monthly:1`` 翻回人话（列表给用户看）。
+
+    ``weekly:6`` → 「每周六」（每 + 周 + 六，不是「每周周六」）。
+    """
+    kind, _, value = cadence.partition(":")
+    if kind == "weekly":
+        return f"每周{_CARE_WEEKDAY_LABELS.get(value, value)}"
+    if kind == "monthly":
+        return f"每月{int(value)}号"
+    return cadence
+
+
+def render_cares(items: Iterable[CareDue], now: datetime | None = None) -> str:
+    """人生角色关注面列表（11.24 / V1.68）。
+
+    每个角色名下「我该周期性关心的东西」。刻意不催、不判 —— 只摆
+    「角色 · 关注面 · 节奏 · 下次该看」，看完由用户自己 ``/care done``。
+    """
+    if not items:
+        return "还没有角色关注面 —— 给某个角色记一个「该周期性关心的东西」，如：/care 爸爸 孩子的作业和状态 每周六"
+    lines = ["人生角色关注面（该周期性关心的东西）："]
+    for i, due in enumerate(items, 1):
+        a = due.area
+        lines.append(f"{i}. 每周照看 · {_cadence_label(a.cadence)} 该看：{a.text}（{due.role_name}）")
+    lines.append("/care done <序号> 记「看过了」，会推到下个周期。关注面不是待办，不会做完就消失。")
     return "\n".join(lines)
 
 

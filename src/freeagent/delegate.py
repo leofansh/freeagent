@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import functools
 import json
@@ -57,9 +58,12 @@ from .services.delegate import (
     PROJECTION_STALE_SECONDS,
     DelegationPolicy,
     DispatchOutcome,
+    attempt_state,
     build_brief,
     check_project_allowed,
     eligible_tasks,
+    lease_owner,
+    LOST_MARK,
     parse_opencode_output,
     projection_age_seconds,
 )
@@ -81,6 +85,7 @@ from .services.opencode_server import (
     stale_gate_note,
 )
 from .feishu.sender import ProgressCard
+from .storage.repos import LeaseRepo
 
 __all__ = ["Runner", "subprocess_runner", "run_once", "main",
            "ApprovalGate", "Gate", "run_with_tool_gate",
@@ -225,7 +230,7 @@ def version_mismatch_reason(detected: int | None) -> str | None:
     - **可派发的版本**（V1 / V2） → 放行
     - **探不到版本** → 查装没装 / 输出格式
     - **不认识的版本** → 只能升级本仓（或降级执行器）
-    - **认识但未验证**（hermes） → 先对着真实实例验完适配器
+    - **认识但未验证**（仅测试注入的合成适配器能走到） → 先对着真实实例验完适配器
     """
     if detected is None:
         accepted = "、".join(str(n) for n in SUPPORTED_OPENCODE_MAJORS) or "无"
@@ -248,7 +253,9 @@ def version_mismatch_reason(detected: int | None) -> str | None:
             "**静默忽略**，闸门随之失效，且失效方向是回到 allow。"
             "请升级本仓，或把执行器降回已知版本。"
         )
-    # 认识但 verified=False —— 当前只有 hermes 会走到这里
+    # 认识但 verified=False —— 当前**没有**生产适配器是这样（hermes 已转正），
+    # 只有测试注入的合成未验证适配器会走到这里。仍保留这条分支：哪天又一个
+    # 执行器只登记没实测，这条「认识但未验证」的话术要能直接接住它。
     return (
         f"opencode 主版本是 {detected}，本仓**认识**它但**未验证**接线"
         f"（见设计文档 11.8.1 的版本陷阱表）。"
@@ -347,6 +354,7 @@ def reclaim_abandoned(
             for row in app.task_repo.open_delegate_progress():
                 latest[str(row["task_id"])] = str(row["updated_at"])
             notes: list[str] = []
+            handled: set[str] = set()
             for item in store.pending_for_web():
                 task_id = item.task_id or ""
                 if not task_id:
@@ -354,6 +362,7 @@ def reclaim_abandoned(
                 task = app.task_repo.find(task_id)
                 if task is None:
                     continue          # 事务已删：没什么可认领
+                handled.add(task_id)
                 # 投影新鲜 ⇒ 执行器**大概率还在跑**。此时落失败账是
                 # 误伤正在动的委派 —— 宁可漏认领（它自己会跑完），
                 # 也不许把活的记成死的。这个方向与陈旧判定的 fail-safe 同向。
@@ -383,6 +392,56 @@ def reclaim_abandoned(
                              f"（停在「等批准」，进度已陈旧）。"),
                     detail=(f"可在终端里 /redispatch {task_id}"
                             " 重新派发，或 /drop 放弃。"),
+                ))
+
+            # ── 第二趟：已派出、却没有任何收尾记录（12.11.3 / V1.94）──────
+            #
+            # 这一格以前**接不住**：上一趟只扫「停在等批准」的那批
+            # （``pending_for_web``），而崩溃也可能发生在**批准之后、跑完
+            # 之前**。那时的形状是「末条 dispatched、没有终态」、没有任何
+            # 待批项 —— 于是无人认领，``/redispatch`` 永远报「正在跑」，
+            # ``/pause`` 又刻意不清在跑标记。**一次崩溃 = 一条死事务。**
+            #
+            # 凭什么敢判它已经死了：这段跑在 ``app.lock`` 里面，而锁是排他的，
+            # ``run_once`` 整轮扫派都持有它。**拿到锁就等于「现在没有第二个
+            # 派发进程活着」** —— 所以「末条 dispatched」只可能是遗留。
+            #
+            # 判据仍然只有一份：形状问 :func:`attempt_state`，不重新拼记录。
+            #
+            # 不自动重派（11.10.5）：只落一条失败账，把续不续交给人。而且
+            # 通知里要点明**子进程可能还活着** —— 父进程死了，执行器未必跟着
+            # 死；不确认就重派，就是两个进程改同一个目录。
+            for task in app.task_repo.list_all():
+                if not task.project_path or task.id in handled:
+                    continue
+                # **已结束的不认领**：有人手工把它标成 done/dropped，说明
+                # 「这件事到此为止」这个决定已经做过了，再补一条失败账只是
+                # 往统计里掺噪声。认领的目的是**让卡住的能继续**，不是记账。
+                if not task.is_open:
+                    continue
+                records = app.record_repo.list_for_task(task.id)
+                in_flight, _last = attempt_state(records)
+                if not in_flight:
+                    continue
+                dispatched_at = ""
+                for record in reversed(records):
+                    if record.type is RecordType.DELEGATION_DISPATCHED:
+                        dispatched_at = record.ts.strftime("%Y-%m-%d %H:%M")
+                        break
+                app.record_repo.append(
+                    task.id, RecordType.DELEGATION_FAILED,
+                    (f"{LOST_MARK}：派出于 {dispatched_at}，之后没有任何收尾"
+                     f"记录。执行器子进程可能还没退出 —— 确认没有进程在改"
+                     f"{task.project_path} 之后 /redispatch {task.id}，"
+                     f"或 /drop。"), now,
+                )
+                notes.append(f"{task.id[:8]} 失联认领：已记执行期失败并通知发起人")
+                _notify_chat(task, DispatchOutcome(
+                    ok=False,
+                    summary="这条委派派出去之后没有收尾记录（进程中断）。",
+                    detail=(f"派发时间 {dispatched_at}。执行器子进程可能还在跑 ——"
+                            f" 确认没有进程在改 {task.project_path} 之后，"
+                            f"在终端里 /redispatch {task.id} 续跑，或 /drop 放弃。"),
                 ))
         return tuple(notes)
     finally:
@@ -501,32 +560,39 @@ def run_once_with_tool_gate(
                     leftover = stale_gate_note(project)
                     if leftover and leftover not in notes:
                         notes.append(leftover)
-                    outcome = run_with_tool_gate(
-                        task, project,
-                        build_brief(
-                            task, task.intent, task.definition_of_done,
-                            # V1.38：上次失败的错因回流进简报（12.10.7）。
-                            records=app.record_repo.list_for_task(task.id),
-                        ),
-                        policy=the_policy, store=store, sender=sender,
-                        progress_sender=progress_sender,
-                        # V1.40：把两个角色拆开传。``requested_by`` 只记
-                        # **真实发起人**——WEB/终端发起的委派写空串，WEB 面板
-                        # 据 12.8 判为「本机可决」；``approver`` 是卡片收件人，
-                        # 有真实发起人发给他，没有才落回兜底 approver。
-                        # 曾在这里只传 ``task_requester(task, approver)`` 一个
-                        # 参数，身份一肩挑两职，把兜底 approver 也写进了
-                        # requested_by —— WEB 发起的委派被 WEB 面板误判成
-                        # 「飞书发起，只有发起人能批」（真机截图实证）。
-                        approver=task_requester(task, approver),
-                        requested_by=task_requester(task),
-                        server_factory=server_factory,
-                        # 落库进度投影（12.8）：WEB 面板读的就是这张表。
-                        # 传的是适配器而不是 TaskRepo 本身，因为
-                        # ``write_delegate_progress`` 还要把 ``now`` 换成一个
-                        # 墙上时钟 —— 而那条时钟属于存储层，不属于这里。
-                        progress_repo=_TaskRepoProgress(app.task_repo),
-                    )
+                    # 租约覆盖「真的在跑会话」这一段。上限用同一份
+                    # ``DEFAULT_MAX_DISPATCH_SECONDS``：租约写的是**承诺**
+                    # （我最多占到什么时候），用另一套数字就是让承诺和
+                    # 执行器实际拥有的时间不一致。
+                    with dispatch_lease(
+                        app, task.id, DEFAULT_MAX_DISPATCH_SECONDS
+                    ):
+                        outcome = run_with_tool_gate(
+                            task, project,
+                            build_brief(
+                                task, task.intent, task.definition_of_done,
+                                # V1.38：上次失败的错因回流进简报（12.10.7）。
+                                records=app.record_repo.list_for_task(task.id),
+                            ),
+                            policy=the_policy, store=store, sender=sender,
+                            progress_sender=progress_sender,
+                            # V1.40：把两个角色拆开传。``requested_by`` 只记
+                            # **真实发起人**——WEB/终端发起的委派写空串，WEB 面板
+                            # 据 12.8 判为「本机可决」；``approver`` 是卡片收件人，
+                            # 有真实发起人发给他，没有才落回兜底 approver。
+                            # 曾在这里只传 ``task_requester(task, approver)`` 一个
+                            # 参数，身份一肩挑两职，把兜底 approver 也写进了
+                            # requested_by —— WEB 发起的委派被 WEB 面板误判成
+                            # 「飞书发起，只有发起人能批」（真机截图实证）。
+                            approver=task_requester(task, approver),
+                            requested_by=task_requester(task),
+                            server_factory=server_factory,
+                            # 落库进度投影（12.8）：WEB 面板读的就是这张表。
+                            # 传的是适配器而不是 TaskRepo 本身，因为
+                            # ``write_delegate_progress`` 还要把 ``now`` 换成一个
+                            # 墙上时钟 —— 而那条时钟属于存储层，不属于这里。
+                            progress_repo=_TaskRepoProgress(app.task_repo),
+                        )
                 except FreeAgentError as exc:
                     outcome = DispatchOutcome(
                         ok=False, summary=f"白名单拒绝：{exc}"
@@ -873,10 +939,10 @@ class ToolCardSender(Protocol):
     sender 协议就得把 :class:`~freeagent.services.localops.CardSender`
     一起搬进来，而这里用不到它的别的能力。
 
-    撤回（V1.41）为什么算进**这张卡自己的**协议：授权卡的生命周期是
-    「发 → 等结论 → 定案 → 发下一张前撤掉上一张」，发与撤是同一份
-    生命周期的两半。分到两个对象/协议上的话，「什么时候撤」就没有人
-    负责 —— 而没人负责的事在两个实现里必然漂移出两个答案。
+    收尾（V1.88）为什么算进**这张卡自己的**协议：授权卡的生命周期是
+    「发 → 等结论 → 定案 → 发下一张前把上一张**原地改写成终态**」，发与
+    收是同一份生命周期的两半。分到两个对象/协议上的话，「什么时候收」
+    就没有人负责 —— 而没人负责的事在两个实现里必然漂移出两个答案。
     """
 
     def send_tool_card(
@@ -884,16 +950,18 @@ class ToolCardSender(Protocol):
         credential: str, ttl_seconds: int, reply_to: str = "",
     ) -> str: ...
 
-    def delete_message(self, message_id: str) -> None: ...
+    def settle_card(
+        self, message_id: str, *, subject: str = "", verdict: str = "",
+    ) -> None: ...
 
 
 class QuestionCardSender(Protocol):
-    """提问卡的发送与撤回，与授权卡**同一份生命周期**。
+    """提问卡的发送与收尾，与授权卡**同一份生命周期**。
 
     与 :class:`ToolCardSender` 分开声明，刻意不合并成一个 sender 协议：
     两者的按钮语义不同（一个有 allow/deny，一个**没有按钮**），合并会
     让「调用方到底需不需要实现发卡」这个问题变得要看实现才知道。
-    撤回归进来的理由同上 —— 提问卡也在回复串里占位，瘦身时一并收。
+    收尾归进来的理由同上 —— 提问卡也在回复串里占位，收尾时一并折叠。
     """
 
     def send_question_card(
@@ -901,7 +969,9 @@ class QuestionCardSender(Protocol):
         credential: str, ttl_seconds: int, reply_to: str = "",
     ) -> str: ...
 
-    def delete_message(self, message_id: str) -> None: ...
+    def settle_card(
+        self, message_id: str, *, subject: str = "", verdict: str = "",
+    ) -> None: ...
 
 
 class ProgressCardSender(Protocol):
@@ -1089,6 +1159,34 @@ MIN_PROGRESS_INTERVAL = 5.0
 #:
 #: 两者都在**代码**里数，不靠请 agent 自觉。
 DEFAULT_MAX_DISPATCH_SECONDS = 30 * 60
+
+
+@contextlib.contextmanager
+def dispatch_lease(app, task_id: str, seconds: float):
+    """占住这条委派的租约，跑完放掉。**到期时间就是这次的硬超时。**
+
+    这个 ``with`` 只做一件事：把「现在有人在跑」写成一条能被读到的行
+    （12.11.3）。它**不参与**「要不要派」的判定 —— 那个判定还是
+    :func:`~freeagent.services.delegate.already_dispatched` 一个人说了算，
+    依据仍是记录形状。两份判定并存的坏处是漂移；所以这里的唯一产出是
+    **过期与否**这个事实，由读方（``/redispatch``、``/feedback``）各自决定
+    怎么用。
+
+    放掉放在 ``finally``：正常结束、超时、被拒、抛异常都走同一处。
+    万一进程在这中间被杀，这一行会留到过期 —— 那正是它存在的意义。
+    """
+    leases = LeaseRepo(app.conn)
+    now = app.clock.now()
+    leases.acquire(
+        task_id,
+        owner=lease_owner(),
+        acquired_at=now,
+        expires_at=now + datetime.timedelta(seconds=seconds),
+    )
+    try:
+        yield
+    finally:
+        leases.release(task_id)
 
 
 def run_with_tool_gate(
@@ -1917,7 +2015,7 @@ def _ask_one_question(
             # 答案**，而它确实会驱动 agent 继续改代码。
             log.warning("【执行期】发提问卡失败（%s）—— 不自己回答", exc)
             return ""
-        store.record_card(pending.credential, message_id)
+        store.record_card(pending.credential, message_id, thread_root=reply_to)
         got = store.wait_answer(
             pending.credential, slot, timeout_seconds=policy.ttl_seconds,
         )
@@ -2010,58 +2108,80 @@ def _send_card_threaded(
         return send(reply_to="", **kwargs)
 
 
+def _verdict_line(decision: str | None, kind: str) -> str:
+    """把库里的一次判定翻译成卡上的一行人话。**一处成形**。
+
+    - 授权行：``allow`` → 已允许；``deny`` → 未放行。**deny 不区分
+      「点了拒绝」和「过期」** —— 对收据来说两者后果相同（动作没跑），
+      而区分它们需要查 ``decided_at`` vs ``expires_at``，收据不值得。
+    - 提问行：**只说「已处理」**。提问行的「已答」记在 answer 列、
+      ``decision`` 仍是 None（:meth:`ApprovalStore.answer_text`），
+      两套判据混一条 SQL 就会漂（见 store 里的时序论证）。
+    """
+    if kind == "question":
+        return "**已处理。**"
+    if decision == "allow":
+        return "**已允许。**"
+    if decision == "deny":
+        return "**未放行**（拒绝或已过期）。"
+    return "**已处理。**"
+
+
 def _retire_settled_cards(
     sender: "ToolCardSender | QuestionCardSender",
     store: "ApprovalStore",
     task_id: str,
     retired: set[str],
 ) -> None:
-    """撤回这条委派**已发出去**的授权/提问卡（V1.41 滚动瘦身）。
+    """把这条委派**已发出去**的授权/提问卡原地改写成终态（V1.88）。
 
-    ## 为什么必须撤，而「聚拢」救不了这条命
+    ## 为什么从「撤回」改成「原地改写」（V1.88 推翻了 V1.41 的前提）
 
-    11.16 的聚拢（授权卡 reply 到进度卡下）治的是「卡片散落全聊天流」，
-    治不了「回复串本身越滚越长」：飞书回复**逐条占位**，N 次工具调用
-    = N 张卡，而进度卡的原地更新改变不了它的位置 —— 用户看到的是
-    一串旧卡把屏幕往下顶，最新动态永远在可视区外（真机截图实证）。
-    消息在飞书里只有「撤」没有「收起」，所以收短回复串的唯一操作就是
-    撤回。**timer：撤的是已定案的旧卡** —— 定案瞬间用户已经得到反馈
-    （原地变绿「已允许」+ toast），撤发生在**下一张卡发出之前**，
-    中间没有任何交互窗口会撞上。
+    V1.41 选撤回的理由是「飞书里只有撤、没有收起」—— **这个前提是错的**：
+    ``PATCH /im/v1/messages/{id}`` 能把一张卡原地改写成任何 1.0 形状。
+    而撤回的真实代价被真机截图量出来了：每张撤回留一条
+    「撤回了一条消息」墓碑，内容没了、占位还在 —— N 张卡就是 N 条墓碑
+    （真机 9 连实证），清理行为本身成了聊天里最大的噪音。
 
-    ## 可追溯性不因此消失（用户的合理担心）
+    改写成一行终态后：回复串照样被「收短」（一张大卡折成一行收据），
+    且聊天里留下的是**可回看的授权收据** —— 对治理层产品这是资产不是
+    残骸。逐条判定的真源仍在库里（``pending_approvals`` / ``task_records``），
+    聊天收据只是投影。
 
-    逐条判定的真源在库里：``pending_approvals``（每次授权一行：主题、
-    结论、谁批的）与 ``task_records``（执行投影）。WEB 面板按委派
-    全量可查；聊天里的**收尾**则把最近判定的明细写回进度卡正文
-    （见 :func:`run_with_tool_gate` 的统一收口）。聊天流本来就不是
-    审计库 —— 留痕的职责在库，聊天只保「当前要批什么」和「最终凭证」。
+    ## 时序论证（从 V1.41 原样继承，一字未变）
 
-    ## 失败语义：外观损失，不重试
+    改写只发生在**发下一张卡之前**和**收尾**两处；那两个时刻执行循环是
+    **串行**的 —— 前一张必然已等到结论，本张还没发出去。所以查出来的
+    卡全部属于已定案的，当前挂起的卡**永远不在结果里**
+    （见 :meth:`ApprovalStore.settled_cards_for_task`）。
 
-    撤回失败只记 warning、**不重试**（旧卡留在聊天里而已，不影响授权），
-    判据与 11.16「reply 失败退回独立发送」同一条：锚点失效只影响
-    「挂哪儿」，这里是「留不留旧卡」，都碰不到「能不能批」。不重试
-    的理由是撤回失败的两种可能（权限没开 / 消息早已不在）都**不会**
-    因为重试而变好，徒增每次发卡前的等待。
+    ## 失败语义：外观损失，不重试，**绝不降级成撤回**
+
+    改写失败只记 warning、旧卡原样保留。不重试的理由与 V1.41 同一条：
+    失败的两种原因（14 天窗口已过 / 旧版卡没有 ``update_multi``）都不会
+    因重试而变好。**也不许降级成 DELETE** —— 那等于把墓碑请回来，
+    等于这次修改白做。
 
     ``retired`` 由调用方全程持有：它同时是「本 run 已处理过的 id」的
-    去重表 —— 库里的 id 一查全量，不查重就会对同一条消息反复 DELETE，
-    每次都换来一条徒劳的飞书报错。
+    去重表 —— 库里的 id 一查全量，不查重就会对同一条消息反复 PATCH，
+    每次都换来一次徒劳的飞书请求。
     """
     if not task_id:
-        # 没有归属的请求（终端路径、本地操作）查不出卡，也就无从撤。直接跳过。
+        # 没有归属的请求（终端路径、本地操作）查不出卡，也就无从收。直接跳过。
         return
-    for message_id in store.card_message_ids_for_task(task_id):
+    for message_id, subject, decision, kind in store.settled_cards_for_task(task_id):
         if message_id in retired:
             continue
         retired.add(message_id)
         try:
-            sender.delete_message(message_id)
+            sender.settle_card(
+                message_id, subject=subject,
+                verdict=_verdict_line(decision, kind),
+            )
         except Exception as exc:  # noqa: BLE001 - 外观损失，说清就放行
             log.warning(
-                "【执行期】撤回已定案卡片失败（%s）—— 旧卡留在聊天里，"
-                "不影响授权流程（task=%s）", exc, task_id,
+                "【执行期】已定案卡片改写终态失败（%s）—— 旧卡原样保留"
+                "（不降级撤回），不影响授权流程（task=%s）", exc, task_id,
             )
 
 
@@ -2123,7 +2243,7 @@ def _ask_one_tool(
         log.warning("【执行期】发卡失败（%s）—— 按拒绝处理", exc)
         # 凭据给空串：没走到 wait，也就没有「被叫停」可言。
         return "deny", ""
-    store.record_card(pending.credential, message_id)
+    store.record_card(pending.credential, message_id, thread_root=reply_to)
     # 结论一律回库读（同 11.9.4 的纪律），不采信任何返回值。
     # ``timeout_seconds`` 必须**显式**给 policy 的 TTL：默认那个是
     # DEFAULT_TTL_SECONDS，与本场景的 TTL 不是一回事（实测 1800 vs 600）。
@@ -2210,29 +2330,33 @@ def _dispatch_one(
         f"派给 {policy.command}：{project}｜标题 {title}", app.clock.now(),
     )
 
-    code, stdout, stderr = runner(
-        _argv(policy, brief, title), project, policy.timeout
-    )
-    # 刻意**不加自动重试**。曾以为「全新目录首次运行会掉到主 agent 的付费
-    # 模型、重跑就好」，实测两次都失败 —— 假设被证伪。真实规律是：
-    # **需要写权限的任务会路由到唯一的 primary agent**（本机 Sisyphus，
-    # 模型钉死 claude-opus-5），``--model`` 在那次路由里不生效，
-    # 余额不足就 402。重试既治不了，又让每个真失败白跑一遍、耗时翻倍。
-    if code != 0:
-        # 截断放宽到 4000：**产物链才是事后能查的地方**，而 500 字符
-        # 常常正好把错因切掉（实测那次 `APIError` 的 message 就在 500 字符
-        # 之后）。终端那行另有 ``first_meaningful_line`` 做短显示，
-        # 两边不必用同一个上限 —— 一个给人看，一个给事后查。
-        detail = (stderr or stdout).strip()[:4000]
-        outcome = DispatchOutcome(
-            ok=False,
-            summary=f"执行器退出码 {code}",
-            detail=detail,
+    # 租约在「已记派出」之后占：先有事实，再声明「我在跑」。
+    # 顺序反过来的话，崩在两者之间会留下一条「没人占却已经派出」的记录 ——
+    # 那和「刚派出去就崩」是同一种形状，认领侧不必为此多一条分支。
+    with dispatch_lease(app, task.id, policy.timeout):
+        code, stdout, stderr = runner(
+            _argv(policy, brief, title), project, policy.timeout
         )
-    else:
-        outcome = parse_opencode_output(stdout)
+        # 刻意**不加自动重试**。曾以为「全新目录首次运行会掉到主 agent 的付费
+        # 模型、重跑就好」，实测两次都失败 —— 假设被证伪。真实规律是：
+        # **需要写权限的任务会路由到唯一的 primary agent**（本机 Sisyphus，
+        # 模型钉死 claude-opus-5），``--model`` 在那次路由里不生效，
+        # 余额不足就 402。重试既治不了，又让每个真失败白跑一遍、耗时翻倍。
+        if code != 0:
+            # 截断放宽到 4000：**产物链才是事后能查的地方**，而 500 字符
+            # 常常正好把错因切掉（实测那次 `APIError` 的 message 就在 500 字符
+            # 之后）。终端那行另有 ``first_meaningful_line`` 做短显示，
+            # 两边不必用同一个上限 —— 一个给人看，一个给事后查。
+            detail = (stderr or stdout).strip()[:4000]
+            outcome = DispatchOutcome(
+                ok=False,
+                summary=f"执行器退出码 {code}",
+                detail=detail,
+            )
+        else:
+            outcome = parse_opencode_output(stdout)
 
-    _record_result(app, task, outcome)
+        _record_result(app, task, outcome)
     return outcome
 
 

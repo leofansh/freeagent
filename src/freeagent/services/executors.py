@@ -5,8 +5,9 @@
 委派要启动一个外部执行器，而**那个东西的协议会变**。
 
 注册表里现有两个执行器：**opencode**（V1 与 V2 都已实测接线）与
-**hermes**（未验证）。后者**只能登记、不能派发**，而且它与 opencode
-**不是同一种接法**（HTTP+SSE vs stdio JSON-RPC）—— 见下面 hermes 那节。
+**hermes**（/ask 那条线已接线，但不能委派）。后者**只能问、不能派**，
+而且它与 opencode **不是同一种接法**（HTTP+SSE 走常驻 gateway，不是
+起隔离进程）—— 见下面 hermes 那节。
 
 V1 → V2 时 permission 模型的字段名全变了（``permission`` 对象 / ``bash`` /
 ``task`` → ``permissions`` 数组 / ``shell`` / ``subagent``），而**旧字段被静默
@@ -24,8 +25,9 @@ V1 → V2 时 permission 模型的字段名全变了（``permission`` 对象 / `
 1. **不猜未知的字段。** 一个版本要是还没对着真机验过，它的协议函数就**全部
    拒绝调用**，而不是照着一个「看起来很像对的」形状写下去 ——
    见 :mod:`docs.postmortem.0001`，写反的东西看起来总很像对的。
-   现行的例子是 hermes（``verified=False``，六个函数全抛）。
 2. **不放行未验证的版本。** 版本闸门只放 ``verified=True`` 的适配器。
+   （hermes 已 ``verified`` 但 ``dispatchable=False``：它只验过 /ask 那条线，
+   不参与委派闸门 —— 见 :class:`ExecutorAdapter` 的字段说明。）
 
 ## 版本闸门在哪
 
@@ -70,6 +72,7 @@ __all__ = [
     "V1_FIELD_NAMES",
     "V2_FIELD_RENAMES",
     "HERMES_FIELD_NAMES",
+    "HERMES_API",
 ]
 
 
@@ -213,6 +216,30 @@ class ExecutorAdapter:
     executor: str
     major: int
     verified: bool
+    #: 能不能走 11.8 **委派**。与 :attr:`verified` **是两个概念**：
+    #:
+    #: - ``verified`` —— 对着真实实例验过**接线**（11.10.2）。一个执行器
+    #:   可能只验过「/ask（只读问答）」这一条线，就**不等于**它能委派。
+    #: - ``dispatchable`` —— 能走 11.8 那条「建会话 → 执行期逐次授权 → 产出
+    #:   artifact」的完整委派链路。只有这条线验过的执行器才有资格。
+    #:
+    #: 曾用的例子是 hermes：``verified`` 转正（/ask 线对着真机验过）后，
+    #: ``dispatchable`` **仍为 False** —— V1.81 真机确认它的审批闸是「按模式
+    #: 标记」而非「每动作确认」：API 面与飞书面都会直接执行未标记的 file/
+    #: terminal 操作而不弹审批（manual + 重启也拦不住），**做不了执行期逐次
+    #: 授权**。**V1.83 更因它连「只读改不了」都保证不了而把 ``disabled`` 置
+    #: True 停用**（见下方 ``disabled`` 字段说明）；这里保留这段历史是为了说清
+    #: 为什么 ``dispatchable`` 必须与 ``verified`` 分开。
+    #:
+    #: 为什么必须拆开而不是让 ``verified`` 兼管「可委派」：探针（``/agents``）
+    #: 拿 ``dispatchable`` 说「能不能派」，拿 ``verified`` 说「验没验过」——
+    #: 合在一起会让 hermes 验过 /ask 后就被说成「可以派发」，而那与
+    #: 11.10.8 的边界直接冲突（诱导用户去委派一个做不了委派的执行器）。
+    #:
+    #: **必须显式填写、无默认值**：加一个新执行器时「能不能委派」是一个
+    #: 需要人来定的决定，不该悄悄落到 False（那会「看起来能派其实不能派」），
+    #: 也不该悄悄落到 True（那会让未验证委派的执行器进了闸门）。
+    dispatchable: bool
     #: 该版本的键名。**单独拎出来**是为了让「V2 改了什么」这件事
     #: 可以被测试断言，而不是埋在拼 dict 的代码里。
     field_names: dict[str, str]
@@ -233,6 +260,18 @@ class ExecutorAdapter:
     build_question_reply: Callable[[Sequence[Sequence[str]]], dict[str, Any]]
     #: HTTP 面。**``None`` = 这个执行器不是 HTTP+SSE 那一种接法**（hermes）。
     api: ExecutorApi | None = None
+    #: 停用（V1.83）：登记过、但**不作为可用执行器**。默认 ``False``
+    #: （安全方向是「不静默停用」—— 新适配器默认仍可用，只有人决定不用
+    #: 它时才显式置 True）。
+    #:
+    #: 与 :attr:`verified` / :attr:`dispatchable` 是两个方向：停用不是因为
+    #: 「没验过」或「不能委派」，而是「**决定不用它了，代码保留作接缝**」。
+    #: 现行的例子是 hermes —— V1.82 真机证伪它的审批闸（「按模式标记」而非
+    #: 「每动作确认」，拦不住未标记的 file/terminal，API 面与飞书面都直接
+    #: 执行不弹审批），FreeAgent 不再把它当执行器；适配器与 helper 全部保留，
+    #: 将来若 hermes 修好审批闸，把 ``disabled`` 改回 ``False`` 并恢复
+    #: ``/ask hermes`` 分派即可重新启用。
+    disabled: bool = False
 
 
 # ── opencode V1（本仓实测并据以接线）─────────────────────────────────────
@@ -735,6 +774,7 @@ _V1 = ExecutorAdapter(
     executor="opencode",
     major=1,
     verified=True,
+    dispatchable=True,
     field_names=V1_FIELD_NAMES,
     build_permission_config=_v1_permission_config,
     build_read_only_config=_v1_read_only_config,
@@ -1363,6 +1403,7 @@ _V2 = ExecutorAdapter(
     executor="opencode",
     major=2,
     verified=True,
+    dispatchable=True,
     field_names=V2_FIELD_RENAMES,
     build_permission_config=_v2_permission_config,
     build_read_only_config=_v2_read_only_config,
@@ -1444,37 +1485,325 @@ _V2 = ExecutorAdapter(
 HERMES_FIELD_NAMES: dict[str, str] = {}
 
 
-def _hermes_unverified(what: str) -> Callable[..., Any]:
-    def _raise(*_args: Any, **_kwargs: Any) -> Any:
-        raise UnverifiedExecutorError(
-            f"hermes 的 {what} 尚未验证。"
-            "照文档看，它的 API Server（HTTP + SSE，默认 8642）与 opencode "
-            "**同构**：建 run、读 SSE 事件、``/stop`` 中止、``/approval`` 回应授权，"
-            "连 ``approval.request`` 都对得上 opencode 的 ``permission.asked``。"
-            "但那些是**读来的，没对着真机验过一次** —— 而 11.8.1 的教训正是"
-            "「照文档接线、字段名对不上时不报错、闸门静默失效」。"
-            "要接它：先起 `hermes gateway`（需 `API_SERVER_ENABLED=true` "
-            "与 `API_SERVER_KEY`），按设计文档 11.10.8 那组验收判据逐项实测，"
-            "再回来填这几个函数并把 `verified` 改成 True。"
-        )
+#: hermes run 事件名 → 内部事件名。**只翻译我们真正处理的那些。**
+#:
+#: 来源是**本机 hermes 源码**（``gateway/platforms/api_server_runs.py``）：
+#: 每个 SSE 帧是 ``_run_event(run_id, name, **fields)`` = ``{"event": name,
+#: "run_id", "timestamp", **fields}``；事件名取 ``obj["event"]``。
+#:
+#: 翻译对齐 opencode 的分布（V1 实测定下、ask/delegate 读的就是这些内部名）：
+#:
+#: - ``message.delta``（载荷 ``delta=`` 增量）→ ``message.part.delta``，
+#:   于是 :func:`~freeagent.services.ask._delta_from_part` 原样复用。
+#: - ``tool.completed`` → ``tool``：ask 数轮次只数 ``kind == "tool"``
+#:   （11.10.4），一次工具调用计一次。刻意**只**把完成事件映射成 ``tool``，
+#:   ``tool.started`` 只给进度卡（delegate 认得任意 kind）—— 与 V2 同一条
+#:   纪律：一次调用只能计一次。
+#: - ``approval.request`` → ``permission.asked``：/ask 遇它即中止（只读配置
+#:   下不该有任何授权请求）。⚠️ **V1.81 真机证伪了「unattended deny 让危险
+#:   命令直接拒、approval.request 本不该出现」的假设**：hermes 的审批闸是
+#:   「按模式标记」，``del`` / 简单 ``write_file`` 不在危险清单里，**根本不进
+#:   这个闸**、也不发 approval.request，直接执行。所以 approval.request 真出现
+#:   只是「连被标记的动作都没挡住」的更糟情况，ask 依然中止报错，但这道闸
+#:   拦不住**未标记**的 file/terminal 操作（见模块 docstring 的 V1.81 处置）。
+#: - ``run.completed`` → ``session.idle``（权威结束信号）；``run.failed`` →
+#:   ``session.error``；``run.cancelled`` → ``session.idle``（被叫停不是失败，
+#:   保留已拿到的部分；ask 主动中止时早已 return，正常不会走到它）。
+_HERMES_EVENT_MAP: dict[str, str] = {
+    "message.delta": "message.part.delta",
+    "tool.completed": "tool",
+    "tool.started": "tool.started",
+    "approval.request": "permission.asked",
+    "run.completed": "session.idle",
+    "run.failed": "session.error",
+    "run.cancelled": "session.idle",
+}
 
-    return _raise
 
+def _hermes_event_name(obj: Any) -> str | None:
+    """hermes 帧里取事件名。**类型不对就返回 ``None``**，由调用方丢掉。
+
+    hermes 的事件名在帧 JSON 的 ``event`` 字段（``_run_event`` 的 name），
+    **不在** ``type`` —— 与 opencode 两版都不一样，所以不能复用
+    :func:`_v1_event_type`。
+    """
+    if not isinstance(obj, dict):
+        return None
+    kind = obj.get("event")
+    return kind if isinstance(kind, str) and kind else None
+
+
+def _hermes_parse_event(obj: Any) -> tuple[str, Any] | None:
+    """hermes 的一帧 → ``(内部事件名, 归一化后的载荷)``。
+
+    hermes 的载荷键与 opencode 不同（``delta`` / ``tool`` 在**顶层**，而
+    opencode 的 ``message.part.delta`` 在 ``properties`` / ``data`` 里）。
+    所以这里不仅改事件名，还要把载荷折成调用方认的形状 —— 只改名不改形状，
+    症状是「事件到了、内容读不到」（与 V2 同一条纪律）。
+
+    ``message.delta`` 的载荷折成 ``{"delta": ...}``：ask 的
+    ``_delta_from_part`` 读的就是 ``props["delta"]``，这样 ask 一行不用改。
+    ``tool.completed`` / ``tool.started`` 折成 ``{"tool": name}``：delegate 的
+    ``tool_event_label`` 读 ``props["tool"]``。
+    """
+    kind = _hermes_event_name(obj)
+    if kind is None:
+        return None
+    mapped = _HERMES_EVENT_MAP.get(kind)
+    if mapped is None:
+        # 不翻译的（reasoning.available / approval.responded / run.steered 等）
+        # 原样透传也认不得 —— 直接丢掉。ask 只关心上面的子集。
+        return None
+
+    if mapped == "message.part.delta":
+        delta = obj.get("delta")
+        if not isinstance(delta, str):
+            return None
+        return mapped, {"delta": delta}
+
+    if mapped in ("tool", "tool.started"):
+        name = obj.get("tool")
+        if not isinstance(name, str) or not name:
+            return None
+        return mapped, {"tool": name}
+
+    if mapped == "session.error":
+        # ``run.failed`` 带 ``error`` 字段（真机实测，如模型到期/余额不足的
+        # HTTP 404）。折进 ``{"message": ...}`` 让 ask 能报出真话 ——
+        # 笼统的「执行器报错」对用户没用（详见 ask 的 session.error 分支）。
+        error = obj.get("error")
+        if isinstance(error, str) and error:
+            return mapped, {"message": error}
+        return mapped, None
+
+    # 其余（permission.asked / session.idle）载荷不解析 —— ask 要么中止要么
+    # 结束，不读载荷。
+    return mapped, None
+
+
+def _hermes_build_read_only_config() -> dict[str, Any]:
+    """hermes 的**只读**「配置」。
+
+    hermes **没有** opencode 那种「按工具名写 permission 配置」的面 ——
+    它的闸门是 profile 三档（manual/smart/off）+ run 级授权端点，而 /ask
+    要的「根本改不了」**做不到**（V1.81 真机证伪初稿）：``approvals.mode``
+    只决定**已被判为危险**的动作怎么处理，不会把更多动作标记为危险 ——
+    ``del`` / 简单 ``write_file`` 不在危险清单里，API 面与飞书面都会直接执行
+    而不弹审批（manual + 重启也拦不住）。所以 hermes 只能作知识问答、不能当
+    可执行器开放，``/ask hermes`` 的回话常驻安全警示。这里返回空字典 ——
+    任何试图按 opencode 那套拼配置的代码会立刻拿到空而炸掉，而不是拿到一份
+    无效映射。
+
+    为什么用「空」而不是拒绝：``ask_executor`` 无条件调
+    :func:`~freeagent.services.opencode_server.read_only_permission_config`
+    （= 当前适配器的 ``build_read_only_config()``）并把结果传给 make_server。
+    对 hermes，那个值**不会被使用**（:class:`~freeagent.services.hermes_client.HermesClient`
+    忽略它），所以返回空而不是抛，好让 /ask hermes 的正常路径能跑通。
+    """
+    return {}
+
+
+def _hermes_build_permission_config() -> dict[str, Any]:
+    """hermes 的委派 permission 配置：**没有**。
+
+    hermes **不可委派**（11.10.8，unattended 面做不了执行期逐次授权），所以
+    「委派用的 permission 配置」这个功能对她不存在。返回空 + 由调用方判断
+    不可派发 —— 不要试图给一份「看起来合理」的配置（那会暗示能委派）。
+    """
+    return {}
+
+
+def _hermes_parse_request(_props: Any) -> ToolPermission | None:
+    """hermes 的授权请求解析：**不适用**。
+
+    hermes 只走 /ask，而 /ask 对 ``permission.asked`` 一律中止（只读配置下
+    不该有任何授权请求）—— 从**不**调 ``parse_request``。所以这里返回
+    ``None``（不是能回应的请求）。不试图去读 hermes 的 ``approval.request``
+    载荷：那是委派那条线的功能，hermes 没有。
+    """
+    return None
+
+
+def _hermes_build_reply(decision: str) -> dict[str, str]:
+    """hermes 的授权答复载荷：**不存在**（不委派就不回授权）。"""
+    raise ValueError(
+        f"hermes 不可委派，没有授权答复可发（收到 decision={decision!r}）"
+    )
+
+
+def _hermes_parse_question(_props: Any) -> ToolQuestion | None:
+    """hermes 的提问解析：**不适用**（不委派就不回提问）。"""
+    return None
+
+
+def _hermes_build_question_reply(
+    _answers: Sequence[Sequence[str]],
+) -> dict[str, Any]:
+    """hermes 的提问答复载荷：**不存在**（不委派就不回提问）。"""
+    raise ValueError("hermes 不可委派，没有提问答复可发")
+
+
+def _hermes_run_id_of(raw: Any) -> str | None:
+    """POST /v1/runs → run id。
+
+    真机实测（判据 5）：响应是 ``{"run_id": "run_…", "status": "started"}`` ——
+    字段名是 ``run_id``，**不是** ``id``。别再猜成 opencode 的 ``session_id``。
+    ``HermesClient`` 其实不用它（它直接拿 POST 的响应体取 run id），这里只是
+    占住 ExecutorApi 的字段 —— hermes 不走 OpenCodeServer 的 ``create_session``。
+    """
+    if isinstance(raw, dict):
+        cand = raw.get("run_id") or raw.get("id")
+        return cand if isinstance(cand, str) and cand else None
+    return None
+
+
+def _hermes_prompt_calls(
+    _session_id: str, _brief: str, _model: str, _agent: str, _variant: str
+) -> list[HttpCall]:
+    """hermes 的 prompt 链路：**不走 OpenCodeServer.prompt_async**。
+
+    hermes 的 run 是「提交即运行」：prompt 在 ``POST /v1/runs`` 的请求体里，
+    没有 opencode 那种「先建空会话、再发 prompt」的拆分。所以这个函数
+    （给 OpenCodeServer 用）对 hermes **不会被执行** —— HermesClient 自己
+    拼 ``/v1/runs``。这里返回空 + 抛，避免有人误以为能拿它发 prompt。
+    """
+    raise ValueError("hermes 的 prompt 随 /v1/runs 一起提交，不走 prompt_calls")
+
+
+def _hermes_abort_path(run_id: str) -> str:
+    """中止：``POST /v1/runs/{id}/stop``（源码确认的路径）。"""
+    return f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/stop"
+
+
+def _hermes_directory_query(_directory: str) -> str:
+    """hermes 无「限目录」概念（它的工作目录随 gateway 配置走）。"""
+    return ""
+
+
+def _hermes_normalize_projects(_responses: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """hermes 不委派，无项目目录（那是委派选目录用的）。"""
+    return []
+
+
+def _hermes_normalize_agents(_responses: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """hermes 不委派，无工作模式列表。"""
+    return []
+
+
+def _hermes_normalize_models(_responses: Mapping[str, Any]) -> dict[str, Any]:
+    """hermes 不委派，无模型目录。"""
+    return {}
+
+
+def _hermes_deny_reply(_sid: str, _rid: str, _decision: str) -> HttpCall:
+    raise ValueError("hermes 不可委派，没有授权答复端点")
+
+
+def _hermes_deny_question(
+    _sid: str, _rid: str, _answers: Sequence[Sequence[str]]
+) -> HttpCall:
+    raise ValueError("hermes 不可委派，没有提问答复端点")
+
+
+#: hermes API Server 的 HTTP 面（路径与事件翻译）。
+#:
+#: ⚠️ **只有 ``ready_path`` 与 ``parse_event`` 会被真正使用** —— 二者分别
+#: 供「就绪探针」与 ``HermesClient.events()`` 用。其余字段（session/目录/授权/
+#: 提问）是 :class:`ExecutorApi` 为 opencode 那条「起进程 → 建会话 → 委派」的
+#: 生命周期设计的，而 hermes **不走 OpenCodeServer**（它是**连一个已常驻的
+#: gateway**，不是起一个隔离进程）。所以那些字段要么占位、要么抛，且都注明
+#: 「不适用」。把空壳留在 dataclass 里而不是拆掉 ExecutorApi，是为了
+#: 「parse_event 该住在哪」只有一个答案（适配器），换执行器时协议知识仍只
+#: 在一处。
+HERMES_API = ExecutorApi(
+    ready_path="/v1/capabilities",
+    session_create_path="/v1/runs",        # 不被 OpenCodeServer 使用
+    session_id_of=_hermes_run_id_of,       # 不被 OpenCodeServer 使用
+    prompt_calls=_hermes_prompt_calls,     # 不被 OpenCodeServer 使用
+    events_path="/v1/runs/{run_id}/events",  # HermesClient 自己拼 run_id
+    permission_reply=_hermes_deny_reply,
+    question_reply=_hermes_deny_question,
+    abort_path=_hermes_abort_path,         # HermesClient 用它
+    directory_query=_hermes_directory_query,
+    permission_pending_path="",
+    question_pending_path="",
+    projects_paths=(),
+    normalize_projects=_hermes_normalize_projects,
+    agents_paths=(),
+    normalize_agents=_hermes_normalize_agents,
+    models_paths=(),
+    normalize_models=_hermes_normalize_models,
+    parse_event=_hermes_parse_event,       # HermesClient.events() 用它
+    reply_needs_session=False,
+    catalog_lag_seconds=0.0,
+)
+
+
+# ── hermes（**已接线 /ask**：判据 1-3 真机验过，其余见文档 11.10.8）────────
+#
+# ## 它有**两个**接口面，别只看一个
+#
+# 1. **ACP**（``hermes acp`` / ``acp_adapter.entry``）—— stdio 上的 JSON-RPC
+# 2. **API Server**（``hermes gateway`` 起的 HTTP 端点，默认 8642）
+#    —— **OpenAI 兼容**的 ``POST /v1/chat/completions``，以及
+#    一组**有状态**的 run 端点：``POST /v1/runs``、
+#    ``GET /v1/runs/{id}/events``（SSE）、``POST /v1/runs/{id}/stop``、
+#    ``POST /v1/runs/{id}/approval``，能力面见 ``GET /v1/capabilities``
+#    （``run_submission`` / ``run_events_sse`` / ``run_stop`` / ``run_approval``）。
+#
+# ## 所以「接第二个执行器」比想象中容易，但仍然只能接 /ask
+#
+# 值得高兴的那半：走 **API Server** 那条面，形状与 opencode **同构** ——
+# 同为 HTTP + SSE，同样「建会话 → 流式读数 → 中止 → 回应授权」，连授权事件
+# 都对得上（opencode ``permission.asked`` ↔ hermes ``approval.request``）。
+# **不需要引 ACP SDK，也不需要换传输层**：本仓给 opencode 用的就是标准库
+# ``urllib``，给 hermes 也一样（见 :mod:`freeagent.services.hermes_client`）。
+#
+# 仍然只能接 /ask 的那半：V1.81 真机确认 hermes 的审批闸是**「按模式标记」
+# 而非「每动作确认」** —— ``approvals.mode`` 只决定**已被判为危险**的动作
+# 怎么处理，不会把更多动作标记为危险。实测 ``del`` / 简单 ``write_file`` 到
+# 普通路径**不在危险清单里**，API 面与飞书面都会**直接执行而不弹审批**
+# （``approvals.mode: manual`` + 重启 gateway 也一样，``file_created: True``、
+# 无 ``approval.request``）。所以这条面**做不了 11.8 委派，连「只读改不了」都
+# 保证不了** —— 只能当知识问答执行器（``/ask`` + 常驻安全警示），不能开放
+# 执行。执行 + 飞书确认走 opencode（FreeAgent 全控）。
+#
+# ## 一个反向结论：这条面**走不了 11.8 委派**
+#
+# 所以 ``verified`` 与 ``dispatchable`` 在这里**分开了**：
+#
+# - ``verified = True`` —— /ask 这条线对着真机验过（判据 1 面自证、判据 3
+#   unattended deny，及事件名从本机源码确认）。
+# - ``dispatchable = False`` —— 不能进 11.8 委派闸门（11.10.8）。
+#
+# 这与 19.4 的领域划分对得上 —— 编程走 opencode（有逐次授权、能委派），
+# 办公走 hermes（问答）。不是妥协，是两个执行器的能力面本来就不一样。
+#
+# > ⚠️ 另一条**绝不能走**的捷径：直接把 hermes 当 OpenAI 兼容后端来问
+# > （``/v1/chat/completions``）。那条面**工具已在服务端执行完毕**，
+# > 回放出来的 ``function_call`` 一律是 ``"status": "completed"`` ——
+# > 也就是说 agent 已经动过 terminal 和文件系统了，本仓**看不到也拦不住**。
+# > 那等于绕开 11.8 的全部闸门，而症状只是「能用」。``/ask hermes`` 走的是
+# > 有状态的 ``/v1/runs``，不是这条捷径。
 
 _HERMES_0 = ExecutorAdapter(
     executor="hermes",
     major=0,
-    verified=False,
+    verified=True,
+    dispatchable=False,     # 只 /ask，不委派（见上方 docstring）
+    disabled=True,          # V1.83 停用：审批闸失效，FreeAgent 不再把它当执行器；
+                            # 代码保留作接缝，修好审批可改回 False 重新启用。
     field_names=HERMES_FIELD_NAMES,
-    build_permission_config=_hermes_unverified("permission 配置形状"),
-    build_read_only_config=_hermes_unverified("只读配置形状"),
-    parse_request=_hermes_unverified("授权请求事件形状"),
-    build_reply=_hermes_unverified("答复载荷形状"),
-    parse_question=_hermes_unverified("提问事件形状"),
-    build_question_reply=_hermes_unverified("提问答复载荷形状"),
-    # **没有** HTTP 面：它要走的是 stdio JSON-RPC，与 opencode 不是同一种
-    # 接法。``None`` 让任何试图把它当 opencode 来接的代码立刻炸掉。
-    api=None,
+    build_permission_config=_hermes_build_permission_config,
+    build_read_only_config=_hermes_build_read_only_config,
+    parse_request=_hermes_parse_request,
+    build_reply=_hermes_build_reply,
+    parse_question=_hermes_parse_question,
+    build_question_reply=_hermes_build_question_reply,
+    # HTTP 面：走 API Server（``/v1/runs`` + SSE）。只读问答那条线
+    # （ready_path / parse_event / abort_path）是给 HermesClient 用的；
+    # 其余字段是不被使用的外壳（见 ``HERMES_API`` 的 docstring）。
+    api=HERMES_API,
 )
 
 
@@ -1494,7 +1823,8 @@ def known_executors() -> tuple[str, ...]:
     而不是另写一份常量：两份清单迟早会漂移，而漂移的方向是「探针说没有、
     注册表里其实有」。
 
-    注意「知道」不等于「能派」：hermes 在列，但它 ``verified=False``。
+    注意「知道」不等于「能派」：hermes 在列，但它 ``dispatchable=False``
+    （只 /ask，不委派）。
     """
     seen: dict[str, None] = {}
     for a in _ADAPTERS:
@@ -1518,15 +1848,24 @@ def all_adapters(executor: str = "opencode") -> tuple[ExecutorAdapter, ...]:
 def known_majors(executor: str = "opencode") -> tuple[int, ...]:
     """本仓知道的（不是**支持的**）主版本，升序。
 
-    「知道」与「支持」是两个概念。现行的例子是 hermes：我们知道它存在、
-    也读得懂它的文档，但一次真机都没验过，所以它**不能**被派发。
+    「知道」与「支持」是两个概念。现行的例子是 hermes：它 /ask 那条线已
+    验证接线，但 ``dispatchable=False`` —— 它不能**被派发**（11.10.8）。
     """
     return tuple(a.major for a in all_adapters(executor))
 
 
 def dispatchable_majors(executor: str = "opencode") -> tuple[int, ...]:
-    """可派发的（``verified=True``）主版本，升序。版本闸门只放行这些。"""
-    return tuple(a.major for a in all_adapters(executor) if a.verified)
+    """可**委派**的（``dispatchable=True`` 且未停用）主版本，升序。版本闸门只放行这些。
+
+    ``dispatchable`` 与 ``verified`` 分开（见 :class:`ExecutorAdapter` 的字段
+    说明）：一个执行器可能只验过 /ask 这条线（hermes），那它 ``verified``
+    为真、但**不可委派**，也就进不了这份清单。**停用的执行器（``disabled``）
+    也绝不进这份清单** —— 即便有人把停用适配器的 ``dispatchable`` 误写成
+    True，闸门也不该放行（V1.83 防御）。
+    """
+    return tuple(
+        a.major for a in all_adapters(executor) if a.dispatchable and not a.disabled
+    )
 
 
 def adapter_for(major: int | None, executor: str = "opencode") -> ExecutorAdapter | None:

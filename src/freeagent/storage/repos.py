@@ -18,6 +18,7 @@ from ..domain import (
     ArtifactStatus,
     CapturedItem,
     CapturedStatus,
+    CareArea,
     ConflictError,
     Contact,
     ContactKind,
@@ -78,6 +79,7 @@ _TASK_COLUMNS = (
     "delegate_chat_id",
     "delegate_requested_by",
     "current_artifact_id",
+    "origin",
 )
 
 _TASK_INSERT_COLUMNS = ("id",) + _TASK_COLUMNS
@@ -748,6 +750,7 @@ class TaskRepo(_RepoBase):
             delegate_chat_id=row["delegate_chat_id"],
             delegate_requested_by=row["delegate_requested_by"],
             current_artifact_id=row["current_artifact_id"],
+            origin=row["origin"],
         )
 
     def _task_params(self, task: Task) -> tuple[object, ...]:
@@ -778,6 +781,7 @@ class TaskRepo(_RepoBase):
             task.delegate_chat_id,
             task.delegate_requested_by,
             task.current_artifact_id,
+            task.origin,
         )
 
 
@@ -1440,6 +1444,132 @@ class DailyDigestRepo(_RepoBase):
                 " VALUES (?, ?)",
                 (day, ts.isoformat()),
             )
+
+
+class LeaseRepo(_RepoBase):
+    """委派租约（V1.94 / 设计文档 12.11.3）。**只存取，不判断。**
+
+    「这条租约算不算过期」「过期意味着什么」都不在这里 —— 判过期要读方
+    的时钟（执行器、REPL、WEB 各有一个 now），把阈值写进存储层就等于让
+    存储层知道有谁在读它。这里只给 ``expires_at``。
+    """
+
+    def get(self, task_id: str) -> dict[str, str] | None:
+        row = self._conn.execute(
+            "SELECT task_id, owner, acquired_at, expires_at"
+            " FROM dispatch_leases WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def acquire(
+        self, task_id: str, *, owner: str, acquired_at: datetime, expires_at: datetime
+    ) -> None:
+        """占一条。**覆盖写**：同一条事务只允许一个租约，后占的顶掉先占的。
+
+        为什么允许覆盖而不是「已存在就拒绝」：派发前 ``already_dispatched``
+        已经把「正在跑」的挡在门外，能走到这里说明判定放行了；而放行的
+        正当理由之一恰恰是**上一条租约已过期**（失联）。这时若拒绝写入，
+        重启后的派发会永远写不进租约 —— 那正是「一次崩溃 = 一条死事务」
+        要修的那个坑。
+        """
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO dispatch_leases"
+                " (task_id, owner, acquired_at, expires_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(task_id) DO UPDATE SET"
+                " owner=excluded.owner, acquired_at=excluded.acquired_at,"
+                " expires_at=excluded.expires_at",
+                (task_id, owner, acquired_at.isoformat(), expires_at.isoformat()),
+            )
+
+    def release(self, task_id: str) -> None:
+        """放掉。**幂等**：正常收口与异常收口都会调一遍。"""
+        with self._tx():
+            self._conn.execute(
+                "DELETE FROM dispatch_leases WHERE task_id = ?", (task_id,)
+            )
+
+    def all(self) -> dict[str, dict[str, str]]:
+        rows = self._conn.execute(
+            "SELECT task_id, owner, acquired_at, expires_at FROM dispatch_leases"
+        ).fetchall()
+        return {str(r["task_id"]): dict(r) for r in rows}
+
+
+class CareRepo(_RepoBase):
+    """人生角色关注面（V1.68 / 设计文档 11.24）。
+
+    **只做存储，不做业务判断**：``next_due`` 是下次该看的 ISO 日期，
+    cadence 怎么解析、到期怎么推，全在 :class:`CareService`。
+    ``roll_to_next`` 是唯一的写改动 —— 「看了」之后把 ``next_due``
+    推到下个周期（关注面不因看完而消失）。
+    """
+
+    def add(
+        self,
+        role_id: str,
+        text: str,
+        cadence: str,
+        next_due: date,
+        now: datetime,
+    ) -> CareArea:
+        care_id = new_id()
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO role_cares (id, role_id, text, cadence, next_due, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    care_id,
+                    role_id,
+                    text,
+                    cadence,
+                    _d_out(next_due),
+                    _dt_out(now),
+                ),
+            )
+        return CareArea(
+            id=care_id, role_id=role_id, text=text, cadence=cadence,
+            next_due=next_due, created_at=now,
+        )
+
+    def list_all(self) -> list[CareArea]:
+        """全部关注面，按**创建序**（最早的先列，同 ``list_pending``）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM role_cares ORDER BY created_at ASC, rowid ASC"
+        ).fetchall()
+        return [self._row_to_care(r) for r in rows]
+
+    def due_on(self, day: date) -> list[CareArea]:
+        """``next_due`` 恰好落在 ``day`` 的关注面。"""
+        rows = self._conn.execute(
+            "SELECT * FROM role_cares WHERE next_due = ?", (_d_out(day),)
+        ).fetchall()
+        return [self._row_to_care(r) for r in rows]
+
+    def roll_to_next(self, care_id: str, next_due: date, now: datetime) -> CareArea:
+        """「看了」之后把 ``next_due`` 推到下个周期。不校验存在性 ——
+        调用方（服务层）已先按序号定位。"""
+        with self._tx():
+            self._conn.execute(
+                "UPDATE role_cares SET next_due = ? WHERE id = ?",
+                (_d_out(next_due), care_id),
+            )
+        row = self._conn.execute(
+            "SELECT * FROM role_cares WHERE id = ?", (care_id,)
+        ).fetchone()
+        return self._row_to_care(row)
+
+    def _row_to_care(self, row: sqlite3.Row) -> CareArea:
+        return CareArea(
+            id=row["id"],
+            role_id=row["role_id"],
+            text=row["text"],
+            cadence=row["cadence"],
+            next_due=_d_in(row["next_due"]),
+            created_at=_dt_in(row["created_at"]),
+        )
 
 
 def _replace(obj: _T, **changes: object) -> _T:

@@ -136,4 +136,6 @@ class TestMigration:
             " WHERE type='table' AND name='daily_digests'"
         ).fetchone()
         assert row is not None, "daily_digests 表应已建出"
-        assert SCHEMA_VERSION == 20
+        # 这条断言跟着 SCHEMA_VERSION 走（v26 = dispatch_leases，V1.94）
+        # —— 它守的是「表建得出来且版本号对得上」，不是具体哪个数。
+        assert SCHEMA_VERSION == 26

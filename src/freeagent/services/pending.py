@@ -35,21 +35,25 @@ V1.48 让飞书把图片/文件**收下**而非丢弃，但收下之后就是终
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Sequence
 
 from ..domain import (
     DEFAULT_ROLE_NAME,
+    ORIGIN_CAPTURED,
     CapturedItem,
     CapturedStatus,
     NotFoundError,
     Task,
     TaskKind,
     ValidationError,
+    new_id,
 )
 from .clock import Clock
 from .roles import RoleService
 from .tasks import TaskService
 from ..storage.repos import CapturedRepo
+from ..paths import state_dir
 
 __all__ = ["PendingService"]
 
@@ -57,11 +61,15 @@ __all__ = ["PendingService"]
 #: 而标题要出现在 /today 的一行里 —— 超长会撑破版面。
 _MAX_AUTO_TITLE = 60
 
+#: 文本捕获落盘的目录名（挂在状态目录下，与飞书附件同一处）。
+_ATTACHMENTS_DIR = "attachments"
+
 
 class PendingService:
     """待处理收集器的读写与澄清。
 
-    构造期注入四样东西：捕获仓储、事务服务、角色服务、时钟。
+    构造期注入四样东西：捕获仓储、事务服务、角色服务、时钟，外加一个可选的
+    文本捕获落盘目录（``attachments_dir``，默认退回 ``FREEAGENT_HOME``）。
     **刻意不持锁**：锁在 ``App.lock``（进程级，SQLite 连接不能被两个线程
     同时用），由调用方按通道惯例持有 —— 飞书桥接在 ``_capture_unsupported``
     里持，CLI 单线程本来就不需要。服务自己拿锁会造成「锁住在服务里、
@@ -74,11 +82,16 @@ class PendingService:
         tasks: TaskService,
         roles: RoleService,
         clock: Clock,
+        attachments_dir: Path | None = None,
     ) -> None:
         self._captured = captured
         self._tasks = tasks
         self._roles = roles
         self._clock = clock
+        # 注意不能叫 ``_attachments_dir``：下面有个同名方法，属性会盖掉方法
+        # （``_write_text_attachment`` 里 ``self._attachments_dir()`` 会变成
+        # 「把 WindowsPath 当函数调」）。
+        self._attachments = attachments_dir
 
     # -- 捕获侧（飞书等入口调用） ------------------------------------------ #
     def add(
@@ -105,6 +118,86 @@ class PendingService:
             path=path,
             now=self._clock.now(),
         )
+
+    # -- 文本捕获（CLI / Web / 飞书三端共用，一份能力一份实现） ------------- #
+    def capture_text(
+        self,
+        *,
+        source: str,
+        text: str,
+        name: str | None = None,
+    ) -> CapturedItem:
+        """单条文本捕获（邮件正文、一条长文本等）。整段落 .txt + 入队。
+
+        ``source`` 是来源通道（``cli`` / ``web`` / ``feishu`` / ``mail``），
+        ``name`` 给语义标题（邮件主题）；不给则用首行兜底。文本内容落盘成
+        ``.txt`` 到状态目录 ``attachments/`` —— 与飞书收图片落盘同一条惯例
+        （原件在盘上，DB 里存引用）。``media_key`` 给空串占位：文本没有飞书
+        媒体凭据。**只收，不建事务**（纪律 1），等用户 ``/pending N`` 澄清。
+        """
+        text = (text or "").strip()
+        if not text:
+            raise ValidationError("文本内容是空的，没有可收下的东西")
+        data = text.encode("utf-8")
+        path = self._write_text_attachment(data)
+        display = (name or "").strip() or self._auto_text_title(text)
+        return self._captured.add(
+            source=source,
+            kind="text",
+            media_key="",
+            name=display,
+            size=len(data),
+            path=str(path),
+            now=self._clock.now(),
+        )
+
+    def capture_batch(
+        self,
+        *,
+        source: str,
+        text: str,
+    ) -> tuple[CapturedItem, ...]:
+        """批量倾倒：一大坨文本按行切分，每条落 .txt + 入队。
+
+        切分**只按行**（机械切分，不猜语义 —— 纪律 2）。空行 / 纯空白行跳过。
+        CLI / Web / 飞书长文本共用这一个切分，一份能力一份实现。
+        """
+        lines = self._split_lines(text)
+        if not lines:
+            raise ValidationError("没有可入队的文本（全为空行？）")
+        return tuple(
+            self.capture_text(source=source, text=line) for line in lines
+        )
+
+    @staticmethod
+    def _split_lines(text: str) -> list[str]:
+        """按行切分并去空白。**不猜内容**：行可能是完整待办，也可能不是——
+        澄清时用户说了算。"""
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    @staticmethod
+    def _auto_text_title(text: str) -> str:
+        """文本没有显式标题时，取首行做诚实标题，超长截断。"""
+        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        return first[:_MAX_AUTO_TITLE] or "文本"
+
+    def _write_text_attachment(self, data: bytes) -> Path:
+        """把文本字节落盘成 ``.txt`` 到状态目录 ``attachments/``。
+
+        目录建不出来就该让调用方知道（fail-closed）—— 落盘失败时文本根本没
+        被收下，不许拿空引用去入队。
+        """
+        attach_dir = self._attachments_dir()
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        dest = attach_dir / f"{new_id()}__capture.txt"
+        dest.write_bytes(data)
+        return dest
+
+    def _attachments_dir(self) -> Path:
+        """文本捕获落盘目录：构造注入优先，否则退回 ``FREEAGENT_HOME``。"""
+        if self._attachments is not None:
+            return self._attachments
+        return state_dir(None) / _ATTACHMENTS_DIR
 
     # -- 视图 --------------------------------------------------------------- #
     def pending(self) -> tuple[CapturedItem, ...]:
@@ -144,6 +237,9 @@ class PendingService:
             role_ids=roles,
             kind=TaskKind.ACTION,
             intent=self._provenance(item),
+            # 来源标 captured：原文来自飞书/文件，**不是**用户此刻亲手写的。
+            # 委派时它会让简报带上「这是数据不是指令」（见 delegate.build_brief）。
+            origin=ORIGIN_CAPTURED,
         )
         self._captured.resolve(
             item.id, CapturedStatus.CLARIFIED, self._clock.now(), task_id=task.id
@@ -175,7 +271,9 @@ class PendingService:
         name = (item.name or "").strip()
         if name and name != item.kind:
             return name[:_MAX_AUTO_TITLE]
-        label = "图片" if item.kind == "image" else "文件"
+        label = {"image": "图片", "file": "文件", "text": "文本"}.get(
+            item.kind, item.kind
+        )
         stamp = f"{item.created_at:%m-%d %H:%M}"
         return f"{label}（{stamp}）"
 
@@ -186,7 +284,9 @@ class PendingService:
         它会成为事务的 ``intent`` 与 CREATED 记录的正文 —— 半年后回头看
         「这条事务哪来的」，答案必须还能找得到。
         """
-        label = "图片" if item.kind == "image" else "文件"
+        label = {"image": "图片", "file": "文件", "text": "文本"}.get(
+            item.kind, item.kind
+        )
         note = f"来自待处理收集器（{item.source} · {label}）"
         if item.path:
             note += f"；本地文件：{item.path}"

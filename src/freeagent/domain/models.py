@@ -116,6 +116,14 @@ class WaitingOn:
         return base
 
 
+#: ``Task.origin`` 的取值。
+#:
+#: **空不在其中** —— 空是「未记」，不是第三种来源。把它并进这张表就等于
+#: 给「不知道」编一个答案（同 ``decided_via`` 空值那条纪律）。
+ORIGIN_SELF = "self"
+ORIGIN_CAPTURED = "captured"
+
+
 @dataclass(frozen=True, slots=True)
 class Task:
     """一件事务。
@@ -183,6 +191,14 @@ class Task:
     #: 那等于凭空造一个越权面。
     delegate_requested_by: str | None = None
     current_artifact_id: str | None = None
+    #: 这条需求的原文**是谁给的位置**：``"self"`` = 本人直接写的，
+    #: ``"captured"`` = 从待处理收集器澄清来的（内容来自飞书消息、转发文件、
+    #: 别人发来的东西）。**空 = 未记**，不当作 ``"self"``。
+    #:
+    #: 它管的不是位置，是**权威**：``captured`` 的原文对执行器没有发令资格，
+    #: 哪怕它写着「忽略之前的指示」。所以简报里要带一句「这是数据不是指令」——
+    #: 而判定必须靠这一列，不能靠 ``intent`` 的措辞（那是字符串匹配当契约）。
+    origin: str | None = None
 
     @property
     def is_open(self) -> bool:
@@ -294,6 +310,33 @@ class Contact:
     @property
     def is_merged(self) -> bool:
         return self.merged_into is not None
+
+
+@dataclass(frozen=True, slots=True)
+class CareArea:
+    """人生角色关注面（设计文档 11.24 / V1.68）。
+
+    **它是什么**：我作为某个角色「该周期性关心的东西」。角色是「我是谁」
+    的维度（爸爸 / 儿子 / 企业家 / 高管…），关注面是「这个角色该看的」——
+    「孩子的作业和状态」「父母的身体」「公司本月现金流」「那个项目的进展」。
+
+    **它为什么不是事务**：事务是「做完了就消失」的待办；关注面是**持续
+    责任** —— 不因看了一眼而结束，看完推到下个周期再来。它回答的是
+    「我该关心什么」，不是「我该做什么」。:meth:`CareService` 到点把它
+    并进每日总览提醒（只提醒自己、绝不代发，同 11.21）。
+
+    ``cadence`` 形如 ``weekly:5``（每周五）/ ``monthly:1``（每月 1 号）。
+    ``next_due`` 是下次该看的 ``YYYY-MM-DD``，由 cadence 现算。
+    """
+
+    id: str
+    role_id: str
+    #: 关注面一句话。给列表看的，不是自由文本块。
+    text: str
+    cadence: str
+    #: 下次该看的日期（ISO）。
+    next_due: date
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

@@ -345,12 +345,15 @@ class TestToolCardThreadsUnderProgressCard:
         # 也**不该**有 receive_id —— 那一栏在 reply 路径没有意义。
         assert "receive_id" not in tr.business_calls[-1]["payload"]
 
-    def test_reply_in_thread_is_false(self) -> None:
-        """``reply_in_thread`` 给 False。
+    def test_reply_in_thread_is_true(self) -> None:
+        """``reply_in_thread`` 给 **True** —— 授权卡进话题（V1.90）。
 
-        true 会把**被回复的那条也拖进话题串**，而私聊没有话题 —— 于是
-        进度卡自己被卷进话题，用户要找它反而更麻烦。给 False 才是普通的
-        「回复」，卡片留在原位、位置不动。
+        旧断言是 False，理由「私聊没有话题，true 会把被回复的那条也拖进
+        话题串」。``tools/probe_topic.py`` 真机七项全绿把前提推翻了：
+        私聊可以开话题，且**根就是被回复的那条**（也就是进度卡）——
+        进度卡自己留在主聊天流，进话题的只有挂在它下面的授权/提问卡。
+
+        所以 true 不是副作用，而是目的：一次委派一个话题，审批不串台。
         """
         tr = _Transport('{"code":0,"data":{"message_id":"om_r"}}')
         sender = _make_sender(tr)
@@ -358,7 +361,7 @@ class TestToolCardThreadsUnderProgressCard:
             open_id=WHO, subject="s", detail="d", credential="c",
             ttl_seconds=600, reply_to="om_anchor",
         )
-        assert tr.business_calls[-1]["payload"]["reply_in_thread"] is False
+        assert tr.business_calls[-1]["payload"]["reply_in_thread"] is True
 
     def test_empty_reply_to_falls_back_to_send(self) -> None:
         """**空锚点必须退回原路径** —— 闸门不许因为想好看而失效。

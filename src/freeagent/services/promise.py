@@ -168,6 +168,19 @@ class PromiseService:
         """按名字找，**找不到返回 None**（不建）。给「查一下」用。"""
         return self._contacts.get_by_name(name.strip())
 
+    def mentioned_contacts(self, text: str) -> tuple[Contact, ...]:
+        """文本里提到的**已登记**关系对象（建事务的「顺势提示」用）。
+
+        **只认已登记的名字，零误判**：没登记过的称谓词（张总还没 /contact
+        建关系）不提示 —— 等用户建了，再提它就提示「可挂账」。这守 11.19
+        「只显式触发绝不静默推断」：我们**不猜**谁是关系人（"周三"这种
+        既可能是日期又可能是人的会被误判），只提醒「你已经有这个人了」。
+        顺序按登记序，稳定可测。
+        """
+        return tuple(
+            c for c in self._contacts.list_all() if c.name and c.name in text
+        )
+
     def set_contact_note(self, contact_id: str, note: str | None) -> Contact:
         """给关系对象写自由文本（「怎么找他」「答应了什么」）。
 

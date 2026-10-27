@@ -32,11 +32,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from typing import TYPE_CHECKING
 
 from ..domain import RecordType, Task
 from ..storage.repos import RecordRepo, TaskRepo
 from .clock import Clock
 from .today import TodayService
+
+if TYPE_CHECKING:
+    from .memory import MemoryService
 
 __all__ = ["SlipItem", "WeekService", "WeekView"]
 
@@ -77,6 +81,10 @@ class WeekView:
     next_week: tuple[Task, ...]
     unscheduled: tuple[Task, ...]
     waiting: tuple[Task, ...]
+    #: 成长目标（V1.71，有意提示 / 20.1.12）：记忆里「目标」类的原文。
+    #: 刻意独立于四个「事务」分区 —— 目标是长期自我期许，不属于某一周，
+    #: 也不混进 ``care`` 的责任提醒（〇.8.6：对成长的事有意提示，不与责任并）。
+    growth_goals: tuple[tuple[str, str], ...]        # (kind, text)　kind 恒为「目标」
 
     @property
     def completed(self) -> tuple[Task, ...]:
@@ -94,7 +102,7 @@ class WeekView:
     def is_empty(self) -> bool:
         return not (
             self.closed or self.slips or self.next_week
-            or self.unscheduled or self.waiting
+            or self.unscheduled or self.waiting or self.growth_goals
         )
 
 
@@ -106,6 +114,7 @@ class WeekService:
         clock: Clock,
         *,
         today: TodayService | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         self._tasks = tasks
         self._records = records
@@ -113,6 +122,8 @@ class WeekService:
         # 顺延的**唯一实现**在 TodayService 里。不复制一份 —— 复制就会漂移，
         # 而「顺延到哪天」漂移的后果是两条通道给出不同答案。
         self._today = today
+        # 成长目标数据源（memory「目标」类）。可空：空则成长头为空。
+        self._memory = memory
 
     def view(self) -> WeekView:
         if self._today is not None:
@@ -162,6 +173,14 @@ class WeekService:
                 key=lambda t: (t.waiting_on.since, t.created_at),
             )
         )
+        # 成长目标（V1.71，有意提示 / 20.1.12）：memory「目标」类的原文，原样列出。
+        growth_goals: tuple[tuple[str, str], ...] = ()
+        if self._memory is not None:
+            growth_goals = tuple(
+                (entry.kind, entry.content)
+                for entry in self._memory.list_all()
+                if entry.kind == "目标"
+            )
         return WeekView(
             start=monday,
             end=monday + timedelta(days=7),
@@ -170,4 +189,5 @@ class WeekService:
             next_week=next_week,
             unscheduled=unscheduled,
             waiting=waiting,
+            growth_goals=growth_goals,
         )

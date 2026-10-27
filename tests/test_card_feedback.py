@@ -15,7 +15,7 @@ import pytest
 
 from freeagent.feishu import bridge as bridge_mod
 from freeagent.services.approval import ApprovalStore
-from freeagent.storage.db import connect, init_schema
+from freeagent.storage.db import connect, migrate
 
 
 class FakeClock:
@@ -32,7 +32,7 @@ class FakeClock:
 @pytest.fixture
 def wired(tmp_path):
     conn = connect(Path(tmp_path) / "a.db")
-    init_schema(conn)
+    migrate(conn)
     old_conn, old_clock = bridge_mod._card_conn, bridge_mod._card_clock
     clock = FakeClock(datetime.datetime(2026, 9, 29, 12, 0))
     bridge_mod._card_conn = conn

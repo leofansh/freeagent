@@ -76,13 +76,18 @@ class PersonalModelView:
     relationships: tuple[tuple[str, str, int, int], ...]  # 按（承诺+等候）账重降序
     #: 承诺与目标：对外承诺（open）+ 记忆里的「约定 / 目标」。只摆事实，不评判。
     commitments: tuple[tuple[str, str, bool], ...]        # (kind, text, overdue)
+    #: 滋养兴趣（V1.69，记录优先）：记忆里的「偏好」—— 爱好、口味、喜欢做什么。
+    #: 刻意与 ``commitments`` 分开：偏好是「我是谁」，约定/目标是「我在追什么」，
+    #: 混在「承诺与目标」里会把它读成该兑现的义务（〇.8.4 只记录不催促）。
+    preferences: tuple[tuple[str, str], ...]              # (kind, text)　kind 恒为「偏好」
 
     @property
     def is_empty(self) -> bool:
         """没有任何可归纳的事实。
 
         角色活跃度不计入：只要有事务就一定有角色，它不能代表「有没有规律」。
-        关系账与承诺计入：有「跟谁还有账」或「还记着的目标」本身就是规律。
+        关系账、承诺与滋养偏好计入：有「跟谁还有账」或「还记着的目标 / 爱好」
+        本身就是规律。
         """
         return (
             self.done_in_window == 0
@@ -90,6 +95,7 @@ class PersonalModelView:
             and not self.stuck_waiting
             and not self.relationships
             and not self.commitments
+            and not self.preferences
         )
 
 
@@ -212,6 +218,10 @@ def build_personal_model(
     commitments.sort(key=lambda item: (not item[2], item[0] != "承诺", item[1]))
     commitments = tuple(commitments)
 
+    # -- 滋养兴趣（V1.69，记录优先）：记忆里的「偏好」----------------------------
+    # 只原样列出，不排序打分、不评判 —— 它就是「你是怎样的人」，没有对错。
+    preferences = tuple((entry.kind, entry.content) for entry in memory_entries if entry.kind == "偏好")
+
     return PersonalModelView(
         since=since,
         until=until,
@@ -225,6 +235,7 @@ def build_personal_model(
         role_activity=role_activity,
         relationships=relationships,
         commitments=commitments,
+        preferences=preferences,
     )
 
 

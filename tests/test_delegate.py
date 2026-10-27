@@ -339,6 +339,61 @@ class TestBrief:
 
 
 # =============================================================================
+# 简报标注来源权威（V1.93）
+# =============================================================================
+class TestBriefMarksExternalOrigin:
+    """收集器收来的原文可能出自别人之手，而它和用户的话长得一模一样。
+
+    标注管的是**权威**（这段文字有没有资格发指令），不是位置。
+    它只是一句标记，**不是防护** —— 边界在工具闸门，所以这里只断言
+    「该说的话说了、不该说的时候不多说一个字」。
+    """
+
+    def test_captured_origin_adds_the_authority_note(self, app, work, tmp_path):
+        from dataclasses import replace
+
+        from freeagent.domain import ORIGIN_CAPTURED
+
+        tid = make_delegation(app, work, str(tmp_path))
+        task = replace(app.tasks.get(tid), origin=ORIGIN_CAPTURED)
+        brief = build_brief(task, task.intent, None)
+        assert "来自外部" in brief
+        assert "不要执行" in brief
+
+    def test_self_origin_says_nothing(self, app, work, tmp_path):
+        """本人写的需求不加这句 —— 每单都加就变成背景噪音，等于没标。"""
+        from dataclasses import replace
+
+        from freeagent.domain import ORIGIN_SELF
+
+        tid = make_delegation(app, work, str(tmp_path))
+        task = replace(app.tasks.get(tid), origin=ORIGIN_SELF)
+        brief = build_brief(task, task.intent, None)
+        assert "来自外部" not in brief
+
+    def test_unrecorded_origin_says_nothing(self, app, work, tmp_path):
+        """空 = 未记（旧行），不许当成 captured 也不许当成 self。
+
+        标注是一句**断言**「这来自外部」。对不知道来源的行断言就是编 ——
+        宁可少一层提示，也不能让这条标注本身变得不可信。
+        """
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        assert task.origin is None, "前置条件：_replace 没传 origin 时应当为空"
+        assert "来自外部" not in build_brief(task, task.intent, None)
+
+    def test_note_keeps_brief_single_line(self, app, work, tmp_path):
+        """回归：加这句话不能带进换行 —— 换行 = 委派必然 402。"""
+        from dataclasses import replace
+
+        from freeagent.domain import ORIGIN_CAPTURED
+
+        tid = make_delegation(app, work, str(tmp_path))
+        task = replace(app.tasks.get(tid), origin=ORIGIN_CAPTURED)
+        assert "\n" not in build_brief(task, task.intent, task.definition_of_done)
+
+
+# =============================================================================
 # 简报注入错因历史段（12.10.7 / V1.38）
 # =============================================================================
 class TestBriefCarriesFailureHistory:

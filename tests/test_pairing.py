@@ -32,7 +32,7 @@ from freeagent.services.pairing import (
     PairingStore,
     new_pairing_code,
 )
-from freeagent.storage.db import connect, init_schema
+from freeagent.storage.db import connect, migrate
 
 
 class _Clock:
@@ -51,7 +51,7 @@ class _Clock:
 @pytest.fixture()
 def wired(tmp_path):
     conn = connect(Path(tmp_path) / "a.db")
-    init_schema(conn)
+    migrate(conn)
     clock = _Clock(datetime.datetime(2026, 10, 8, 12, 0))
     yield conn, clock, tmp_path
     conn.close()

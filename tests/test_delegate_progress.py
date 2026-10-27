@@ -130,10 +130,10 @@ class _FakeToolSender:
         self._reply_answer = answers
         #: 提问卡单独记 —— 它没有按钮，答复走文本，语义与授权卡不同。
         self.question_cards: list[dict[str, Any]] = []
-        #: 每张卡唯一 message_id（``om_1``、``om_2``…）。V1.41 滚动瘦身
-        #: 要按**消息 id** 撤卡 —— 全部同串的话，「撤的是哪张」断言不出来。
+        #: 每张卡唯一 message_id（``om_1``、``om_2``…）。收尾要按**消息 id**
+        #: 改写终态 —— 全部同串的话，「收的是哪张」断言不出来。
         self._seq = 0
-        #: 收到过的撤回请求（录制）。断言「哪张卡的 id 在何时被撤」。
+        #: 收到过的收尾请求（录制）。断言「哪张卡的 id 在何时被改写终态」。
         self.retired_ids: list[str] = []
 
     def send_tool_card(self, *, open_id, subject, detail, credential,
@@ -156,8 +156,9 @@ class _FakeToolSender:
             self._store.put_answer(credential, text, answered_by=open_id)
         return "om_q"
 
-    def delete_message(self, message_id: str) -> None:
-        # 生产语义是「真的飞书撤回」；替身只**录制** —— 断言撤回时序用。
+    def settle_card(self, message_id: str, *, subject: str = "",
+                    verdict: str = "") -> None:
+        # 生产语义是「PATCH 原地改写终态」；替身只**录制** —— 断言时序用。
         self.retired_ids.append(message_id)
 
 
@@ -470,18 +471,20 @@ class TestAuthorizationCardsThreadUnderProgressCard:
 # 投影：tool_event_label —— 认不出就不显示，绝不猜
 # --------------------------------------------------------------------------- #
 class TestRetireSettledCards:
-    """V1.41 滚动瘦身：已定案的授权卡，在**下一张发出前**被撤掉。
+    """V1.88 原地改写终态：已定案的授权卡，在**下一张发出前**被折叠成收据。
 
-    ## 为什么必须有这条纪律
+    ## 为什么必须有这条纪律（V1.88 推翻了 V1.41 的「撤回」前提）
 
     聚拢（方向 A）治「卡片散落全聊天流」，治不了「回复串逐条占位」：
     N 次工具调用 = N 张卡，把位置固定的进度卡一路顶出屏幕（真机截图
-    实证）。撤已定案旧卡是唯一能把串收短的操作。同时四条不变量：
+    实证）。但撤回会在飞书里留下 N 条「撤回了一条消息」墓碑（真机 9 连
+    实证）—— 清理行为本身成了最大噪音。V1.88 改用 PATCH 把已定案卡
+    原地改写成一行收据：串照样收短，且留下可回看的授权记录。四条不变量：
 
-    - 撤的**永远**不是进度卡（它是回复锚点，撤了聚拢机制当场失效）；
-    - 撤的是**已定案**的卡（当前挂起的卡收不到撤回 —— 串行循环保证）；
-    - 撤回失败只算外观损失，委派与授权结论**一个不受影响**；
-    - 收尾进度卡正文带**最近判定明细** —— 删除路径上专门的留痕补偿。
+    - 收的**永远**不是进度卡（它是回复锚点，收了聚拢机制当场失效）；
+    - 收的是**已定案**的卡（当前挂起的卡收不到收尾 —— 串行循环保证）；
+    - 改写失败只算外观损失（旧卡保留，**不降级成撤回**），结论一个不变；
+    - 收尾进度卡正文带**最近判定明细** —— 收据之外的第二重留痕。
     """
 
     def test_old_cards_retired_as_new_ones_are_sent(self, store) -> None:
@@ -491,10 +494,10 @@ class TestRetireSettledCards:
             _asked("p1"), _asked("p2"), ("session.idle", {}),
         ]), progress=prog, tool_sender=sender)
         assert len(sender.cards) == 2
-        # 时序就是这个序列本身：ask#2 发卡前撤了 om_1，收尾撤了 om_2。
+        # 时序就是这个序列本身：ask#2 发卡前收了 om_1，收尾收了 om_2。
         assert sender.retired_ids == ["om_1", "om_2"], (
-            f"应按「新卡发出前撤旧卡、收尾清最后一张」撤两张卡，"
-            f"实际撤了 {sender.retired_ids}"
+            f"应按「新卡发出前收旧卡、收尾收最后一张」收两张卡，"
+            f"实际收了 {sender.retired_ids}"
         )
 
     def test_progress_card_is_never_retired(self, store) -> None:
@@ -508,11 +511,15 @@ class TestRetireSettledCards:
         assert "card-1" not in sender.retired_ids
 
     def test_delete_failure_does_not_break_the_run(self, store) -> None:
-        """撤不下来（权限没开等）只留旧卡，授权结论**一个不许变**。"""
+        """收不下来（14 天窗口已过等）只留旧卡，授权结论**一个不许变**。
+
+        ⚠️ V1.88 起失败**绝不降级成撤回** —— 那等于把墓碑请回来。
+        """
 
         class _Boom(_FakeToolSender):
-            def delete_message(self, message_id: str) -> None:
-                raise RuntimeError("飞书拒了撤回")
+            def settle_card(self, message_id: str, *, subject: str = "",
+                            verdict: str = "") -> None:
+                raise RuntimeError("飞书拒了改写")
 
         sender = _Boom(store)
         server = _FakeServer([
@@ -533,8 +540,8 @@ class TestRetireSettledCards:
         # 两分判定都要能从正文里对出来（动作名 + 结论在**同一行**）。
         assert final.count("允许") >= 2
 
-    def test_no_task_means_no_delete(self, store) -> None:
-        """终端/本地路径没有归属，查不出卡 —— 一次 DELETE 都不该发生。"""
+    def test_no_task_means_no_settle(self, store) -> None:
+        """终端/本地路径没有归属，查不出卡 —— 一次改写都不该发生。"""
 
         class _NoTask:
             id = ""

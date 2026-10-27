@@ -20,8 +20,12 @@ from pathlib import Path
 from ..app import App, build_app
 from ..domain import (
     DEFAULT_ROLE_NAME,
+    ORIGIN_SELF,
     FreeAgentError,
+    NotFoundError,
+    STATE_LABELS,
     TaskKind,
+    ValidationError,
     WaitingKind,
     WaitingOn,
 )
@@ -61,9 +65,11 @@ KIND_ALIASES: dict[str, TaskKind] = {
 _USAGE: dict[str, str] = {
     "/today": "/today",
     "/week": "/week      本周回顾：完成了什么、卡在哪、下周承诺了什么",
-    "/feedback": "/feedback   执行层履历：派了多少、成了多少、反复失败在哪",
+    "/feedback": "/feedback   留痕：审批分账、委派履历、改版差异、以及没派出去的卡在哪",
     "/model": "/model      连续性个人模型：从你的记录现推的画像（节奏/关系账/承诺与目标），只读聚合，只摆事实不评价",
     "/pending": "/pending [N [标题]|drop N]   待处理收集器：收下的图片/文件；N 澄清成事务，drop N 明确忽略",
+    "/capture": "/capture   批量倾倒：粘贴一大坨文本，空行结束；每行切成一条进待处理队列",
+    "/mail": "/mail    邮件入口：粘贴邮件正文，空行结束；整段一条进待处理队列（首行当标题）",
     "/all": "/all [open|closed|all]   默认 open",
     "/roles": "/roles [all]",
     "/role": "/role <名字|id>",
@@ -117,8 +123,9 @@ _USAGE: dict[str, str] = {
     # 一句没有主语的说明。
     "/mode-plan": "/mode-plan —— 进入规划：只沟通、不落库、可多轮",
     "/mode-build": (
-        "/mode-build —— 退出规划并发确认卡（**还不执行**）；"
-        "/mode-build ok 确认建事务、/mode-build cancel 先留着"
+        "/mode-build —— 退出规划并发确认卡（还不执行）；"
+        "/mode-build ok 确认建事务、cancel 先留着、"
+        "discard 计划丢掉、回正常模式"
     ),
     "/tick": "/tick",
     "/llm": "/llm            查看当前智能层与配置（不显示 Key）",
@@ -129,6 +136,12 @@ _USAGE: dict[str, str] = {
         "  对外承诺：我答应别人的"
     ),
     "/contact": "/contact [关系名 [备注]]  关系对象：事务背后的人（可检索）",
+    # 人生角色关注面（11.24 / V1.68）。用法文本的值**必须以命令名开头**
+    # （test_doc_contract 会查）。关注面是持续责任，不是待办。
+    "/care": (
+        "/care [<角色> <关注面> [每周X|每月X号]|done <序号>]"
+        "  人生角色关注面：这个角色该周期性关心的东西；到点进每日总览"
+    ),
     # 催办草稿（20.1.4）。用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
     "/nudge": (
         "/nudge [序号]  该催的事务；给序号就出草稿"
@@ -170,17 +183,37 @@ def _split_relation(tokens: list[str]) -> tuple[list[str], str | None]:
         )
     return rest, (name or None)
 
+
+def _readable_span(seconds: int) -> str:
+    """把秒数说成人话。**只用于展示，不参与任何判断。**
+
+    审批留痕里「等了多久」是个关键事实（秒回 = 他正盯着，躺满 TTL =
+    根本没看见），但 ``7432`` 这种数字读不出这个差别。
+    """
+    if seconds < 60:
+        return f"{seconds} 秒"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} 小时"
+    return f"{seconds / 86400:.1f} 天"
+
+
 _HELP = """\
 个人事务助手 · 命令
   ── 视图 ──
   /today              今天视图（含顺延标记与每条信号的理由）
   /week               本周回顾（完成了什么 / 卡在哪 / 下周承诺了什么，只摆事实）
-  /feedback           执行层履历：派了多少、成了多少、反复失败在哪（只摆事实）
+  /feedback           留痕：审批分账（把「没人看」从「拒绝」里拆开）、委派履历、
+                      改版差异、以及没派出去的各自卡在哪一步
   /model              连续性个人模型：从记录现推的规律（完成时段 / 常顺延 / 卡住的等候 / 角色活跃度，只摆事实）
   /pending [N|drop N]  待处理收集器：飞书收下的图片/文件，列出来、一键澄清成事务
+  /capture            批量倾倒：粘贴一大坨文本，空行结束，每行进待处理队列
+  /mail               邮件入口：粘贴邮件正文，空行结束，整段一条进待处理队列（首行当标题）
   /promise [记|keep|break|withdraw|postpone]  对外承诺：我答应别人的（只显式记录，不自动推断）
   /contact [名字 [备注]]  关系对象：事务背后的人（与角色脉络是两个维度）
-  /nudge [序号]       该催的事务；给序号出草稿（只铺事实、正文留白，**绝不代发**）
+  /nudge [序号]       该催的事务；给序号出草稿（只铺事实、正文留白，绝不代发）
+  /care [<角色> <关注面> [每周X|每月X号]|done <序号>]  人生角色关注面：该周期性关心的东西，到点进每日总览
   /all [open|closed|all]  全部事务（默认只列未结束）
   /roles [all]        角色脉络（默认只列活跃；all 含静置）
   /role <名字|id>      某个角色下的事务
@@ -197,7 +230,8 @@ _HELP = """\
 
   ── 交互模式（设计文档 12.7.2）──
   /mode-plan           进入规划：只沟通、不落库、可多轮
-  /mode-build          退出规划（确认卡尚未实现，故尚不执行）
+  /mode-build          退出规划并出确认卡（还不执行）：
+                       ok 确认建事务｜cancel 先留着｜discard 计划丢掉、回正常模式
 
   ── 状态与调度 ──
   /start <id>         开始做
@@ -213,11 +247,11 @@ _HELP = """\
 
   ── 委派（交给 opencode 改代码）──
   /delegate <项目绝对路径> | <角色> | <需求>
-        建一条委派事务。**必须 /start 之后**执行器才会动它；
+        建一条委派事务。必须 /start 之后执行器才会动它；
         项目路径要在 config.json 的 delegate.projects 白名单里。
         另开终端跑：python -m freeagent.delegate --dry-run
   /redispatch <id> [原因]
-        让这条委派可以**重新派发**。「派发前就被拒」（白名单不符 / 没闸门）
+        让这条委派可以「重新派发」。「派发前就被拒」（白名单不符 / 没闸门）
         不会自动重试 —— 改配置前重试多少次都是同一个结果。
         改好配置后跑这条，执行器下次扫到就会再派一次。
 
@@ -243,11 +277,11 @@ _HELP = """\
   ── 其它 ──
   /tick               手动检查提醒
   /llm                当前智能层与配置（不显示 Key）
-  /agents             执行器探针：装了没、什么版本、能不能派（**只看不派**）
-  /ask <问题>         问执行器一句就回来（**只读**：不改文件、不建事务、不问审批）
+  /agents             执行器探针：装了没、什么版本、能不能派（只看不派）
+  /ask <问题>         问执行器一句就回来（只读：不改文件、不建事务、不问审批）
   /pair <配对码>      把飞书某个人加进白名单（码来自 bot 私聊发的那张卡）
   /reset-data <确认口令>
-                      **恢复出厂**：清空全部事务数据（角色脉络/配置/Key 保留），
+                      「恢复出厂」：清空全部事务数据（角色脉络/配置/Key 保留），
                       执行前强制自动备份。口令不带时只打印说明、不执行。
                       执行器或桥接在跑时会拒绝。慎用。
   /help               这份帮助
@@ -601,6 +635,22 @@ class Repl:
         except Exception:  # noqa: BLE001
             pass
 
+    def _drop_plan_state(self) -> None:
+        """把盘上的 Plan 状态删掉。**静默失败**，理由同 :meth:`_persist_plan`。
+
+        调用方**必须先写一次终态再调它**（``_discard_plan`` / ``_confirm_plan``
+        都这么做）：drop 失败时盘上留着的是「刚写的那个终态」，而不是旧计划。
+        只 drop 不写的后果是「丢弃/确认之后一重启，计划又回来了」—— 那等于
+        系统没照做他要求的动作，却什么也没说。
+        """
+        chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
+        if not chat_id:
+            return
+        try:
+            self._plan_store().drop(chat_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     def restore_plan(self) -> bool:
         """从磁盘恢复本会话的 Plan。**有得恢复返回 True。**
 
@@ -621,6 +671,11 @@ class Repl:
             return False
         if saved is None:
             return False
+        if saved.mode != MODE_PLAN and not saved.lines:
+            # 「build + 空计划」= 什么都值得恢复的都没有（典型来源：
+            # discard/确认之后落下的终态，而删行没删掉）。这种情况**要说
+            # 一句「上次的会话状态已恢复」就是噪声**，且会让用户以为有别的东西。
+            return False
         self._mode = saved.mode
         self._plan = list(saved.lines)
         self._resume_notice = self._resume_text(saved)
@@ -635,8 +690,12 @@ class Repl:
         if saved.mode == MODE_PLAN:
             n = len(saved.lines)
             tail = f"，已记下 {n} 条" if n else "，还没记下任何内容"
+            # 「不想继续」这句必须给**真能走的**那条路（V1.91）：旧版写的是
+            # 「/mode-build 或直接重说」，而无参 /mode-build 只是重新出一张
+            # 确认卡 —— 照做会得到一张卡，用户更懵。
             return (f"（上次的规划还在{tail}。现在是 Plan 模式：只沟通、不落库；"
-                    f"要动手时说 /mode-build，不想继续就 /mode-build 或直接重说。）")
+                    f"要动手时说 /mode-build；不想继续就说 /mode-build discard"
+                    f"（计划丢掉、回正常模式）。）")
         # 落在盘上的也可能是 build 模式（例如写盘后用户又退出了规划）。
         # 这时**不谎称**「在规划」——照样说清、让用户知道系统记得他。
         return "（上次的会话状态已恢复。）"
@@ -660,22 +719,56 @@ class Repl:
         return True
 
     def _cmd_mode_build(self, args: list[str]) -> bool:
-        """退出规划。**三个形态，不新增命令**：
+        """退出规划。**四个形态，不新增命令**：
 
         - ``/mode-build`` → **发确认卡，不动手**（Plan 仍在，可继续补）
         - ``/mode-build ok`` → 确认：把计划落成事务
         - ``/mode-build cancel`` → 取消：计划留着，回到 Plan 继续沟通
+        - ``/mode-build discard`` → **丢弃**：计划清空、回正常模式（V1.91）
 
         刻意不加 ``/confirm`` / ``/cancel`` 这两个新命令 —— 命令表每多一条，
         说明书与设计文档的**计数**就跟着漂移一次（上次加 ``/mode-*`` 时刚
         付过这个代价）。而给已有命令加参数，代价是零。
+
+        ## 为什么必须有 ``discard``（V1.91 补的出边）
+
+        这不是「多一个方便的参数」，是**状态机少了一条出边**。此前退出 Plan
+        的唯一路径是 ``ok``，而 ``cancel`` 的语义是「计划留着、继续规划」：
+
+        - 进了 ``/mode-plan`` 又改主意「算了不弄了」→ **没有一条命令能回到
+          正常模式**，只能确认一份不想要的计划；
+        - Plan 是**落盘**的（``_persist_plan`` + 启动时 ``restore_plan``），
+          所以「关掉重开」也逃不掉 —— 重启后照样被恢复回 Plan；
+        - 更糟的是当时恢复提示写的是「不想继续就 /mode-build 或直接重说」，
+          而 ``/mode-build`` 无参只是**重新出一张确认卡**，等于提示在指错路。
+
+        对照生态里的 ``opencode-feishu-plugin``：它每条临时态命令（``/new``
+        ``/form``）都配了一条 ``/cancel`` 收场 —— 这是对的，进得去就得出得来。
+        我们借它的**结论**（每个临时态必须有零副作用出口），但按本仓纪律
+        **不借它的形态**（不新增命令，加参数）。
         """
         chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
+        choice = args[0].strip().lower() if args else ""
+
+        # 「丢掉计划、回正常模式」——**必须排在「没有计划」的早退之前**。
+        # 否则进了 Plan 但一句没说（计划为空）时，用户连唯一的出边都走不了，
+        # 那正是这个 bug 最容易被撞到的形态（进错模式、什么都没说、想退出）。
+        if choice in ("discard", "abandon", "drop", "放弃", "算了"):
+            return self._discard_plan(chat_id)
+
         if not self._plan:
-            self._say("（已经在 build 模式，没有待执行的计划。）")
+            # 分不清「在 Plan 里但空手」和「本来就在 build」是旧版的两个谎之一：
+            # 前者说「已经在 build 模式」是假话，而用户正卡在这里找出路。
+            if self._mode == MODE_PLAN:
+                self._say(
+                    "（现在是 Plan 模式，还没记下任何内容 —— 你说的每句话都只"
+                    "进计划、不落库。）\n"
+                    "  要开始规划就说一句话；要回正常模式就说 /mode-build discard。"
+                )
+            else:
+                self._say("（已经是正常模式，没有待确认的计划。）")
             return True
 
-        choice = args[0].strip().lower() if args else ""
         if choice in ("cancel", "no"):
             # 计划**留着** —— 他可能只是想再想想，不是想丢掉。
             self._last_plan_confirm = ()
@@ -701,6 +794,36 @@ class Repl:
         )
         for line in self._plan:
             self._say(f"· {line}")
+        return True
+
+    def _discard_plan(self, chat_id: str) -> bool:
+        """丢掉计划、退回正常模式。**这是 Plan 状态机唯一的无副作用出边。**
+
+        ## 三条都要一起做，少一条就留个「幽灵计划」
+
+        1. 内存：``_plan`` 清空、``_last_plan_confirm`` 清空（挂着的确认卡
+           随之作废，否则用户点「确认执行」会把已经丢掉的计划建出来）；
+        2. 模式：``_mode = MODE_BUILD``；
+        3. 盘上：**先写**「build + 空计划」再 ``drop``。顺序不能反 ——
+           写盘是幂等的、drop 可能失败，而 ``_persist_plan`` 本身**静默失败**
+           （它的注释写了理由：不为存状态打断对话）。若只 drop 不写，
+           drop 失败时盘上还留着旧计划，用户重启后会被「恢复」回 Plan
+           模式 —— 他会以为自己那句话说错了，而系统其实**没执行他要求的
+           丢弃**。先写一次空状态，最坏情况也是「盘上是真的：build、无计划」。
+        """
+        had = len(self._plan)
+        self._plan = []
+        self._last_plan_confirm = ()
+        self._mode = MODE_BUILD
+        self._persist_plan()
+        self._drop_plan_state()
+        if had:
+            self._say(
+                f"（已退出规划，{had} 条计划**丢掉**了 —— 一条都没建。）\n"
+                f"  现在是正常模式，直接说要做什么就行。"
+            )
+        else:
+            self._say("（已退出规划，现在是正常模式。）")
         return True
 
     def _confirm_plan(self) -> bool:
@@ -735,12 +858,11 @@ class Repl:
         self._plan = []
         self._last_plan_confirm = ()
         self._mode = MODE_BUILD
-        chat_id = self.channel_ctx.chat_id if self.channel_ctx else ""
-        if chat_id:
-            try:
-                self._plan_store().drop(chat_id)
-            except Exception:  # noqa: BLE001
-                pass
+        # 先写终态（build + 空计划）再删盘上状态 —— 顺序与理由见
+        # ``_drop_plan_state``：drop 失败时盘上必须是「真的：已确认且无待办」，
+        # 否则重启会把已确认的计划恢复回来，再点一次 ok 就是**重复建事务**。
+        self._persist_plan()
+        self._drop_plan_state()
 
         made: list[str] = []
         for line in plan:
@@ -1136,6 +1258,7 @@ class Repl:
                 due_time=due,
                 reminder_time=reminder,
                 waiting_on=waiting_on,
+                origin=ORIGIN_SELF,
             )
         self._say()
         self._say(f"已记下：{task.title}")
@@ -1143,8 +1266,9 @@ class Repl:
             f"  形状 {task.kind.label}｜状态 {task.state.label}"
             f"｜角色 {'、'.join(self._names().get(r, '?') for r in task.role_ids)}"
         )
-        if intent is None:
-            self._say("  意图还没说清楚 —— 说一句「想做到什么程度」我帮你补上。")
+        # V1.84：不再自动追问「意图还没说清楚」—— 快速记一笔不该被盘问。
+        # intent 是可选项，缺了有 [TODO] 兜底（rules.py / deepseek.py），
+        # 用户真要补自会用 /steps、/draft 或再补一句。**默认安静记下**。
         if task_kind is TaskKind.WAIT and waiting_on is not None:
             self._say(f"  在等：{waiting_on.who_or_what}")
         if reminder is not None:
@@ -1153,6 +1277,12 @@ class Repl:
             self._say(f"  截止时间：{due:%Y-%m-%d %H:%M}")
         if scheduled is not None:
             self._say(f"  已排到 {scheduled}")
+        # V1.84：提到已登记的关系对象（张总这种）就顺势提一句可挂账 ——
+        # **只提示不静默挂**（守 11.19「只显式触发」）：用户知道能挂，但
+        # 挂不挂、挂到谁由他拍板。零误判 —— 只认已登记的名字（mentioned_
+        # contacts 里那套逻辑，见 promise.py）。
+        for contact in self.app.promise.mentioned_contacts(task.title):
+            self._say(f"  提到 {contact.name}，可挂关系账（/contact {contact.name}）")
         self._say(f"  id={task.id}")
         self._say()
         self._say(f"  /draft {task.id[:8]} 出个骨架，/steps {task.id[:8]} 拆步骤。")
@@ -1200,6 +1330,8 @@ class Repl:
             "/feedback": self._cmd_feedback,
             "/model": self._cmd_model,
             "/pending": self._cmd_pending,
+            "/capture": self._cmd_capture,
+            "/mail": self._cmd_mail,
             "/all": self._cmd_all,
             "/roles": self._cmd_roles,
             "/role": self._cmd_role,
@@ -1257,10 +1389,26 @@ class Repl:
             "/promise": self._cmd_promise,
             "/contact": self._cmd_contact,
             "/nudge": self._cmd_nudge,
+            # 人生角色关注面（11.24 / V1.68）：给角色定义「该周期性关心的东西」。
+            "/care": self._cmd_care,
         }
 
     # ---- 视图 ---- #
     def _cmd_help(self, args: list[str]) -> None:
+        """帮助。**先报当前模式**（V1.91）。
+
+        进 Plan 之后用户唯一的困惑是「我现在说的话落不落库」，而这件事必须
+        在 ``/help`` 第一行看得到 —— 否则他得靠回忆「我刚才是不是敲过
+        /mode-plan」。这也顺手替掉了原本缺一条命令才有的「我在哪」查询：
+        不新增 ``/mode``，把状态挂在本来就该看的那一页上。
+        """
+        if self._mode == MODE_PLAN:
+            n = len(self._plan)
+            tail = f"，已记下 {n} 条" if n else "，还没记下任何内容"
+            self._say(
+                f"（当前：Plan 模式{tail} —— 只沟通、不落库。"
+                f"要动手说 /mode-build；不干了说 /mode-build discard。）"
+            )
         self._say(_HELP)
 
     def _cmd_today(self, args: list[str]) -> None:
@@ -1272,6 +1420,16 @@ class Repl:
                 view, self._names(), pending_count=self.app.pending.count()
             )
         )
+        # 飞书侧：今天**最高优先那条**附一张动作卡（开始 / 做完 / 放一放）。
+        # 终端不读 ``_last_task_action``，设了无副作用；飞书 bridge 读到就发卡。
+        # 刻意**只对第一条**（全局排序最高优先）发：卡片是「省一次交互」用的，
+        # 每条都发会把飞书变成每句话一张卡（V1.61 起，查询命令可带操作卡；
+        # 普通问答仍纯文本，见 test_card_button_command 的边界测试）。
+        if view.items:
+            top = view.items[0].task
+            self._last_task_action = (
+                top.id, top.title, STATE_LABELS[top.state],
+            )
 
     def _cmd_week(self, args: list[str]) -> None:
         """周回顾（设计文档 6.5）。
@@ -1352,6 +1510,59 @@ class Repl:
             self._usage("/pending")
             return
         self._say(render.render_pending(items))
+
+    def _cmd_capture(self, args: list[str]) -> None:
+        """批量倾倒（录入口三件之一）：粘贴一大坨文本，按行切成多条进待处理队列。
+
+        多行收集**停在空行**：空行在 REPL 里通常表示「我没话说了」，这里借它
+        表示「倒完了」。入队**不建事务** —— 澄清是 ``/pending N``，纪律 11.18。
+        """
+        self._say("批量倾倒：粘贴文本（可多行），空行结束 —— 每行将进待处理队列。")
+        lines = self._collect_multiline()
+        if not lines:
+            self._say("没有内容，未入队。")
+            return
+        text = "\n".join(lines)
+        try:
+            items = self.app.pending.capture_batch(source="cli", text=text)
+        except FreeAgentError as exc:
+            self._say(f"入队失败：{exc}")
+            return
+        self._say(f"已入待处理队列 {len(items)} 条 → /pending 查看并澄清。")
+
+    def _cmd_mail(self, args: list[str]) -> None:
+        """邮件入口（录入口三件之一）：粘贴邮件正文，整段一条进待处理队列。
+
+        ``source='mail'`` 标记「这来自一封邮件」。整段一条（**不是按行切分**）——
+        邮件是一条承诺 / 等候的载体，不该被拆碎。首行当作标题。不建事务，
+        ``/pending`` 澄清。
+        """
+        self._say("邮件：粘贴邮件正文，空行结束 —— 整段一条进待处理队列，首行当作标题。")
+        lines = self._collect_multiline()
+        if not lines:
+            self._say("没有内容，未入队。")
+            return
+        title = lines[0]
+        body = "\n".join(lines)
+        try:
+            item = self.app.pending.capture_text(source="mail", text=body, name=title)
+        except FreeAgentError as exc:
+            self._say(f"入队失败：{exc}")
+            return
+        self._say(f"已收进待处理队列 1 条（{item.name}）→ /pending 澄清。")
+
+    def _collect_multiline(self) -> list[str]:
+        """从 stdin 收集多行，停在空行或 EOF。``/capture`` 与 ``/mail`` 共用。"""
+        lines: list[str] = []
+        while True:
+            try:
+                line = input("").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                break
+            lines.append(line)
+        return lines
 
     def _cmd_promise(self, args: list[str]) -> None:
         """对外承诺（设计文档 11.19）。
@@ -1603,17 +1814,72 @@ class Repl:
             self._say(f"  {line}")
 
     def _cmd_feedback(self, args: list[str]) -> None:
-        """执行层履历：派了多少、成了多少、反复失败在哪。
+        """执行层与治理层的**事实留痕**：我批得怎么样、派得怎么样、改了什么。
 
         **刻意只摆事实，不给建议。** 与第七章「摆得更清楚 ≠ 替你决定」
         同构，也与 11.10.5「绝不自动触发委派」同源 —— 一个「建议重派」
         的按钮就是自动触发的前一步。所以输出里没有「建议你…」这种句子。
+
+        三段分开算，任何一段没数据就跳过那一段，而不是整条命令早退：
+        「一次都没派过」不该让「我批了 12 次、其中 9 次没看见」也看不见 ——
+        恰恰是后者才说明问题出在**打扰方式**上，而不是派发质量上。
         """
+        self._say_audit_section()
+        self._say_delegation_section()
+        self._say_dispatch_gap_section()
+        self._say_revision_section()
+        self._say(
+            "\n这些是事实，不是建议 —— 要不要重派、怎么改，由你决定。"
+        )
+
+    def _say_audit_section(self) -> None:
+        """审批留痕：每条等你批的请求最后怎么了（V1.92）。
+
+        这一段的全部意义在于**把「没人看」从「拒绝」里拆出来**。拆之前
+        两者都是 ``decision='deny'``，而它们该导致的后果完全相反：
+        前者要改的是提议内容，后者要改的是打扰方式。
+        """
+        from ..services.approval import ApprovalStore
+
+        rep = ApprovalStore(
+            self.app.conn, clock=self.app.clock.now
+        ).evidence()
+        if rep.total == 0:
+            self._say("审批留痕：这段时间没有等你批的请求。")
+            return
+        self._say(
+            f"审批留痕（近 {rep.since_days} 天共 {rep.total} 条）\n"
+            f"  允许 {rep.allow}　明确拒绝 {rep.deny}　叫停 {rep.stop}\n"
+            f"  点了但已过期 {rep.late}　没人看 {rep.timeout}　还挂着 {rep.open}"
+        )
+        if rep.timeout:
+            self._say(
+                "  ↑「没人看」不是拒绝 —— 卡放到过期，你根本没看见它。"
+            )
+        recent = [e for e in rep.entries if e.outcome != "open"][:5]
+        if recent:
+            label = {
+                "allow": "允许", "deny": "拒绝", "stop": "叫停",
+                "late": "过期后才点", "timeout": "没看", "open": "挂着",
+            }
+            self._say("\n  最近几条：")
+            for e in recent:
+                span = (
+                    f"　等了 {_readable_span(e.waited_seconds)}"
+                    if e.waited_seconds is not None else ""
+                )
+                self._say(
+                    f"    {e.asked_at.strftime('%m-%d %H:%M')}　"
+                    f"{label.get(e.outcome, e.outcome)}　{e.subject}{span}"
+                )
+
+    def _say_delegation_section(self) -> None:
+        """执行层履历：派了多少、成了多少、反复失败在哪。"""
         from ..services.feedback import feedback_report
 
         tasks = [t for t in self.app.task_repo.list_all() if t.is_open]
         if not tasks:
-            self._say("还没有未结束的事务 —— 没有可统计的委派。")
+            self._say("\n还没有未结束的事务 —— 没有可统计的委派。")
             return
         ids = [t.id for t in tasks]
         titles = {t.id: t.title for t in tasks}
@@ -1625,7 +1891,7 @@ class Repl:
         rate = rep.success_rate
         rate_text = "没真跑过" if rate is None else f"{rate:.0%}"
         self._say(
-            f"未结束事务 {rep.total} 条 —— 其中派过的 "
+            f"\n未结束事务 {rep.total} 条 —— 其中派过的 "
             f"{rep.total - rep.never} 条\n"
             f"  成功 {rep.succeeded}　执行期失败 {rep.failed}　"
             f"派发前被拒 {rep.refused}　没派过 {rep.never}\n"
@@ -1647,13 +1913,91 @@ class Repl:
                     "revised": "圈改重做过（>=2 版）",
                 }.get(verdict, verdict)
                 self._say(f"  {label}　{n} 条")
-        if rep.revised_tasks:
-            self._say("\n返工过的：")
-            for task_id, title, _n in rep.revised_tasks:
-                self._say(f"  {title}（{task_id[:8]}）")
-        self._say(
-            "\n这些是**事实**，不是建议 —— 要不要重派、怎么改，由你决定。"
-        )
+
+    def _say_dispatch_gap_section(self) -> None:
+        """没派出去的委派，**各自卡在哪一步**（12.11.3 / V1.94）。
+
+        为什么需要这一段：资格判定是三个条件的合取（有项目路径 / 是 active /
+        没派过或上次失败），不满足就**静默跳过**。于是「我建了委派它怎么
+        不动」的答案只存在于代码里 —— 这与 v1.36 那次「文档承诺了重派、
+        守卫禁止它」是同一类毛病：系统知道原因，但不说。
+
+        全部都在正常轨道上时**一个字不占**：没有卡点就没有版面。
+        措辞里不带「建议」，与本章其余各段同源。
+        """
+        from ..services.delegate import dispatch_blocker
+        from ..storage.repos import LeaseRepo
+
+        leases = LeaseRepo(self.app.conn).all()
+        now = self.app.clock.now()
+        rows: list[tuple[str, str]] = []
+        ready = 0
+        for task in self.app.task_repo.list_all():
+            if not task.project_path or not task.is_open:
+                continue
+            why = dispatch_blocker(
+                task,
+                self.app.record_repo.list_for_task(task.id),
+                lease=leases.get(task.id),
+                now=now,
+            )
+            if why:
+                rows.append((task.title, why))
+            else:
+                # 够格 = 下一次扫派会派它。**不列进「卡住」**（它没卡住），
+                # 但也不该彻底沉默：执行器没在跑时，它同样永远不会开始 ——
+                # 而「我建了委派它怎么不动」问的正是这一格。
+                ready += 1
+        if not rows and not ready:
+            return
+        if rows:
+            self._say(f"\n没派出去的 {len(rows)} 条（各自卡在哪一步）：")
+            for title, why in rows[:8]:
+                self._say(f"  {title} —— {why}")
+            if len(rows) > 8:
+                self._say(f"  …还有 {len(rows) - 8} 条")
+        if ready:
+            lead = "　" if rows else "\n"
+            self._say(
+                f"{lead}够格待派 {ready} 条 —— 执行器下一次扫到就会派；"
+                "它没在跑就不会自己开始。"
+            )
+
+    def _say_revision_section(self) -> None:
+        """改版差异：圈改的时候**实际动了哪几行**（V1.92）。
+
+        这是「人改了什么」唯一能算出来的地方 —— 审批卡上只有同意/拒绝，
+        没有「改一下」；真正的改动发生在 :meth:`revise`，而它**永远产生
+        新版本、旧版不删**，于是两版摆在一起就能算差。
+
+        只报增删行数与几行样本，**不做语义解释**（「他大概想更简洁」是
+        替他讲动机）。样本裁到 60 字，避免一条长段落把整屏吃掉。
+        """
+        from ..services.feedback import revision_drift
+
+        rows: list[tuple[str, str, int, int, object]] = []
+        for task in self.app.task_repo.list_all():
+            versions = self.app.artifacts.list_for_task(task.id)
+            for prev, cur in zip(versions, versions[1:]):
+                drift = revision_drift(prev.content, cur.content)
+                if drift.added == 0 and drift.removed == 0:
+                    continue
+                rows.append(
+                    (task.id, task.title, prev.version, cur.version, drift)
+                )
+        if not rows:
+            return
+        self._say("\n改版差异（圈改时实际动了什么）：")
+        for task_id, title, v_from, v_to, drift in rows[-5:]:
+            self._say(
+                f"  {title}（{task_id[:8]}）v{v_from}→v{v_to}："
+                f"+{drift.added} 行 / -{drift.removed} 行"
+            )
+            for sign, line in drift.samples:
+                text = line.strip()
+                if not text:
+                    continue
+                self._say(f"    {sign} {text[:60]}")
 
     def _cmd_all(self, args: list[str]) -> None:
         mode = args[0] if args else "open"
@@ -1729,21 +2073,35 @@ class Repl:
         self._say(render_probes(probe_all()))
 
     def _cmd_ask(self, args: list[str]) -> None:
-        """``/ask <问题>`` —— 把一句话交给执行器，把答复拿回来（设计文档 11.10.6）。
+        """``/ask [hermes] <问题>`` —— 把一句话交给执行器，把答复拿回来（设计文档 11.10.6）。
 
         **和 ``/delegate`` 的区别**：那是「把一件事做掉」，这是「问一句」。
         所以不落库、不进今天视图、不产出 artifact、**不问任何审批**。
 
-        「不问审批」的前提是「**改不了**」，而那由 ``services/ask.py`` 传入的
-        **只读权限配置**强制 —— 不是靠执行器自觉（V1 未命中规则时大多默认
-        ``allow``，见设计文档 11.8.1 的版本陷阱表）。
+        可选的首个 token ``hermes`` 保留但**已停用**（V1.83）：``/ask hermes``
+        会直接报「hermes 执行器已停用」，不再分派 —— 因为 hermes 的审批闸是
+        「按模式标记」而非「每动作确认」，拦不住未标记的 file/terminal，不能当
+        受控执行器（见 11.10.8）。知识问答统一走默认的 opencode。
+
+        「不问审批」的前提是「**改不了**」：opencode 由 ``services/ask.py``
+        传入的**只读权限配置**强制（不是靠执行器自觉）。
 
         函数内导入：``ask_executor`` 会起一个**真进程**，那是本文件导入期
         绝不该发生的事。
         """
+        executor = "opencode"
+        if args and args[0] == "hermes":
+            # V1.83 停用：hermes 不再当执行器用。不悄悄改走 opencode ——
+            # 用户点了名字就是想要 hermes，报清「已停用」并给出路，比
+            # 换到别的执行器更诚实（fail-closed + 说得清原因）。
+            self._say("hermes 执行器已停用（V1.83）。它的审批闸是「按模式标记」"
+                      "而非「每动作确认」，拦不住未标记的文件/终端操作，不能当"
+                      "受控执行器。知识问答请用 `/ask`（默认 opencode，FreeAgent "
+                      "全控）。代码保留作接缝，若 hermes 修好审批可重新启用。")
+            return
         question = " ".join(args).strip()
         if not question:
-            self._say("用法：/ask <问题>。例如：/ask 这个项目是干什么的？")
+            self._say("用法：/ask [hermes] <问题>。例如：/ask 这个项目是干什么的？")
             return
 
         import pathlib
@@ -1751,14 +2109,18 @@ class Repl:
         from ..services.ask import ask_executor
         from ..services.opencode_server import OpenCodeServer
 
+        def make_server(p, c, **kw):
+            # 只 opcode 一个执行器（hermes 已停用，V1.83）。``command`` 参数
+            # （ask_executor 传入的 ``executor``）就是这里的 ``c``。
+            return OpenCodeServer(project=p, executable=c, apply_gate=True, **kw)
+
         project = pathlib.Path.cwd()
-        self._say(f"（问的是这个目录：{project}）")
+        self._say(f"（问的是这个目录：{project}，执行器 {executor}）")
         outcome = ask_executor(
             question,
             project=project,
-            make_server=lambda p, c, **kw: OpenCodeServer(
-                project=p, executable=c, apply_gate=True, **kw
-            ),
+            command=executor,
+            make_server=make_server,
             model=(self.app.config.model if self.app.config else None),
         )
         if outcome.ok:
@@ -1849,7 +2211,6 @@ class Repl:
         role = self._require_role(args[0])
         updated = self.app.roles.rename(role.id, " ".join(args[1:]))
         self._say(f"「{role.name}」已改名为「{updated.name}」")
-
     def _cmd_role_silence(self, args: list[str]) -> None:
         if not args:
             self._usage("/role-silence")
@@ -1894,6 +2255,85 @@ class Repl:
             )
         self.app.roles.delete(role.id)
         self._say(f"已删除角色「{role.name}」")
+
+    #: 「每周X」里 X 的中文数字 → ISO 星期（1=周一 … 7=周日）。
+    _CARE_WEEKDAY = {
+        "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7,
+    }
+
+    def _parse_cadence(self, tokens: list[str]) -> str:
+        """把「每周六 / 每月1号」翻成规范串（``weekly:6`` / ``monthly:1``）。
+
+        缺省 = **每周一**（weekly:1）——「周期性关心」总得有个周期，默认
+        每周一次是低频不扰的起点；用户可随时显式改。解析失败抛错，
+        不静默猜（fail-closed）。
+        """
+        s = "".join(tokens).strip()
+        if not s:
+            return "weekly:1"
+        if s.startswith("每周"):
+            v = s[2:]
+            if v in self._CARE_WEEKDAY:
+                return f"weekly:{self._CARE_WEEKDAY[v]}"
+            if v.isdigit() and 1 <= int(v) <= 7:
+                return f"weekly:{int(v)}"
+            raise FreeAgentError(f"「每周」后请给 一~日 或 1-7（收到：{s}）")
+        if s.startswith("每月"):
+            v = s[2:].replace("号", "")
+            if v.isdigit() and 1 <= int(v) <= 31:
+                return f"monthly:{int(v)}"
+            raise FreeAgentError(f"「每月」后请给 1-31 号（收到：{s}）")
+        raise FreeAgentError(f"节奏只支持「每周X」或「每月X号」（收到：{s}）")
+
+    def _cmd_care(self, args: list[str]) -> None:
+        """人生角色关注面（11.24 / V1.68）。
+
+        无参 → 列出所有角色的关注面；``/care done <序号>`` → 记「看过了」
+        （推到下周期）；``/care <角色> <关注面> [每周X|每月X号]`` → 记一条。
+        """
+        if not args:
+            cares = [
+                render.CareDue(area=a, role_name=self.app.roles.get(a.role_id).name)
+                for a in self.app.care.list()
+            ]
+            self._say(render.render_cares(cares))
+            return
+        if args[0] == "done":
+            if len(args) < 2:
+                self._usage("/care")
+                return
+            try:
+                index = int(args[1])
+            except ValueError:
+                self._usage("/care")
+                return
+            try:
+                area = self.app.care.done(index)
+            except NotFoundError:
+                self._say(
+                    f"没有第 {index} 条关注面（当前共 {self.app.care.count()} 条）"
+                )
+                return
+            self._say(
+                f"已记「{area.text}」看过了，推到下个周期 —— "
+                f"{area.next_due.isoformat()} 再看。关注面不是待办，不会做完就消失。"
+            )
+            return
+        if len(args) < 2:
+            self._usage("/care")
+            return
+        role = self._require_role(args[0])
+        text = args[1]
+        cadence = self._parse_cadence(args[2:])
+        try:
+            area = self.app.care.add(role.id, text, cadence)
+        except (ValidationError, NotFoundError) as exc:
+            self._say(str(exc))
+            return
+        self._say(
+            f"已给「{role.name}」记关注面：{area.text}（"
+            f"{render._cadence_label(area.cadence)} 起，{area.next_due.isoformat()} 该看）"
+        )
 
     def _cmd_task_del(self, args: list[str]) -> None:
         """硬删一条事务（记录/产物/角色归属一起没，找不回来）。
@@ -2014,6 +2454,7 @@ class Repl:
             kind=TaskKind.ACTION,
             intent=f"在 {project} 里完成：{requirement}",
             project_path=str(project),
+            origin=ORIGIN_SELF,
             # 从**能推送的**通道发起的，才记下是哪个会话 —— 执行器靠它把结果
             # 推回去，闭环才合得上。
             #
@@ -2081,12 +2522,20 @@ class Repl:
         self._say(f"  脉络：{role.name}" + ("（你没指定，用的第一条）" if by_default else ""))
         self._say("")
         self._say("它现在是「待办」，执行器不会碰它。")
+        # ⑩ 委派隐私的正面声明（重写版附录 B·10）：委派**不隔离** —— 真跑时
+        # 会在该项目里以你的执行器配置运行（默认 ``plugins=inherit``，加载你配的
+        # 插件 / MCP / 技能，它们在项目里跑会读到项目内容）。这句话必须放在
+        # 「确认要派的话」之前：用户是在看到它之后才决定要不要 /start 的。
+        self._say("  ⚠️ 委派不隔离：真跑时会在该项目里以你的执行器配置运行"
+                  "（默认加载你配的插件 / MCP / 技能）。只把可信项目交给它。")
         self._say(f"确认要派的话：/start {task.id[:8]}")
         self._say("然后另开一个终端跑：python -m freeagent.delegate --dry-run")
         # 让通道层（飞书）能发一张动作卡：否则用户看到「确认要派的话：
         # /start ab12」却还得**手打这条命令**—— 而 11.9.8 说的「点一下即可」
         # 就没兑现。终端不读这个字段，所以这里设了也无副作用。
-        self._last_task_action = (task.id, task.title)
+        # 三元组 (id, title, state_label)：V1.61 起桥接用第三项做卡上
+        # 「当前状态」文案，today 卡传事务实际状态，委派卡传这句。
+        self._last_task_action = (task.id, task.title, "待办（执行器不会碰它）")
 
     def _cmd_task(self, args: list[str]) -> None:
         if not args:
@@ -2094,6 +2543,14 @@ class Repl:
             return
         view = self.app.restore.open_task(self._resolve_id(args[0]))
         self._say(render.render_task(view, self._names()))
+        # V1.66：飞书点开单条事务，带它自己的动作卡（同 today 卡，见 11.23）。
+        # 只对**未结束**的事务发：DONE / DROPPED 的按钮（start/done/pause）没有
+        # 意义，发了就是噪音。open_task 可能 mark_resumed（改了状态），
+        # 所以用返回的 view.task（最新那条）。
+        if view.task.is_open:
+            self._last_task_action = (
+                view.task.id, view.task.title, STATE_LABELS[view.task.state],
+            )
 
     # ---- 状态与调度 ---- #
     def _cmd_start(self, args: list[str]) -> None:
@@ -2430,7 +2887,7 @@ class Repl:
         if not args:
             self._say(
                 "用法：/pair <配对码>。\n"
-                "码从哪儿来：给 bot 发一条**私聊**，它会回一张带配对码的卡。\n"
+                "码从哪儿来：给 bot 发一条私聊，它会回一张带配对码的卡。\n"
                 "（群里不会发 —— 群里发卡等于向全群确认「这里有个 bot」。）"
             )
             return

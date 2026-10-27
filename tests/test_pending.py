@@ -16,7 +16,7 @@ import pytest
 
 from freeagent.app import build_app
 from freeagent.cli.render import render_pending, render_today
-from freeagent.domain import DEFAULT_ROLE_NAME
+from freeagent.domain import DEFAULT_ROLE_NAME, ORIGIN_CAPTURED
 from freeagent.domain.enums import CapturedStatus, TaskState
 from freeagent.feishu.bridge import FeishuBridge
 from freeagent.feishu.events import AttachmentRef, IncomingMessage
@@ -95,6 +95,9 @@ class TestPendingService:
         # 来源注记只记事实（不猜内容）：来源、类型、本地路径都在
         assert "feishu" in (task.intent or "")
         assert "/x/quote.pdf" in (task.intent or "")
+        # 来源是**结构化的**一列，不是靠 intent 的措辞去认（V1.93）：
+        # 改文案不会让「这是外部内容」这个判断失效。
+        assert task.origin == ORIGIN_CAPTURED
         # 捕获侧：关联 + 终态 + 出队
         stored = app.pending._captured.get(item.id)
         assert stored.status is CapturedStatus.CLARIFIED
@@ -158,6 +161,60 @@ class TestPendingService:
         task = app.pending.clarify(item.id)
         assert task.title.startswith("图片（")
         assert "k9" in (task.intent or "") or "meta.json" in (task.intent or "")
+
+
+# --------------------------------------------------------------------- 文本捕获
+class TestPendingTextCapture:
+    """录入口三件之文本捕获（V1.88）：kind="text"，落盘 .txt，media_key 占位空串。
+
+    与图片/文件同一条纪律：只入队不建事务（澄清是 /pending N），不猜内容
+    （切分只按行）。文本没有飞书媒体凭据，所以 media_key 给空串 —— 这正是
+    「原件在盘上、DB 里存引用」的延续。
+    """
+
+    def test_capture_text_single_mail_entry_lands_and_clarifies(self, env):
+        app, clock, _role = env
+        item = app.pending.capture_text(
+            source="mail", text="张总确认合同", name="转发：合同确认"
+        )
+        assert item.kind == "text" and item.source == "mail"
+        assert item.name == "转发：合同确认"
+        assert item.media_key == ""
+        assert Path(item.path).read_text(encoding="utf-8") == "张总确认合同"
+        assert app.pending.count() == 1
+        # 澄清后标题用显式 name（不猜内容，原样带走）
+        task = app.pending.clarify(item.id)
+        assert task.title == "转发：合同确认"
+
+    def test_capture_text_auto_title_uses_first_line(self, env):
+        app, _clock, _role = env
+        item = app.pending.capture_text(
+            source="mail", text="周三和张总确认\n（转发邮件，正文见下）"
+        )
+        assert item.name == "周三和张总确认"
+
+    def test_capture_text_blank_raises(self, env):
+        app, _clock, _role = env
+        with pytest.raises(Exception):
+            app.pending.capture_text(source="mail", text="   \n  ")
+
+    def test_capture_batch_splits_lines_and_skips_blanks(self, env):
+        app, _clock, _role = env
+        items = app.pending.capture_batch(
+            source="cli", text="周三和张总确认\n\n   \n周四交季度报告\n"
+        )
+        assert len(items) == 2, "空行/纯空白行要跳过"
+        assert [i.name for i in items] == ["周三和张总确认", "周四交季度报告"]
+        assert all(i.kind == "text" and i.source == "cli" for i in items)
+        assert app.pending.count() == 2
+        # 每条各自落盘成 .txt，内容即该行原文
+        for item in items:
+            assert Path(item.path).read_text(encoding="utf-8") == item.name
+
+    def test_capture_batch_all_blank_raises(self, env):
+        app, _clock, _role = env
+        with pytest.raises(Exception):
+            app.pending.capture_batch(source="cli", text="\n\n  \n")
 
 
 # --------------------------------------------------------------------- 渲染
@@ -323,6 +380,48 @@ class TestBridgeEnqueues:
         bridge._capture_unsupported(_msg(event_id="dup", message_id="", attachment=att))
         bridge._capture_unsupported(_msg(event_id="dup", message_id="", attachment=att))
         assert app.pending.count() == 1
+
+    # ---- 飞书长文本录入口（/capture、/mail，V1.88）------------------------ #
+    def _text_msg(self, text, **kw):
+        """文本消息：unsupported_type=None（不是图片/文件）。"""
+        return _msg(unsupported_type=None, text=text, **kw)
+
+    def test_feishu_capture_command_enqueues_batch(self, env, tmp_path):
+        app, _clock, _role = env
+        bridge, _home = self._bridge(app, tmp_path)
+        reply = bridge._route_capture(
+            self._text_msg("/capture\n周三和张总确认\n周四交季度报告")
+        )
+        assert reply and "2 条" in reply
+        assert app.pending.count() == 2
+        items = app.pending.pending()
+        assert [i.name for i in items] == ["周三和张总确认", "周四交季度报告"]
+        assert all(i.source == "feishu" and i.kind == "text" for i in items)
+
+    def test_feishu_mail_command_enqueues_single(self, env, tmp_path):
+        app, _clock, _role = env
+        bridge, _home = self._bridge(app, tmp_path)
+        reply = bridge._route_capture(
+            self._text_msg("/mail\n张总确认合同\n（正文细节）")
+        )
+        assert reply and "1 条" in reply
+        assert app.pending.count() == 1
+        item = app.pending.pending()[0]
+        assert item.source == "mail" and item.name == "张总确认合同"
+
+    def test_feishu_capture_command_alone_shows_usage_not_enqueue(self, env, tmp_path):
+        app, _clock, _role = env
+        bridge, _home = self._bridge(app, tmp_path)
+        reply = bridge._route_capture(self._text_msg("/capture"))
+        assert reply and "批量倾倒" in reply
+        assert app.pending.count() == 0, "命令单独一行：回用法，不猜用户想倒什么"
+
+    def test_feishu_capture_non_command_not_intercepted(self, env, tmp_path):
+        app, _clock, _role = env
+        bridge, _home = self._bridge(app, tmp_path)
+        assert bridge._route_capture(self._text_msg("普通文本")) is None, (
+            "非 /capture /mail 的命令或普通文本不拦"
+        )
 
 
 # ----------------------------------------------------------------- 通道收口

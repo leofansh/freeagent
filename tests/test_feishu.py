@@ -86,11 +86,16 @@ def _payload(
     mentions=None,
     message_type="text",
     event_type="im.message.receive_v1",
+    message_create_time="",
 ):
     """构造一个**照飞书文档抄的**事件，不是编的形状。
 
     content 是**嵌套**的 JSON 字符串 —— 飞书就这么发，
     只解一层会拿到一坨带转义的字。
+
+    ``message_create_time``：``message.create_time``（**毫秒字符串**），
+    时效窗口（11.9.2）用。默认空 —— 既有测试全部走「窗口放弃判定」的
+    旧路径，不会被这条新闸门误伤。
     """
     return {
         "schema": "2.0",
@@ -114,6 +119,7 @@ def _payload(
                 "message_type": message_type,
                 "content": json.dumps({"text": text}, ensure_ascii=False),
                 "mentions": mentions or [],
+                "create_time": message_create_time,
             },
         },
     }
@@ -2053,3 +2059,232 @@ class TestIdentityRecovery:
         assert sender.calls == before, (
             f"桥接已停却还在探：{before} → {sender.calls}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# V1.88：卡片内容净化 / 终态收据 / 时效窗口
+# --------------------------------------------------------------------------- #
+class TestCardContentSanitized:
+    """真机截图实证的三个渲染坑：反引号原样印、``**`` 原样印、文案说两遍。
+
+    飞书卡片对 ``plain_text`` 完全不解析 markdown、对 ``lark_md``
+    不支持行内代码 —— 符号会**原样出现在卡上**。净化收在构造器一处
+    （「一处成形」），调用方（delegate 拼的 subject/detail）不用管。
+    """
+
+    def test_update_multi_is_explicit_on_every_1_0_card(self):
+        """省略 = 独享卡片 = 只有签发方可见；且 V1.88 的 PATCH 收尾以它为前提。"""
+        from freeagent.feishu.sender import (
+            _approval_card, _decided_card, _question_card, _tool_card,
+        )
+
+        for card in (
+            _approval_card("s", "d", "cred"),
+            _tool_card("s", "d", "cred"),
+            _question_card("s", "d", 600),
+            _decided_card("s", "已允许", granted=True),
+        ):
+            assert card["config"]["update_multi"] is True, type(card)
+
+    def test_backticks_never_reach_the_card(self):
+        from freeagent.feishu.sender import _approval_card, _tool_card
+
+        for build in (_approval_card, _tool_card):
+            card = build("opencode 想 `shell`", "动作：`shell`", "cred")
+            assert "`" not in card["header"]["title"]["content"]
+            body = card["elements"][0]["text"]["content"]
+            assert "`" not in body, f"反引号会原样印在卡上：{body}"
+
+    def test_tool_card_note_no_longer_repeats_the_scope(self):
+        """「仅这一次 + 下次再问」detail 里已有；note 只留「沉默不等于同意」。"""
+        from freeagent.feishu.sender import _tool_card
+
+        card = _tool_card("s", "授权范围：仅这一次动作（remote 档，1800s 内有效）。", "cred")
+        note = card["elements"][1]["elements"][0]["content"]
+        assert "**" not in note, "plain_text 不解析 markdown，** 会原样印"
+        assert "沉默不等于同意" in note
+        assert "下一个动作还会再问" not in note, "与 detail 重复"
+
+
+class TestSettleCard:
+    """V1.88：已定案卡用 PATCH 原地改写成一行收据，**不再撤回**。
+
+    撤回在飞书里每张留一条「撤回了一条消息」墓碑（真机 9 连实证）——
+    清理行为本身成了最大的噪音。改写后留下的是可回看的收据。
+    """
+
+    def test_sends_patch_with_terminal_card(self, sender_cfg):
+        from freeagent.feishu.sender import FeishuSender
+
+        calls = []
+
+        def transport(url, payload, headers, timeout, method="POST"):
+            calls.append((url, dict(payload), method))
+            if "tenant_access_token" in url:
+                return json.dumps({"code": 0, "msg": "ok",
+                                   "tenant_access_token": "t-1", "expire": 7200})
+            return json.dumps({"code": 0, "msg": "ok", "data": {}})
+
+        FeishuSender(sender_cfg, transport=transport).settle_card(
+            "om_1", subject="opencode 想 shell", verdict="**已允许。**",
+        )
+        url, payload, method = calls[-1]
+        assert method == "PATCH", "必须是原地改写，不是 DELETE"
+        assert url.endswith("/im/v1/messages/om_1")
+        card = json.loads(payload["content"])
+        assert card["header"]["template"] == "grey"
+        # 终态卡**没有按钮**：留着可点的按钮等于骗人（_decided_card 同一条）。
+        assert not [e for e in card["elements"] if e.get("tag") == "action"]
+
+    def test_empty_message_id_is_rejected(self, sender_cfg):
+        from freeagent.feishu.sender import FeishuSender
+
+        with pytest.raises(ValueError, match="message_id"):
+            FeishuSender(sender_cfg, transport=lambda *a, **k: "{}").settle_card("")
+
+
+class TestStaleMessageWindow:
+    """11.9.2 时效窗口：无键重投的最后防线。
+
+    去重挡「同键重投」，但 event_id/message_id **可能双双缺失**（实测
+    发生过），去重表损坏隔离后也会以空表重启 —— 创建时刻是唯一不依赖
+    任何 id 的判据。
+    """
+
+    NOW = 1_700_000_900.0
+
+    def _bridge(self, tmp_path, clock, now):
+        app = build_app(tmp_path / "s.db", clock=clock)
+        cfg = load_config({
+            ENV_APP_ID: "cli_x", ENV_APP_SECRET: "secret",
+            ENV_ALLOWED: f"{ALICE},{BOB}",
+        })
+        channel = ChannelService(app, allowed_senders=cfg.allowed_users)
+        b = FeishuBridge(channel, FakeSender(), cfg, bot_open_id=BOT,
+                         clock=lambda: now)
+        return b, app
+
+    def _msg(self, create_time_ms: str):
+        msg = parse_event(_payload(message_create_time=create_time_ms))
+        assert isinstance(msg, IncomingMessage)
+        return msg
+
+    def test_message_older_than_window_is_dropped(self, tmp_path, clock):
+        """晚到超过 10 分钟 = 重投残件：静默忽略（回话会替重投刷屏）。"""
+        b, app = self._bridge(tmp_path, clock, self.NOW)
+        try:
+            b._process(self._msg("1700000000000"))   # 恰好比 NOW 早 900s
+            assert b.sender.sent == [], "过期消息不该触发任何回复"
+        finally:
+            b.stop()
+            app.close()
+
+    def test_fresh_message_still_processed(self, tmp_path, clock):
+        """窗口内的消息照常走：闸门只挡残件，不挡活人。"""
+        b, app = self._bridge(tmp_path, clock, self.NOW)
+        try:
+            b._process(self._msg("1700000895000"))   # 只早 5s
+            assert b.sender.sent, "窗口内的消息必须照常处理"
+        finally:
+            b.stop()
+            app.close()
+
+    def test_missing_create_time_keeps_old_behavior(self, tmp_path, clock):
+        """没有创建时刻 = 窗口放弃判定（退回旧行为），**不是**把消息当过期。"""
+        b, app = self._bridge(tmp_path, clock, self.NOW)
+        try:
+            b._process(self._msg(""))
+            assert b.sender.sent, "缺 create_time 不该被时效窗口误杀"
+        finally:
+            b.stop()
+            app.close()
+
+
+class TestPostAttachment:
+    """「图片+文字一起发」= post 富文本：内联图片**收下而非丢弃**（11.9.10）。
+
+    生态 ``opencode-feishu-plugin`` v0.2.25 踩的同款坑：只按 image/file
+    解析时，post 里的图整张丢 —— 我们 ``_extract_attachment`` 原来只认
+    两种 msg_type，post 是 V1.48 捕获摩擦的最后一个口。
+    """
+
+    @staticmethod
+    def _post_payload(content_obj, message_type="post"):
+        p = _payload(message_type=message_type)
+        p["event"]["message"]["content"] = json.dumps(content_obj, ensure_ascii=False)
+        return p
+
+    def test_inline_image_in_post_is_extracted(self):
+        from freeagent.feishu.events import AttachmentRef, parse_event
+
+        got = parse_event(self._post_payload({
+            "title": "", "content": [
+                [{"tag": "text", "text": "和张总确认合同"}],
+                [{"tag": "img", "image_key": "img_v2_abc"}],
+            ],
+        }))
+        assert isinstance(got, IncomingMessage)
+        assert got.attachment == AttachmentRef(
+            type="image", key="img_v2_abc", name="image", size=0,
+        )
+
+    def test_old_event_shape_with_post_wrapper(self):
+        from freeagent.feishu.events import parse_event
+
+        got = parse_event(self._post_payload({
+            "post": {"title": "", "content": [
+                [{"tag": "img", "image_key": "img_v2_old"}],
+            ]},
+        }))
+        assert isinstance(got, IncomingMessage)
+        assert got.attachment is not None and got.attachment.key == "img_v2_old"
+
+    def test_inline_file_is_extracted_too(self):
+        from freeagent.feishu.events import parse_event
+
+        got = parse_event(self._post_payload({
+            "content": [[{"tag": "file", "file_key": "file_v2_1",
+                          "file_name": "合同.pdf", "file_size": 12}]],
+        }))
+        assert isinstance(got, IncomingMessage)
+        assert got.attachment is not None
+        assert (got.attachment.type, got.attachment.key,
+                got.attachment.name, got.attachment.size) == (
+            "file", "file_v2_1", "合同.pdf", 12,
+        )
+
+    def test_post_without_media_yields_no_attachment(self):
+        from freeagent.feishu.events import parse_event
+
+        got = parse_event(self._post_payload({
+            "content": [[{"tag": "text", "text": "纯文字的富文本"}]],
+        }))
+        assert isinstance(got, IncomingMessage)
+        assert got.attachment is None
+
+
+class TestThreadRefs:
+    """V1.90：话题里的消息带 ``root_id`` / ``thread_id``。
+
+    这是「这句话属于哪条委派」的**唯一确定性判据**：话题根就是那张进度卡，
+    ``root_id`` 指向它，而发卡时同一个值记进了
+    ``pending_approvals.thread_root``。缺这个字段的话，多委派并行时
+    只能按「最新一条提问」猜 —— 猜错就是替人答错题。
+
+    真机实证见 ``tools/probe_topic.py``：话题里每条消息的 root_id /
+    parent_id 都指向根消息，thread_id 相同。
+    """
+
+    def test_topic_message_carries_root_and_thread(self):
+        p = _payload()
+        p["event"]["message"]["thread_id"] = "omt_abc"
+        p["event"]["message"]["root_id"] = "om_x_root"
+        got = parse_event(p)
+        assert isinstance(got, IncomingMessage)
+        assert (got.thread_id, got.root_id) == ("omt_abc", "om_x_root")
+
+    def test_message_outside_topic_has_empty_refs(self):
+        """主聊天流里的消息没有话题 —— 空串，不是 None（免得到处判空）。"""
+        got = parse_event(_payload())
+        assert isinstance(got, IncomingMessage)
+        assert (got.thread_id, got.root_id) == ("", "")

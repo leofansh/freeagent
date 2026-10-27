@@ -143,3 +143,46 @@ def test_web_repl_surfaces_the_notice_on_the_next_message(svc):
     payload = command_payload(app, "/help")
     assert "上次的规划还在" in payload["text"], \
         f"Web 恢复是静默的：{payload['text']!r}"
+
+
+# --------------------------------------------------------------------------- #
+# V1.91：出路必须指对，丢弃必须真的生效
+# --------------------------------------------------------------------------- #
+def test_notice_points_at_discard_not_a_dead_end(svc):
+    """「不想继续」必须指出**真能走的**那条路。
+
+    旧文案是「不想继续就 /mode-build 或直接重说」，而无参 ``/mode-build``
+    只是**重新出一张确认卡** —— 用户照做会得到一张卡，然后更懵。
+    提示写错路比不写更坏：它让人以为自己已经照做过一遍了。
+    """
+    service, _app = svc
+    service._run("chat_A", "ou_x", "/mode-plan")
+    service._run("chat_A", "ou_x", "一")
+    service._run("chat_B", "ou_x", "/mode-plan")
+    reply = service._run("chat_A", "ou_x", "二")
+    assert "discard" in reply, f"恢复告知没给出路：{reply!r}"
+
+
+def test_discard_survives_restart(tmp_path):
+    """丢弃之后再重启，**不许**把计划恢复回来。
+
+    这才是「出边」真正成立的标准：Plan 是落盘的，只在内存里清空等于
+    下次打开又回来 —— 用户会以为自己的操作没生效（而系统确实没照做）。
+    """
+    app1 = build_app(tmp_path / "a.db")
+    svc1 = ChannelService(app1, max_chats=8)
+    svc1._run("chat_A", "ou_x", "/mode-plan")
+    svc1._run("chat_A", "ou_x", "不要了")
+    svc1._run("chat_A", "ou_x", "/mode-build discard")
+    app1.close()
+
+    app2 = build_app(tmp_path / "a.db")
+    try:
+        svc2 = ChannelService(app2, max_chats=8)
+        reply = svc2._run("chat_A", "ou_x", "你好")
+        assert "上次的规划还在" not in reply, f"丢掉的计划又回来了：{reply!r}"
+        r = svc2._repls["chat_A"]
+        assert r._plan == [], f"计划被恢复了：{r._plan}"
+        assert r._mode == MODE_BUILD, f"模式被恢复了：{r._mode}"
+    finally:
+        app2.close()

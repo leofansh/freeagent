@@ -39,7 +39,11 @@ import pytest
 from freeagent.app import build_app
 from freeagent.domain import RecordType
 from freeagent.services.clock import FrozenClock
-from freeagent.services.feedback import feedback_report, read_outcome
+from freeagent.services.feedback import (
+    feedback_report,
+    read_outcome,
+    revision_drift,
+)
 
 NOW = datetime.datetime(2026, 10, 17, 9, 0, 0)
 
@@ -333,3 +337,49 @@ class TestWhatItDeliberatelyDoesNotDo:
         assert "in_flight" not in body_code.replace("_in_flight", ""), (
             "自己累积 in_flight = 第二份推导"
         )
+
+
+# =============================================================================
+class TestRevisionDrift:
+    """V1.92：「人改了什么」**唯一**能算出来的地方。
+
+    审批卡上只有同意 / 拒绝 / 叫停 —— 没有「改一下」这个动作，所以审批
+    那条线记不下改动。真正的改动发生在 ``revise``，而它永远产生新版本、
+    旧版不删，于是两版摆在一起，差多少行是可以**算出来**的。
+    """
+
+    def test_counts_added_and_removed(self):
+        d = revision_drift("a\nb\nc\n", "a\nB\nc\nd\n")
+        assert (d.added, d.removed) == (2, 1)
+
+    def test_identical_text_is_zero(self):
+        d = revision_drift("a\nb\n", "a\nb\n")
+        assert (d.added, d.removed, d.samples) == (0, 0, ())
+
+    def test_hunk_headers_not_counted(self):
+        """``---`` / ``+++`` / ``@@`` 是分隔符，不是内容。
+
+        不跳过的话，每处变更都会凭空多算两行「增删」—— 而那个数会被
+        读成「他改了好多」，与事实差一倍。
+        """
+        d = revision_drift("a\n", "b\n")
+        assert (d.added, d.removed) == (1, 1)
+
+    def test_samples_capped(self):
+        d = revision_drift("", "\n".join(str(i) for i in range(10)))
+        assert d.added == 10
+        assert len(d.samples) == 4, "默认只列 4 行样本"
+
+    def test_negative_sample_yields_none(self):
+        """负数是调用方的 bug，但不能让它变成 Python 切片语义（从尾部取）。"""
+        d = revision_drift("", "x\ny\n", sample=-3)
+        assert d.samples == ()
+
+    def test_samples_keep_sign_and_order(self):
+        d = revision_drift("旧的一行\n", "新的一行\n")
+        assert [s for s, _ in d.samples] == ["-", "+"], "unified diff 先删后增"
+
+    def test_whitespace_only_change_still_counts(self):
+        """行尾空格也是改动 —— 这里数的是**行**，不做「实质差异」判断。"""
+        d = revision_drift("a\n", "a \n")
+        assert (d.added, d.removed) == (1, 1)

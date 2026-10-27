@@ -19,14 +19,14 @@ import pytest
 
 from freeagent.feishu import bridge as bridge_mod
 from freeagent.services.approval import ApprovalStore
-from freeagent.storage.db import connect, init_schema
+from freeagent.storage.db import connect, migrate
 
 
 @pytest.fixture
 def wired(tmp_path):
     """把连接注入模块全局，并保证测试后还原。"""
     conn = connect(Path(tmp_path) / "a.db")
-    init_schema(conn)
+    migrate(conn)
     old = bridge_mod._card_conn
     bridge_mod._card_conn = conn
     try:
@@ -99,7 +99,7 @@ class TestRejects:
     def test_no_connection_writes_nothing(self, tmp_path):
         """没注入连接 → 明确拒绝。**不能偷偷新建连接**，也不能猜成允许。"""
         conn = connect(Path(tmp_path) / "a.db")
-        init_schema(conn)
+        migrate(conn)
         store = ApprovalStore(conn)
         item = store.ask("x")
         old = bridge_mod._card_conn

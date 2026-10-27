@@ -94,12 +94,12 @@ def today_payload(
         "day": view.day.isoformat(),
         "disclaimer": DISCLAIMER_MARKER,
         "count": len(view.items),
-        # 没排期的**不进**今天视图（设计如此），但条数照报 —— 不报的话
-        # 界面显示「今天 0 条」，而用户刚记的那件事其实在库里。
+        # 没排期/排未来的**不进**今天视图（6.2），但条数照报——否则刚记
+        # 的事像凭空消失（V1.84，同构静默）。
         "unscheduled_count": view.unscheduled_count,
-        # 待处理收集器的条数（11.18 / 11.19）。**只报数不报内容** ——
-        # 收集器是工作台，今天这块屏幕只负责提醒「还有没收揽的活」。
-        # 0 条照报（前端据此隐藏那一行），不像 CLI 那样「0 条不占位」。
+        "future_count": view.future_count,
+        "earliest_future": view.earliest_future.isoformat() if view.earliest_future else None,
+        # 待处理收集器条数（11.18/11.19）：只报数，0 条照报（前端据此隐藏）。
         "pending_count": pending_count,
         "items": [
             scored_payload(s, names, rolled_over=s.task.id in rolled)
@@ -144,9 +144,9 @@ def model_payload(view, now=None) -> dict:
             {"id": r[0], "name": r[1], "open_promises": r[2], "open_waitings": r[3]}
             for r in view.relationships
         ],
-        "commitments": [
-            {"kind": c[0], "text": c[1], "overdue": c[2]} for c in view.commitments
-        ],
+        "commitments": [{"kind": c[0], "text": c[1], "overdue": c[2]} for c in view.commitments],
+        # V1.69 滋养兴趣（记录优先）：记下的「偏好」原样带出，不评价不催促
+        "preferences": [{"text": t} for _k, t in view.preferences],
         "disclaimer": DISCLAIMER_MARKER,
     }
 

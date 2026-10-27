@@ -33,7 +33,7 @@ import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:  # 仅类型标注用：运行时不需要 services 层（装配在 main 里做）
     from ..services.pending import PendingService
@@ -156,6 +156,30 @@ def _safe_attachment_name(name: str) -> str:
     return cleaned[:120] if cleaned else ""
 
 
+#: 入站消息的**时效窗口**（秒）。晚到超过它的消息判为重投残件，直接忽略。
+#:
+#: 取值依据：飞书长连接只对**未确认**的事件做重投，重投发生在秒~分钟级；
+#: 真正的用户新消息从发送到送达远小于它。取 10 分钟是放宽一档的保守值
+#: —— 宁可漏掉极端离线积压的旧消息（用户重发即可），不可重复处理一条
+#: 重投（重复建事务正是 11.9.2 要防的事）。与 :mod:`.dedup` 的 24h TTL
+#: 是两道独立的闸：那道挡「同键重投」，这道挡「无键重投」。
+STALE_MESSAGE_SECONDS = 600
+
+
+def _event_seconds(create_time: str) -> "float | None":
+    """把飞书的毫秒字符串（``"1730000000000"``）折成秒。缺/坏返回 ``None``。
+
+    返回 ``None`` = 没有可信的创建时刻，时效窗口**放弃判定**（退回旧行为），
+    而不是把坏时间当成「刚发生」—— 后者会把真消息误杀。
+    """
+    if not create_time:
+        return None
+    try:
+        return float(create_time) / 1000.0
+    except ValueError:
+        return None
+
+
 class FeishuBridge:
     """把飞书消息接到本地助手上。**不直接持有 SDK 客户端**，只管路由。"""
 
@@ -169,6 +193,7 @@ class FeishuBridge:
         reporter: StatusReporter | None = None,
         home: "Path | None" = None,
         pending: "PendingService | None" = None,
+        clock: "Callable[[], float] | None" = None,
     ) -> None:
         """
         ``bot_open_id`` 是 bot 自己的 ``open_id``，**群聊 @ 门控的唯一依据**。
@@ -184,12 +209,16 @@ class FeishuBridge:
         ``pending`` 是待处理收集器（11.18）。收下的附件除了落盘，还要
         进这条队列等用户显式澄清 —— 不传（离线测试）时只落盘不入队，
         行为与 V1.48 一致：**收下但不建事务**这条纪律两种情况下都成立。
+
+        ``clock`` 是时效窗口（11.9.2）用的钟，**必须可注入** —— 测试用
+        FrozenClock 驱动「消息晚到多久算过期」，真钟一跑测试就没法离线了。
         """
         self.channel = channel
         self.sender = sender
         self.config = config
         self.bot_open_id = bot_open_id or None
         self.reporter = reporter
+        self._clock = time.time if clock is None else clock
         #: 状态目录（config.json / 附件落盘都在这下面）。``None`` 时落盘用
         #: ``state_home(None)`` 重新解析，与 ``build_app`` 同一条规则。
         self._home = home
@@ -322,7 +351,18 @@ class FeishuBridge:
 
         store = ApprovalStore(_card_conn, clock=_card_clock)
         who = msg.sender_open_id or ""
-        pending = store.pending_question_for(who)
+        # V1.90：**先按话题归属**，再退回「取最新一条」。
+        #
+        # 用户在哪条委派的话题里说话，``root_id`` 就指向那张进度卡
+        # （真机实证：话题里每条消息的 root_id/parent_id 都是根消息），
+        # 而发卡时把它记进了 ``pending_approvals.thread_root``（delegate
+        # 传 reply_to → record_card）。所以在话题里答题是**确定**归属的。
+        #
+        # 话题里没有对应提问时**不退回**「最新一条」：那等于把这句话写进
+        # 另一条委派的问答槽位 —— 替人答错题，比不答更坏。这时返回 None，
+        # 消息照常走命令/闲聊路径（fail-closed，同 11.19.5 的一贯口径）。
+        root = (getattr(msg, "root_id", "") or "").strip()
+        pending = store.pending_question_for(who, thread_root=root or None)
         if pending is None:
             return None                      # 没有挂起的提问 → 不拦
 
@@ -584,6 +624,89 @@ class FeishuBridge:
         self._send_brief_confirm(msg, entry)
         return ""                            # 卡已说明一切，不必再回文字
 
+    def _route_capture(self, msg) -> str | None:
+        """这条是不是飞书长文本录入口（``/capture`` / ``/mail``）？``None`` = 不拦。
+
+        返回值口径与 :meth:`_route_menu` 一致：``None`` = 不拦，
+        空串 = 已处理且不用再回话，非空 = 已处理且要把这段话回过去。
+
+        ## 为什么在 ``channel.handle`` 之前
+
+        飞书没有终端那种「多行粘贴」—— 长文本录入口的形态是**命令带内容**：
+        ``/capture`` 后直接附多行文本（按行切成多条进待处理队列），
+        ``/mail`` 后附邮件正文（整段一条，首行当标题）。两者都走同一个服务层
+        入口（``PendingService.capture_batch`` / ``capture_text``），与 CLI /
+        Web 一份能力一份实现。**只入队，不建事务**（11.18：澄清由用户显式
+        触发），所以必须在 ``channel.handle`` 之前拦 —— 否则 `「/capture 周三…」
+        会被意图分类当成建事务的话来解析。
+
+        ## 白名单与去重：插在前面，所以这两道闸门要自己补
+
+        与 :meth:`_route_menu` 完全同因（见那段注释）：两道闸门原本都在
+        ``handle`` 里，插在它前面就一起绕过了。白名单外的人回一句话等于向
+        陌生人确认「这里有个 bot」；而 ``is_duplicate`` 一次调用即完成
+        「查重 + 记下」—— 首次返回 ``False`` 已写表，重投返回 ``True`` 跳过。
+        """
+        if msg.unsupported_type:
+            return None
+        text = (msg.text or "").strip()
+        if not text:
+            return None
+        lines = [ln.strip() for ln in text.splitlines()]
+        if not lines:
+            return None
+        cmd = lines[0]
+        if cmd not in ("/capture", "/mail"):
+            return None
+        body_lines = [ln for ln in lines[1:] if ln]
+        body = "\n".join(body_lines)
+
+        if not self.channel.is_allowed(msg.sender_ids):
+            log.info(
+                "发送者不在白名单，%r 不消费也不回话：%s",
+                cmd, self.channel.allowlist_mismatch(msg.sender_ids),
+            )
+            return ""                        # 真静默：None 会交回 handle 回「没有权限」
+
+        key = msg.dedup_key
+        if key and self.channel.dedup.is_duplicate(key):
+            log.info("重复事件（%r），不重复入队（key=%s）", cmd, key)
+            return ""
+        if not key:
+            log.warning(
+                "这条 %r 消息既无 event_id 也无 message_id，**无法去重**；"
+                "若被飞书重投，会重复入队（chat=%s）",
+                cmd, msg.chat_id,
+            )
+
+        if not body:
+            # 命令单独一行（没带内容）：回用法，不建状态 —— 不猜用户想倒什么。
+            hint = (
+                "批量倾倒：/capture 后直接附文本，每行一条进待处理队列。"
+                "例如：\n/capture\n周三和张总确认合同\n周四交季度报告"
+                if cmd == "/capture"
+                else "邮件：/mail 后直接附邮件正文，整段一条进待处理队列（首行当标题）。"
+            )
+            return hint
+
+        try:
+            if cmd == "/capture":
+                with self._db_lock():
+                    items = self._pending.capture_batch(
+                        source="feishu", text=body
+                    )
+                return (
+                    f"已入待处理队列 {len(items)} 条 → 用「待处理」查看并澄清。"
+                )
+            with self._db_lock():
+                item = self._pending.capture_text(
+                    source="mail", text=body, name=body_lines[0]
+                )
+            return f"已收进待处理队列 1 条（{item.name}）→ 「待处理」查看并澄清。"
+        except Exception:  # noqa: BLE001 - 入队是辅助步骤，不许把回复搞崩
+            log.exception("飞书 %r 入队失败（chat=%s）", cmd, msg.chat_id)
+            return "入待处理队列失败（详见日志）；文本没丢，可稍后再试。"
+
     def _send_brief_confirm(self, msg, entry) -> None:
         """收到简报后发确认卡。**发卡失败只记日志，不抛** —— 简报已填进
         快照，用户重发一次即可；抛出去会连带吃掉这条消息的处理。
@@ -650,6 +773,24 @@ class FeishuBridge:
         return "" if problem is None else problem
 
     def _process(self, msg: IncomingMessage) -> None:
+        ## 时效窗口（11.9.2）：晚到太久的一律不算数
+        #
+        # 去重挡的是「同一把键来两次」，但键**可能双双缺失**（实测发生过），
+        # 且去重表损坏隔离后会以空表重启 —— 那时重投就是「新消息」。
+        # 创建时刻是**不依赖任何 id** 的最后防线：晚到超过窗口的消息判为
+        # 重投残件，直接忽略。
+        #
+        # **为什么不回话**：能晚到这么久的消息几乎必然是重投（原投早已
+        # 处理并回复过），再回一句等于替重投又刷一次屏。证据进日志。
+        created = _event_seconds(msg.create_time)
+        if created is not None and self._clock() - created > STALE_MESSAGE_SECONDS:
+            log.warning(
+                "这条消息创建于 %.0f 秒前，超过时效窗口 %ss —— 判为重投残件，"
+                "忽略（chat=%s event_id=%r message_id=%r）",
+                max(self._clock() - created, 0.0), STALE_MESSAGE_SECONDS,
+                msg.chat_id, msg.event_id, msg.message_id,
+            )
+            return
         if msg.unsupported_type:
             # 不支持的消息类型：回一句提示，但**绝不进派发逻辑**。
             # 见设计方案 11.9.1「不支持的消息类型要回一句提示，不能沉默」。
@@ -718,6 +859,18 @@ class FeishuBridge:
                     self.sender.send_text(msg.chat_id, brief)
                 except Exception:  # noqa: BLE001 - 回复失败不得拖垮处理
                     log.exception("回简报提示失败（chat=%s）", msg.chat_id)
+            return
+
+        # 再问：这是不是飞书长文本录入口（/capture、/mail）。**必须在
+        # channel.handle 之前** —— 否则「/capture 周三…」会被意图分类当成建
+        # 事务的话来解析。与 _route_brief 同一把尺子（流程状态优先于意图分类）。
+        capture = self._route_capture(msg)
+        if capture is not None:
+            if capture:
+                try:
+                    self.sender.send_text(msg.chat_id, capture)
+                except Exception:  # noqa: BLE001 - 回复失败不得拖垮处理
+                    log.exception("回捕获提示失败（chat=%s）", msg.chat_id)
             return
 
         reply = self.channel.handle(
@@ -837,7 +990,7 @@ class FeishuBridge:
             #
             # 正文**照发**（上面已经 `send_text` 了）：发卡可能失败，而
             # 「点了没反应」比「多点一次」糟得多。
-            task_id, title = reply.task_action
+            task_id, title, state_label = reply.task_action
             try:
                 send_task_action_card(
                     self.sender,
@@ -845,7 +998,7 @@ class FeishuBridge:
                     title=title,
                     task_id=task_id,
                     chat_id=msg.chat_id,
-                    state="待办（执行器不会碰它）",
+                    state=state_label,
                 )
                 log.info("已发事务动作卡：chat=%s，task=%s", msg.chat_id, task_id[:8])
             except Exception:  # noqa: BLE001 - 发卡失败不该让消息变没反应
@@ -1581,7 +1734,7 @@ def _card_action(data: Any = None) -> dict[str, Any]:
                     _decided_card("无法停止", "**只有发起人能停止这条委派。**", granted=False),
                     "warning", "你不是这条委派的发起人",
                 )
-            store.resolve(credential, "deny", decided_by=who)
+            store.resolve(credential, "deny", decided_by=who, via="stop")
             store.request_stop(credential, by=who)
             log.info("【卡片动作】用户叫停（凭据=%s 点击者=%s）", credential, who)
             return _card_action_response(
@@ -1594,6 +1747,7 @@ def _card_action(data: Any = None) -> dict[str, Any]:
             credential,
             "allow" if choice == "allow_once" else "deny",
             decided_by=who,
+            via="card",
         )
         # **不是发起人**要单独判、单独说 —— 它和「已决定过」「已过期」在
         # :meth:`resolve` 里都是 ``False``，但给用户的话**完全不同**。
@@ -2202,7 +2356,7 @@ def _run_plan_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     chat_id = str(value.get("chat") or "").strip()
     if not choice or not chat_id:
         return _no_card_change("确认卡载荷不完整，未处理")
-    if choice not in ("ok", "cancel"):
+    if choice not in ("ok", "cancel", "discard"):
         # 不猜。认不出的 choice **只把卡收掉**，不发话 ——
         # 说「已确认」而实际没做，比什么都不说糟得多。
         log.info("【确认卡】认不出的 choice=%r（chat=%s）—— 只收卡", choice, chat_id)
@@ -2235,11 +2389,18 @@ def _run_plan_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
         log.warning("【确认卡】回话失败（chat=%s）", chat_id, exc_info=True)
 
     # 2) 卡片回写把按钮**收掉** —— 留着可点的按钮等于骗人（实测过的坑）。
-    heading = "已确认执行" if choice == "ok" else "已取消"
-    body = ("**已按你确认的计划建好事务。**" if choice == "ok"
-            else "**好，先留着。** 计划还在，随时可以再确认。")
+    #
+    # 三个 choice 各自的终态文案（V1.91 加 ``discard``）：**每条都要说清
+    # 「计划还在不在」**，因为这三个按钮的区别恰恰只有这一件事，而用户
+    # 点完之后最想知道的就是它。
+    heading, body, granted = {
+        "ok": ("已确认执行", "**已按你确认的计划建好事务。**", True),
+        "cancel": ("已取消", "**好，先留着。** 计划还在，随时可以再确认。", False),
+        "discard": ("已丢弃", "**计划已经丢掉了，一条都没建。**"
+                              "现在是正常模式，直接说要做什么就行。", False),
+    }[choice]
     return _card_action_response(
-        _decided_card(heading, body, granted=(choice == "ok")),
+        _decided_card(heading, body, granted=granted),
         "success", heading,
     )
 
@@ -2462,7 +2623,7 @@ def _run_delegate_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     # 按钮走 _run_card_command，它有自己的窄白名单（只放 /start /done /pause），
     # 所以补发是安全的：即使 reply.task_action 被伪造，也只能触发这三个状态迁移。
     if reply.task_action:
-        task_id, title = reply.task_action
+        task_id, title, _state_label = reply.task_action
         try:
             send_task_action_card(
                 _card_sender,

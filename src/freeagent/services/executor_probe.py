@@ -96,6 +96,11 @@ def _probe_executor(
     detect: Callable[[str], int | None],
     expected_major: int,
     unverified_reason: Callable[[int], str],
+    nondispatchable_reason: Callable[[int], str] | None = None,
+    disabled_reason: Callable[[int], str] | None = None,
+    capabilities: Callable[[bool], tuple[Bucket, ...]] = lambda v: _buckets_for(
+        verified=v
+    ),
 ) -> ExecutorProbe:
     """探测一个执行器的**共同骨架**。
 
@@ -110,6 +115,19 @@ def _probe_executor(
     而且两个执行器「为什么没验过」的原因**根本不同**
     （opencode 是字段名改名，hermes 是传输层都不一样），
     合成一句通用的「未验证」等于让人自己猜下一步 —— 那正是纪律 2 要防的。
+
+    ``nondispatchable_reason`` 处理「**验过接线但不可委派**」的执行器
+    （曾经是 hermes：``verified=True`` 但 ``dispatchable=False``）。此时不能
+    说「未验证」（那是在说谎），要说清「为什么验过了还是不能派」。不传则沿用
+    :param:`unverified_reason`（对 opencode 来说，verified 与 dispatchable
+    总是同真同假，用不上）。
+
+    ``disabled_reason`` 处理「**已停用**」的执行器（V1.83 的 hermes）：它不是
+    没验过、也不是不能委派，而是**决定不用了、代码保留作接缝**。停用优先于
+    其余：只要适配器 ``disabled``，就按停用报（verified 不给、一桶能力都不给）。
+
+    ``capabilities`` 默认按 ``verified`` 给三桶；需要单独覆盖（曾经是 hermes
+    只 /ask 知识问答，现在停用了）—— 见 :func:`probe_hermes`。
     """
     from .executors import adapter_for, dispatchable_majors
 
@@ -142,6 +160,15 @@ def _probe_executor(
             "请升级本仓，或把执行器降回已知版本 —— "
             "未知版本的 permission 字段名会被**静默忽略**，闸门随之失效。"
         )
+    elif adapter.disabled and disabled_reason is not None:
+        # 停用优先于「验过但不能委派」：不是没验过，是决定不用了。
+        # 能力一桶都不给（verified 保持 False，避免被读成「能读」）。
+        verified = False
+        reason = disabled_reason(detected)
+    elif verified and nondispatchable_reason is not None:
+        # 验过接线、但设计上不走委派（曾经是 hermes 只 /ask）。要跟「未验证」
+        # 分开给理由 —— 前者是「能问不能派」，后者是「连问都还没验」。
+        reason = nondispatchable_reason(detected)
     else:
         reason = unverified_reason(detected)
 
@@ -151,7 +178,7 @@ def _probe_executor(
         detected_major=detected,
         dispatchable=dispatchable,
         verified=verified,
-        capabilities=_buckets_for(verified=verified),
+        capabilities=capabilities(verified),
         unavailable_reason=reason,
     )
 
@@ -180,36 +207,30 @@ def probe_opencode(command: str = "opencode") -> ExecutorProbe:
 def probe_hermes(command: str = "hermes") -> ExecutorProbe:
     """探测 hermes 这个执行器。
 
-    ## 它有两条面，而**走对的那条与 opencode 同构**
+    ## V1.83 起：已停用
 
-    - **ACP**（``hermes acp``）—— stdio 上的 JSON-RPC
-    - **API Server**（``hermes gateway``，HTTP 默认 8642）—— ``POST /v1/runs``
-      + ``GET /v1/runs/{id}/events``（SSE）+ ``/stop`` + ``/approval``
+    hermes 从执行器注册表**停用**（适配器 ``disabled=True``，代码保留作接缝）。
+    停用的原因见下 —— 它是「决定不用了」，不是「没验过」或「还没接上」。
+    所以只要装了，本探针就报「已停用」，能力一桶都不给、verified 不给。
 
-    走下面那条时，形状与 opencode **是同构的**（同为 HTTP + SSE，
-    授权事件 ``approval.request`` 对得上 opencode 的 ``permission.asked``），
-    **不必换传输层，也不必引 ACP SDK**。
+    ## 为什么停用（V1.82 真机证伪初稿的假设）
 
-    ## 那为什么还是不可派发
+    hermes 的审批闸是**「按模式标记」而非「每动作确认」**：``approvals.mode``
+    只决定**已被它判为危险**的动作怎么处理，不会把更多动作标记为危险 ——
+    ``del`` / 简单 ``write_file`` 到普通路径不在危险清单里，API 面与飞书面
+    都会**直接执行而不弹审批**（manual + 重启也拦不住）。所以它**做不了执行期
+    逐次授权，连「只读改不了」都保证不了** —— 不能作为受控执行器。
 
-    因为上面这些是**读文档读来的，一次真机都没验过** —— 而 11.8.1 的教训
-    正是「照文档接线、字段名对不上时不报错、闸门静默失效」。
+    FreeAgent 的处置（方案 B）：执行 + 飞书确认走 **opencode**（全控）；
+    hermes 不再当执行器用。你若真想用 hermes，直接用它的独立飞书 bot 聊天，
+    但那不是 FreeAgent 的执行器。
 
-    ## 有一条捷径**绝不能走**
+    ## 一条捷径**绝不能走**（若将来重新启用）
 
     把它当 OpenAI 兼容后端直接问 ``/v1/chat/completions`` 是最省事的，
     但那条面上**工具已在服务端执行完毕**（回放的 ``function_call`` 一律
     ``"status": "completed"``）—— agent 已经动过 terminal 和文件系统，
     本仓看不到也拦不住。那是绕过 11.8 全部闸门，而症状只是「能用」。
-
-    ## 那为什么还要登记它
-
-    因为 11.10.2 要的正是「**有哪些执行器**」这份清单。先让它**可见**且
-    **诚实地不可派发**，比让 ``/agents`` 只列 opencode 要好 ——
-    后者会让「多执行器」看起来已经做完了，而实际一个都没接上。
-
-    ⚠️ 探到版本**不等于**能派发。hermes 在注册表里 ``verified=False``，
-    所以 :func:`_buckets_for` 一桶都不给它。
     """
     from ..delegate import detect_hermes_version
 
@@ -229,6 +250,28 @@ def probe_hermes(command: str = "hermes") -> ExecutorProbe:
             "（另有一条捷径**不能走**：把它当 OpenAI 后端直接问 —— 那条面上"
             "工具已在服务端执行完，本仓拦不住。）"
         ),
+        disabled_reason=lambda detected: (
+            f"hermes 主版本是 {detected}，本仓**已停用**它（V1.82/83）。"
+            "它的审批闸是「按模式标记」而非「每动作确认」——`approvals.mode`"
+            "只决定**已被判为危险**的动作怎么处理，`del`/简单 `write_file` 到"
+            "普通路径不在危险清单里，API 面与飞书面都会直接执行而不弹审批"
+            "（manual + 重启也拦不住），所以它做不了执行期逐次授权、也不能"
+            "当受控执行器。执行 + 飞书确认走 **opencode**（FreeAgent 全控）。"
+            "你若真想用 hermes，直接用它的独立飞书 bot 聊天，但那不是 FreeAgent "
+            "的执行器。代码保留作接缝 —— 若 hermes 将来修好审批，把适配器 "
+            "`disabled` 改回 False 即可重新启用。"
+            "（别把它当 OpenAI 兼容后端直接问 —— 那条面上工具已在服务端执行完，"
+            "本仓看不到也拦不住。）"
+        ),
+        nondispatchable_reason=lambda detected: (
+            f"hermes 主版本是 {detected}，本仓**验过接线**（/ask 只读问答那条线），"
+            "但**不能委派** —— 它的 API Server 面是 unattended 平台，危险命令"
+            "直接 deny、做不了 11.8 那种「执行期逐次授权」（设计文档 11.10.8）。"
+            "它只适合 `/ask hermes` 只读问答。"
+            "（别把它当 OpenAI 兼容后端直接问 —— 那条面上工具已在服务端执行完，"
+            "本仓看不到也拦不住。）"
+        ),
+        capabilities=lambda verified: (READ,) if verified else (),
     )
 
 

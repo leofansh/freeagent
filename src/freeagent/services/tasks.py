@@ -149,6 +149,7 @@ class TaskService:
         clock: Clock,
         *,
         has_pending: Callable[[str], bool] | None = None,
+        leases: "LeaseRepo | None" = None,
     ) -> None:
         self._tasks = tasks
         self._records = records
@@ -159,6 +160,11 @@ class TaskService:
         #: 读仓库），所以这里只要一个最窄的布尔问题。装配处（app.py）用
         #: ``ApprovalStore.pending_for_web`` 过滤出答案。
         self._has_pending = has_pending
+        #: 委派租约（12.11.3 / V1.94）。**可空**：没有它就退化成「只看形状」，
+        #: 也就是这一列出现之前的行为。空着不报错，是因为它有且只有一个用途
+        #: —— 判断一条「在跑」形状的事务是不是**失联**。没传就是「不知道」，
+        #: 而「不知道」按「可能还在跑」处理（拒绝重派），与判定的保守方向一致。
+        self._leases = leases
 
     # -- 创建 --------------------------------------------------------------- #
     def create(
@@ -178,6 +184,7 @@ class TaskService:
         project_path: str | None = None,
         delegate_chat_id: str | None = None,
         delegate_requested_by: str | None = None,
+        origin: str | None = None,
     ) -> Task:
         now = self._clock.now()
         state = TaskState.BLOCKED if kind is TaskKind.WAIT else TaskState.INBOX
@@ -200,6 +207,7 @@ class TaskService:
             project_path=project_path,
             delegate_chat_id=delegate_chat_id,
             delegate_requested_by=delegate_requested_by,
+            origin=origin,
         )
         validate_task(task)
         saved = self._tasks.add(task)
@@ -616,7 +624,7 @@ class TaskService:
         形状推导必须与判定侧**同一份实现**，否则「校验说能重派」与
         「判定说别派」会在真跑起来时才互相打架。
         """
-        from .delegate import attempt_state
+        from .delegate import LEASE_LOST, LOST_MARK, attempt_state, lease_state
 
         current = self._tasks.get(task_id)
         if not current.project_path:
@@ -625,12 +633,32 @@ class TaskService:
                 "（委派是有项目路径的事务）"
             )
 
-        in_flight, last = attempt_state(self._records.list_for_task(task_id))
+        records = self._records.list_for_task(task_id)
+        in_flight, last = attempt_state(records)
         if in_flight:
-            raise ValidationError(
-                f"「{current.title}」正在跑，不能重派 —— 派第二个进程去改同一个"
-                "项目目录会互相覆盖。等它跑完，或者先 /pause 把它移出来。"
+            # 「在跑」这个形状在**两种情况下完全一样**：真在跑，和跑到一半
+            # 进程没了（12.11.3 / V1.94）。形状分不出，租约能：过期 = 没人续。
+            #
+            # 失联时**先把这一次尝试落成终态，再放行重派**（V1.91 起的老规矩：
+            # 先写终态、再动状态）。只落 RESET 是不够的 —— ``attempt_state``
+            # 刻意不让 RESET 清「在跑」，所以放行之后 ``already_dispatched``
+            # 还会继续拒派，用户看到的是一句「能重派了」接着一次「不派」。
+            lease = self._leases.get(task_id) if self._leases is not None else None
+            if lease_state(lease, self._clock.now()) != LEASE_LOST:
+                raise ValidationError(
+                    f"「{current.title}」正在跑，不能重派 —— 派第二个进程去改同一个"
+                    "项目目录会互相覆盖。等它跑完，或者先 /pause 把它移出来。"
+                    "（若确定它早就没了，等租约过期后再试）"
+                )
+            self._records.append(
+                task_id,
+                RecordType.DELEGATION_FAILED,
+                (f"{LOST_MARK}：租约已过期，判为没人续。"
+                 "执行器子进程可能还没退出 —— 确认没有进程在改这个项目目录。"),
+                self._clock.now(),
             )
+            records = self._records.list_for_task(task_id)
+            in_flight, last = attempt_state(records)
         if last == "succeeded":
             raise ValidationError(
                 f"「{current.title}」已经做完了，重派没有意义"

@@ -85,14 +85,18 @@ class TestKnownExecutors:
 
 
 # --------------------------------------------------------------------------- #
-# hermes：登记了，但不可派发
+# hermes：登记了，但已停用（V1.83，适配器保留作接缝）
 # --------------------------------------------------------------------------- #
 
 class TestHermesIsRegisteredButNotDispatchable:
-    def test_adapter_exists_and_is_unverified(self):
+    def test_adapter_exists_and_is_verified_but_not_dispatchable(self):
         adapter = E.adapter_for(0, "hermes")
         assert adapter is not None, "注册表里应当有 hermes"
-        assert adapter.verified is False
+        # hermes 的 /ask 那条线已对着真机验过（判据 1 面自证、判据 3
+        # unattended deny、判据 5 传输 + 事件名）—— 它不再是「未验证」。
+        assert adapter.verified is True
+        # 但 API Server 面是 unattended 平台，做不了 11.8 委派 —— 不能派。
+        assert adapter.dispatchable is False
 
     def test_registry_does_not_accidentally_enable_opencode_paths(self):
         """加 hermes 不许改变 opencode 的可派发集合。
@@ -103,34 +107,40 @@ class TestHermesIsRegisteredButNotDispatchable:
         assert E.dispatchable_majors("opencode") == (1, 2)
         assert E.dispatchable_majors("hermes") == ()
 
-    def test_every_protocol_hook_refuses_instead_of_guessing(self):
-        """⚠️ 未验证 = **调用即抛**，不给半截形状。
+    def test_verified_is_not_dispatchable_difference_is_structural(self):
+        """``verified``（验过接线）与 ``dispatchable``（能委派）是两个概念。
+
+        混成一个字段，hermes 就会要么「没验过却说能派」、要么「验过了还不许
+        用」—— 而真实情况是：验过 /ask、但不委派。见 ExecutorAdapter 的
+        字段说明。
+        """
+        assert E.dispatchable_majors("hermes") == ()
+        assert E.known_majors("hermes") == (0,)
+
+    def test_delegation_only_entries_refuse_loudly(self):
+        """只走 /ask 的执行器，**委派入口要响**，不给半截形状。
 
         猜一个「看起来很像对的」形状比拒绝更危险：它会静默地不生效，
         而失效方向是闸门回到 allow（见 postmortem 0001）。
         """
         adapter = E.adapter_for(0, "hermes")
-        for hook in (
-            adapter.build_permission_config,
-            adapter.build_read_only_config,
-        ):
-            with pytest.raises(E.UnverifiedExecutorError):
-                hook()
-        for hook in (adapter.parse_request, adapter.parse_question):
-            with pytest.raises(E.UnverifiedExecutorError):
-                hook({})
-        with pytest.raises(E.UnverifiedExecutorError):
+        with pytest.raises(ValueError):
             adapter.build_reply("allow")
-        with pytest.raises(E.UnverifiedExecutorError):
+        with pytest.raises(ValueError):
             adapter.build_question_reply([["答案"]])
+        # 授权请求 / 提问解析走不到 —— 返回 None（不可回应的请求），不猜。
+        assert adapter.parse_request({}) is None
+        assert adapter.parse_question({}) is None
 
-    def test_field_names_left_empty_on_purpose(self):
-        """hermes 侧没有与本仓三桶对位的 permission 配置面。
+    def test_read_only_and_permission_config_are_empty_not_fake(self):
+        """hermes 没有「按工具名写 permission 配置」的面，配置是空而不是假映射。
 
-        它只有 profile 级的三档审批模式（manual/smart/off），
-        与本仓「按动作能不能做」不是同一语义。塞进去假装是键名映射，
-        会让以后拼配置的代码拿到一份看起来合理、实则无效的映射。
+        塞进去假装是键名映射，会让以后拼配置的代码拿到一份看起来合理、
+        实则无效的映射。
         """
+        adapter = E.adapter_for(0, "hermes")
+        assert adapter.build_permission_config() == {}
+        assert adapter.build_read_only_config() == {}
         assert E.HERMES_FIELD_NAMES == {}
 
 
@@ -160,32 +170,36 @@ class TestHermesProbeDiscipline:
         assert got.detected_major is None
         assert "探不到" in got.unavailable_reason
 
-    def test_installed_but_unverified_gets_no_bucket(self, which, majors):
-        """装了、也探到版本了，但没验过 —— **一桶都不给**。"""
+    def test_installed_and_disabled_gets_no_buckets(self, which, majors):
+        """装了、探到版本，但**已停用**（V1.83）→ 一桶都不给。
+
+        hermes 不再是执行器（审批闸是「按模式标记」而非「每动作确认」，
+        拦不住未标记的 file/terminal），所以 ``capabilities == ()``、
+        ``verified`` 不给 —— 不读成「能读」。
+        """
         which(True)
         majors(hermes=0)
         got = P.probe_hermes()
         assert got.installed is True
         assert got.detected_major == 0
         assert got.dispatchable is False
+        assert got.verified is False
         assert got.capabilities == ()
-        assert "未验证" in got.unavailable_reason
+        assert "已停用" in got.unavailable_reason
 
-    def test_unverified_reason_says_it_is_from_docs_not_from_a_real_run(
-        self, which, majors
-    ):
-        """「没验过」的理由必须说清是**读文档读来的**，不是「缺个字段」。
+    def test_disabled_reason_says_disabled_not_just_undispatchable(self, which, majors):
+        """停用的理由必须说清是**决定不用了**（审批闸失效），不是「没验过」。
 
-        只说一句通用的「未验证」，用户会以为补个字段名就能开。
-        真正的缺口是：一次真机都没跑过（11.8.1 的教训正是照文档接线）。
+        只说「不能委派」会让用户以为补个字段名就能开；真实缺口是结构性的：
+        hermes 审批闸拦不住未标记的 file/terminal，做不了执行期逐次授权。
         """
         which(True)
         majors(hermes=0)
         reason = P.probe_hermes().unavailable_reason
-        assert "真机" in reason
-        assert "8642" in reason or "API Server" in reason
+        assert "已停用" in reason
+        assert "按模式标记" in reason or "审批" in reason
 
-    def test_unverified_reason_warns_against_the_openai_shortcut(self, which, majors):
+    def test_nondispatchable_reason_warns_against_the_openai_shortcut(self, which, majors):
         """⚠️ 必须点明**不能**把它当 OpenAI 兼容后端直接问。
 
         那条面（``/v1/chat/completions``）上工具已在服务端执行完毕，
@@ -197,17 +211,16 @@ class TestHermesProbeDiscipline:
         reason = P.probe_hermes().unavailable_reason
         assert "拦不住" in reason or "捷径" in reason
 
-    def test_unknown_and_unverified_differ(self, which, majors):
-        """「不认识」与「认识但没验过」给**不同**的话。"""
+    def test_unknown_and_verified_nondispatchable_differ(self, which, majors):
+        """「不认识」与「认识但验过、不委派」给**不同**的话。"""
         which(True)
         majors(hermes=0)
-        unverified = P.probe_hermes().unavailable_reason
+        nondispatchable = P.probe_hermes().unavailable_reason
         which(True)
         majors(hermes=99)
         unknown = P.probe_hermes().unavailable_reason
-        assert unverified and unknown
-        assert unverified != unknown
-        assert "未验证" in unverified
+        assert nondispatchable and unknown
+        assert nondispatchable != unknown
         assert "不认识" in unknown
 
     def test_probe_signature_cannot_dispatch(self):
@@ -246,7 +259,8 @@ class TestProbeAll:
             E.__dict__, "_ADAPTERS",
             E._ADAPTERS + (
                 E.ExecutorAdapter(
-                    executor="mystery", major=1, verified=False, field_names={},
+                    executor="mystery", major=1, verified=False, dispatchable=False,
+                    field_names={},
                     build_permission_config=lambda: {},
                     build_read_only_config=lambda: {},
                     parse_request=lambda _p: None,
@@ -323,7 +337,7 @@ class TestAgentsCommand:
         assert "hermes" in out
 
     def test_says_hermes_is_not_dispatchable(self, repl, which, majors):
-        """hermes 在 ``/agents`` 里必须显示成**不能派**。
+        """hermes 在 ``/agents`` 里必须显示成**已停用、不能派**。
 
         用户若是看到它列出来就以为能用，那正是「声明比事实强」那类事故。
         """
@@ -333,4 +347,6 @@ class TestAgentsCommand:
         r.handle("/agents")
         out = buf.getvalue()
         assert "现在不能派发" in out
-        assert "未验证" in out
+        # V1.83 停用：是「决定不用了」（审批闸失效），不是「未验证」。
+        assert "已停用" in out
+        assert "未验证" not in out

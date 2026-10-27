@@ -44,14 +44,24 @@ def test_buttons_do_not_carry_the_plan():
         assert "第一件事" not in blob, "计划内容进了 payload"
 
 
-def test_two_choices_ok_and_cancel():
+def test_three_choices_ok_cancel_discard():
+    """三个按钮：确认执行 / 再想想 / **不弄了**（V1.91 由两个扩成三个）。
+
+    为什么必须多这一个：``cancel`` 的语义是「计划留着、继续规划」——它不是
+    退出。此前卡上只有 ok/cancel，于是**想彻底放弃的人在卡上没有出路**，
+    只能靠敲命令，而这张卡存在的意义恰恰是别让他敲。
+
+    「第一个是主按钮」这条没变：确认仍是最可能的意图；后两个都是 default，
+    **刻意不给「不弄了」着红色** —— 它是正常选择，不是危险操作。
+    """
     card = _card()
     btns = [b for e in card["elements"] if e.get("tag") == "action"
             for b in e["actions"]]
-    assert [b["value"]["choice"] for b in btns] == ["ok", "cancel"]
+    assert [b["value"]["choice"] for b in btns] == ["ok", "cancel", "discard"]
     # 第一个是主按钮：确认是最可能的意图
     assert btns[0]["type"] == "primary"
     assert btns[1]["type"] == "default"
+    assert btns[2]["type"] == "default"
 
 
 def test_card_is_json_10():

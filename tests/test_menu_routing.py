@@ -64,6 +64,8 @@ class _Msg:
         #: V1.48 起 ``_capture_unsupported`` 会读它（None = 无可下载附件）。
         #: 与真类 ``IncomingMessage.attachment`` 同形状，缺了会 AttributeError。
         self.attachment = None
+        #: V1.88 起时效窗口会读它（空 = 窗口放弃判定，与真类缺字段时同路）。
+        self.create_time = ""
 
     @property
     def dedup_key(self) -> str:
