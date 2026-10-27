@@ -54,7 +54,9 @@ __all__ = [
 #: 24 → plan_sessions（Plan 模式会话状态；补上当年只进了基线、没进迁移的那张表，V1.93）。
 #: 25 → tasks.origin（这条需求是本人写的还是从外部收来的，V1.93）。
 #: 26 → dispatch_leases（「在跑」变成可观察的事实，V1.94）。
-SCHEMA_VERSION = 26
+#: 27 → artifacts.model（一次委派的账：实际用的模型，V1.95）。
+#: 28 → artifacts.tool_calls（一次委派的账：碰过的工具，V1.95）。
+SCHEMA_VERSION = 28
 
 #: 按版本递增的迁移。**这里是「库的形状」唯一的写入口**：
 #: 新库也是从 v1 基线开始、逐版本重放这一串（见 :data:`_SCHEMA` 的注释），
@@ -464,6 +466,23 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
             expires_at  TEXT NOT NULL
         )
         """,
+    ),
+    (
+        "26 → 27：artifacts 加 model（「一次委派的账」第一列，V1.95）",
+        # 「这次委派实际用了哪个模型」此前只写在产物正文的 HTML 注释里
+        # （给人看的格式，读侧要拿它就得解析自己的文案 —— 11.9.12 禁掉的
+        # 事）。落成列之后，重派简报与 /feedback 都能把它当事实读。
+        "ALTER TABLE artifacts ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "27 → 28：artifacts 加 tool_calls（「一次委派的账」的第二列，V1.95）",
+        # 为什么 model 与 tool_calls 拆成两版而不是塞进 _DOMAIN_STEPS：
+        # 域通道用 ``executescript`` 裸跑，隐含契约是「脚本自身幂等」
+        # （v19 靠 IF NOT EXISTS 满足），而 ``ADD COLUMN`` 没有 IF NOT EXISTS，
+        # 幂等只能靠单语句通道的 ``_run_idempotent`` 守卫。一列一版本
+        # 也是既有先例：pending_approvals 的 kind/answer_text/question_spec
+        # 就是 v9/v10/v11 三连。
+        "ALTER TABLE artifacts ADD COLUMN tool_calls TEXT NOT NULL DEFAULT ''",
     ),
 )
 

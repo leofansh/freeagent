@@ -112,7 +112,13 @@ class TestMigration:
         # v26（dispatch_leases，V1.94）：单语句 CREATE TABLE，索引 24。
         # 「在跑」从「从记录形状推」变成「观察到的租约」—— 形状在
         # 「真在跑」与「跑到一半进程没了」两种情况下一模一样。
-        assert SCHEMA_VERSION == 26
+        # v27/v28（artifacts.model / artifacts.tool_calls，V1.95）：一列一版，
+        # 都走单语句通道。「上次实际用的模型/碰过的工具」落成列，不再只写
+        # 在产物正文的 HTML 注释里。
+        # （为什么不是域通道一条脚本加两列：域通道 executescript 裸跑、
+        # 靠脚本自身幂等，而 ADD COLUMN 没有 IF NOT EXISTS ——
+        # test_rerun_is_idempotent 会抓住这个错。）
+        assert SCHEMA_VERSION == 28
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}
@@ -121,6 +127,29 @@ class TestMigration:
             "v23 加的列。V1.93 起它只在 _MIGRATIONS 里有一份 —— "
             "「新库也要有」由 migrate 内部重放迁移保证，不再靠两处同改"
         )
+
+    def test_attempt_ledger_columns_exist(self, conn):
+        """v27：artifacts 的 model / tool_calls（一次委派的账）。"""
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(artifacts)")}
+        assert {"model", "tool_calls"} <= cols
+
+    def test_v26_upgrade_gains_attempt_ledger(self, tmp_path):
+        """停在 v26 的旧库升到当前：两条 ALTER 走域通道，恰好一次。"""
+        from freeagent.storage.db import migrate
+
+        db = tmp_path / "old.db"
+        conn = connect(db)
+        try:
+            migrate(conn, 26)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(artifacts)")}
+            assert "model" not in cols, "v26 的库不该有这两列"
+            migrate(conn)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(artifacts)")}
+            assert {"model", "tool_calls"} <= cols
+            # 再跑一次migrate：域步骤不得重放（否则第二条 ALTER 会炸）
+            migrate(conn)
+        finally:
+            conn.close()
 
     def test_baseline_stays_at_v1(self, tmp_path):
         """**基线不许长大**：只跑 ``init_schema`` 之后必须还是 v1 的形状。

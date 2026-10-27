@@ -377,3 +377,34 @@ def test_command_without_args_shows_usage(repl):
         r.handle(cmd)
     out = buf.getvalue()
     assert out.count("用法") >= 9
+
+
+# -- /accept 的约定提示（V1.95 / 12.10.10）----------------------------------- #
+
+class TestAcceptConventionHint:
+    """验收是「审核 → 积累」的入口：只提示，不代记（EXPLICIT_ONLY）。
+
+    静默替人记一条约定，和静默挂关系账（V1.84 摩擦点 3）是同一种越权 ——
+    所以这条提示**只在采纳执行器产出时**出现：用户自己写的草稿没有
+    「审核机器的工作」这回事。
+    """
+
+    def test_executor_output_gets_hint(self, app, repl):
+        r, buf = repl
+        role = app.roles.create("工作")
+        t = app.tasks.create("改登录", [role.id])
+        app.artifacts.create_draft(
+            t.id, "opencode 产出", "正文", model="opencode/big-pickle"
+        )
+        out = _run(r, buf, f"/accept {t.id}")
+        assert "已采纳 version 1" in out
+        assert "/memory add 约定" in out, "验收后该提示可沉淀的出口"
+
+    def test_user_draft_gets_no_hint(self, app, repl):
+        r, buf = repl
+        role = app.roles.create("工作")
+        t = app.tasks.create("改登录", [role.id])
+        app.artifacts.create_draft(t.id, "我的方案", "手写正文")
+        out = _run(r, buf, f"/accept {t.id}")
+        assert "已采纳 version 1" in out
+        assert "/memory add 约定" not in out, "没有机器工作被审核，就不该提示"

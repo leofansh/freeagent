@@ -19,11 +19,11 @@
 - 提交信息格式：不用管——本仓由用户手动提交，agent 不主动 commit
   （用户明确要求时代劳，如 2026-10-21 的 V1.43–V1.50 一次提交）。
 - 文档版本号纪律：设计文档头部「本次变更（V1.x）」记录最新变更，
-  当前最新是 **V1.84**（飞书实测三摩擦点改善：today 空态报「排在未来」——
-  `TodayView` 加 `future_count`/`earliest_future`，chat/render/Web 空态照报条数、
-  不改 6.2 视图定义；建事务**默认安静记下**——删掉 `_create` 的「意图还没说清楚」
-  自动追问；建事务**提及已登记关系提示可挂账**——`PromiseService.mentioned_contacts`
-  只认已登记名、零误判、守 11.19「只提示不静默挂」）。更早版本（V1.83 → V1.52）
+  当前最新是 **V1.95**（委派带上历史：默认派发路径补 `DELEGATION_DISPATCHED`
+  —— 执行期失败曾全被误判成「派发前被拒」永不重试；项目级踩坑史、
+  已采纳方案、一次委派的账（`artifacts.model`/`tool_calls`，schema v27/v28
+  **一列一版**——域通道脚本必须自身幂等）、人记的「约定」进简报 +
+  `/accept` 验收后提示沉淀（只提示不代记））。更早版本（V1.94 → V1.52）
   历史见设计文档头部，**本文件只记当前最新，不重复整段历史**。
 
 ## 不要做（负面清单——边界，不是建议）
@@ -53,19 +53,39 @@
   除此之外任何迁移仍然不许写 UPDATE/DELETE。
 - 测试用 `tests/conftest.py` 的临时库 + FrozenClock 夹具，时间必须可注入。
 
-## 当前进行中的工作（V1.84 · 2026-10-25）
+## 当前进行中的工作（V1.95 · 2026-10-28）
 
-飞书实测三摩擦点改善 —— today 空态报「排在未来」+ 建事务默认安静记下 + 提及已登记关系提示可挂账。
+让委派带上历史 ——「Agent 之上的 Agent」从「管得住」补向「记得住」。
 
-- **断点定位**：飞书实机测试跑通五条链路（引导卡 / 自然语言建事务 / today / all / contact 关系对象），确认「暂不接微信」；用户拍板改善三摩擦点。
-- **摩擦点 1（today 空态报「排在未来」）**：实测建一条排周四的事、回 /today 得「0 件事」——事务在库里（/all 看得到）却像没记上。`unscheduled_count` 已报「没排期」，**排在未来**是同构的静默。修：`TodayView` 加 `future_count` + `earliest_future`（`scheduled_for > today 且 open`）；`view()` 填充；`chat.py::_answer_today` 空态、`cli/render.py::render_today`、Web `serialize.py` + `js_core.py::renderList` 空态都报「还有 N 条排在后面（最早 X）」——**不改 6.2 视图定义**，只照报条数。
-- **摩擦点 2（建事务默认安静记下）**：建事务回「意图还没说清楚」追问，快速记一笔被盘问。修：删掉 `cli/app.py::_create` 自动追问行（intent 可选项、缺了有 [TODO] 兜底）。**默认安静记下**。
-- **摩擦点 3（提及已登记关系提示可挂账）**：实测「和张总确认合同」建了事务、/contact 张总 建了关系，但事务没挂——用户不知道能挂账。修：`PromiseService.mentioned_contacts(text)` **只认已登记**关系名（零误判，守 11.19「只显式触发绝不静默推断」）；`_create` 与 Web `create_task` 提到已登记关系加一行「提到 X，可挂关系账（/contact X）」——**只提示不静默挂**。
-- **测试**：`test_unscheduled_visibility.py`（+`TestFutureIsCountedNotListed` 与 payload/chat future 断言）、`test_promise.py`（+`mentioned_contacts` 三测）、`test_cli.py`（+关系提示两测）、`test_web.py::TestTaskEndpoint`（+`relation_hint`）。全量 pytest 绿。
-- 更早版本历史（V1.83 → V1.52）见设计文档头部变更块，本文件只记当前最新。
+- **P0（先修）**：默认派发路径（执行期逐次授权）只占租约、不写
+  `DELEGATION_DISPATCHED` → 执行期失败（模型 402、执行器崩溃）全被
+  11.8 的形状判据误判成「派发前被拒」，**永不自动重试**。修：闸门通过后、
+  占租约前补写，顺序与旧路径对齐（先记派出再查白名单的话
+  「派发前被拒」类别就不存在了）。
+- **① 项目级踩坑史**：`sibling_history` + `project_history_line`
+  （同项目其它任务、只取执行期失败、默认三条/单条 160 字）进简报。
+- **② 已采纳方案进简报**：`_accepted_plan_text` 取已采纳产物作
+  `accepted_plan`（「你已经定下的方案，按它实施」，1500 字截断留标记，
+  排在错因之前）。规划线与委派线由此接通。
+- **③ 一次委派的账**：`artifacts.model`/`tool_calls`（schema **v27/v28**），
+  `last_attempt_line` 读进重派简报。认执行器产出靠两列非空，不靠标题。
+  **教训**：两条 ALTER 不能塞域通道（`executescript` 裸跑要求脚本自身幂等，
+  `ADD COLUMN` 没有 IF NOT EXISTS，`test_rerun_is_idempotent` 当场抓住）——
+  一列一版走单语句通道，先例是 v9/v10/v11。
+- **④ 约定进简报 + 验收提示**：`MemoryService.conventions()`
+  （global+本事务角色、类别过滤在 SQL）→ `conventions_line`
+  （必须带「可能过期，以当前为准」定性，三条/120 字）进简报；
+  终端 `/accept` 与 Web 验收在采纳执行器产出（`model` 非空）时提示
+  「`/memory add 约定` 可沉淀」——**只提示不代记**（EXPLICIT_ONLY），
+  用户自己的草稿不提示。
+- **测试**：`test_delegate.py` +16（回归 2 / 项目历史 4 / 方案 4 / 约定 4 / 账 2）、
+  `test_memory.py::TestConventions`（4）、`test_cli.py`（2）、
+  `test_artifact_accept.py`（2）；版本断言 26 → 28。
+- 更早版本历史（V1.94 → V1.52）见设计文档头部变更块，本文件只记当前最新。
 
 仍未做（重写版附录 B 的诚实清单）：12.7.1.2 重启提示机制化（刻意不做）、
 连续性个人模型自动派生（V1.47 只做了**用户手写**的 core 层，自动 consolidation
 仍刻意不做）、「停止」按钮真机验证。hermes 判据 2/4 补验已结（判据 2 = 失败，
-处置为停用执行器）。
+处置为停用执行器）。并发派发 L1（项目级租约 + 有界线程）：V1.94 的租约只是
+前置，派发仍单线程串行。
 

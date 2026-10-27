@@ -64,8 +64,10 @@ from .services.delegate import (
     eligible_tasks,
     lease_owner,
     LOST_MARK,
+    last_attempt_line,
     parse_opencode_output,
     projection_age_seconds,
+    sibling_history,
 )
 from .services.opencode_projects import authorized_names
 from .services.executors import (
@@ -507,6 +509,17 @@ def run_once(
         app.close()
 
 
+def _accepted_plan_text(app, task_id: str) -> str:
+    """该事务**已采纳**产物的正文；没有就空串。
+
+    只取**已采纳**那一版（``ArtifactService.accepted``），草稿与历史版本
+    都不算数 —— 只有它代表「人已经想清楚、并确认要这么做」。规划线与委派线
+    此前是断开的：人定的方案在派发时被丢掉，执行器只拿到一句需求。
+    """
+    artifact = app.artifacts.accepted(task_id)
+    return (artifact.content or "") if artifact is not None else ""
+
+
 def run_once_with_tool_gate(
     *,
     db_path: Path | None = None,
@@ -560,6 +573,26 @@ def run_once_with_tool_gate(
                     leftover = stale_gate_note(project)
                     if leftover and leftover not in notes:
                         notes.append(leftover)
+                    # 先记「派发出去了」再占租约、再跑 —— 与 ``_dispatch_one``
+                    # 同序（那边是「先记派出，再占租约」，理由一样：崩在两者
+                    # 之间时，记录形状与「刚派出去就崩」一致，不必多一条分支）。
+                    #
+                    # **这条记录不是日志装饰。** ``attempt_state`` 靠「有没有
+                    # dispatched 前置」区分两种失败：``failed`` 无前置 =
+                    # 派发前被拒（确定性，**不自动重试**）；``dispatched →
+                    # failed`` = 执行期失败（可重试）。本路径此前漏写它，于是
+                    # 模型 402 / 执行器崩溃这类**可重试**的失败全被判成
+                    # ``refused`` —— 永不自动重派，``/feedback`` 还把它归到
+                    # 「派发前被拒」并附上一句并不成立的理由。
+                    #
+                    # 位置在白名单检查**之后**：被拒的委派不该留下「已派出」
+                    # 的痕迹，否则那条规定（``_dispatch_one`` 里那条）就被
+                    # 这条路悄悄废掉了。
+                    app.record_repo.append(
+                        task.id, RecordType.DELEGATION_DISPATCHED,
+                        f"派给 {the_policy.command}：{project}｜标题 {task.title}",
+                        app.clock.now(),
+                    )
                     # 租约覆盖「真的在跑会话」这一段。上限用同一份
                     # ``DEFAULT_MAX_DISPATCH_SECONDS``：租约写的是**承诺**
                     # （我最多占到什么时候），用另一套数字就是让承诺和
@@ -573,6 +606,25 @@ def run_once_with_tool_gate(
                                 task, task.intent, task.definition_of_done,
                                 # V1.38：上次失败的错因回流进简报（12.10.7）。
                                 records=app.record_repo.list_for_task(task.id),
+                                # 同项目其它委派的踩坑史：同一目录里 A 任务
+                                # 趟过的坑，B 任务不该再趟一次。
+                                project_history=sibling_history(
+                                    app.task_repo, app.record_repo, task,
+                                ),
+                                # 人已采纳的方案优先于需求转述（12.10.8）。
+                                accepted_plan=_accepted_plan_text(app, task.id),
+                                # 上次尝试的账：实际模型 + 用过的工具（12.10.9）。
+                                last_attempt=last_attempt_line(
+                                    app.artifacts.list_for_task(task.id)
+                                ),
+                                # 人记下的约定（12.10.10）：世界的事实，
+                                # 不是人的倾向 —— 收集在 memory 服务、
+                                # 这里只复述。
+                                conventions=tuple(
+                                    e.content for e in app.memory.conventions(
+                                        task.role_ids
+                                    )
+                                ),
                             ),
                             policy=the_policy, store=store, sender=sender,
                             progress_sender=progress_sender,
@@ -2293,6 +2345,16 @@ def _dispatch_one(
     brief = build_brief(
         task, task.intent, task.definition_of_done,
         records=app.record_repo.list_for_task(task.id),
+        # 同项目其它委派的踩坑史（12.10.7 扩到项目级）。
+        project_history=sibling_history(app.task_repo, app.record_repo, task),
+        # 人已采纳的方案优先于需求转述（12.10.8）。
+        accepted_plan=_accepted_plan_text(app, task.id),
+        # 上次尝试的账：实际模型 + 用过的工具（12.10.9）。
+        last_attempt=last_attempt_line(app.artifacts.list_for_task(task.id)),
+        # 人记下的约定（12.10.10）：世界的事实，不是人的倾向。
+        conventions=tuple(
+            e.content for e in app.memory.conventions(task.role_ids)
+        ),
     )
     title = task.title[:60]
 
@@ -2424,7 +2486,12 @@ def _record_result(app, task, outcome: DispatchOutcome) -> None:
     if outcome.tool_calls:
         body += "\n<!-- 用到的工具：" + "、".join(outcome.tool_calls) + " -->"
 
-    app.artifacts.create_draft(task.id, f"opencode 产出 {now:%m-%d %H:%M}", body)
+    app.artifacts.create_draft(
+        task.id, f"opencode 产出 {now:%m-%d %H:%M}", body,
+        # 同时落**结构化**的两列（schema v27）：正文里的注释是给人看的，
+        # 列是给读侧当事实用的（重派简报、/feedback）。
+        model=outcome.model, tool_calls="、".join(outcome.tool_calls),
+    )
     # 记录里也带上**错因**：``/note``、``/task`` 看到的应该是错因，
     # 而不是「执行器退出码 1」这种没有行动价值的句子。
     # 优先从 JSON 里挖 ``message``（见 :func:`extract_error_message` 的理由），

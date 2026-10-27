@@ -258,3 +258,35 @@ class TestFeishuSide:
         reply = cs.handle("oc_chat", "ou_stranger", f"/accept {task.id}")
         assert reply.denied
         assert app.artifacts.current(task.id).status is ArtifactStatus.DRAFT
+
+class TestConventionHint:
+    """Web 验收同样提示约定出口（与终端同一口径，V1.95 / 12.10.10）。
+
+    Web 没有记忆入口，提示里指明「终端」—— 单用户本机应用，
+    那是同一个人的另一出口，不是把人推去别的地方。
+    """
+
+    def test_executor_output_message_hints(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            task = app.tasks.create("改登录", [role.id])
+            app.artifacts.create_draft(
+                task.id, "opencode 产出", "正文", model="opencode/big-pickle"
+            )
+            status, payload = _post(app, ["api", "task", task.id, "accept"])
+            assert status == 200
+            assert "约定" in payload["message"]
+        finally:
+            app.close()
+
+    def test_user_draft_message_stays_terse(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            task = app.tasks.create("改登录", [role.id])
+            app.artifacts.create_draft(task.id, "我的方案", "手写正文")
+            _status, payload = _post(app, ["api", "task", task.id, "accept"])
+            assert payload["message"] == "已验收 v1"
+        finally:
+            app.close()

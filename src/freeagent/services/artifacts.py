@@ -46,11 +46,22 @@ class ArtifactService:
         return self._artifacts.current_accepted(task_id)
 
     # -- 写入 --------------------------------------------------------------- #
-    def create_draft(self, task_id: str, title: str, content: str) -> Artifact:
+    def create_draft(
+        self,
+        task_id: str,
+        title: str,
+        content: str,
+        *,
+        model: str = "",
+        tool_calls: str = "",
+    ) -> Artifact:
         """新建一版草稿。
 
         ``supersedes`` 指向**上一版**（不论它是否已采纳），使版本链完整可回溯。
         若上一版已采纳，按规则 2 额外把它降为 ``SUPERSEDED``。
+
+        ``model`` / ``tool_calls``（V1.95）：委派产出的「账」—— 实际用的模型
+        与碰过的工具。用户手写草稿两列都空；空 = 未记，不猜。
         """
         now = self._clock.now()
         previous_accepted = self._artifacts.current_accepted(task_id)
@@ -58,7 +69,8 @@ class ArtifactService:
         supersedes = previous_any.id if previous_any is not None else None
 
         artifact = self._artifacts.add(
-            task_id, title, content, now, supersedes=supersedes
+            task_id, title, content, now, supersedes=supersedes,
+            model=model, tool_calls=tool_calls,
         )
         if previous_accepted is not None:
             self._artifacts.set_status(

@@ -261,6 +261,28 @@ class MemoryService:
             ).fetchall()
         return [self._row_to_entry(r) for r in rows]
 
+    def conventions(
+        self, role_ids: tuple[str, ...] = (), *, limit: int = 3
+    ) -> list[MemoryEntry]:
+        """约定类记忆（``kind='约定'``）—— 进委派简报的那一份。
+
+        作用域口径与 :meth:`core_block` 相同：global + 各角色。类别过滤
+        在 SQL 里做而不是取回来再筛 —— 偏好/目标这类记忆描述的是**人**，
+        混进简报就成了拿人的事占执行器的上下文。
+
+        只查不判新旧：记忆可能过期，这条定性由读侧（简报）带出来，
+        见 ``conventions_line``。
+        """
+        scopes = [GLOBAL_SCOPE] + [role_scope(r) for r in role_ids]
+        placeholders = ",".join("?" for _ in scopes)
+        rows = self._conn.execute(
+            "SELECT id, scope, kind, content, source_ref, created_at, updated_at"
+            f" FROM memory WHERE kind='约定' AND scope IN ({placeholders})"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (*scopes, int(limit)),
+        ).fetchall()
+        return [self._row_to_entry(r) for r in rows]
+
     def retrieve(
         self,
         query: str,

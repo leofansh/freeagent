@@ -1285,6 +1285,8 @@ class ArtifactRepo(_RepoBase):
         *,
         artifact_id: str | None = None,
         supersedes: str | None = None,
+        model: str = "",
+        tool_calls: str = "",
     ) -> Artifact:
         version = self.next_version(task_id)
         artifact = Artifact(
@@ -1296,11 +1298,14 @@ class ArtifactRepo(_RepoBase):
             status=ArtifactStatus.DRAFT,
             created_at=now,
             supersedes=supersedes,
+            model=model,
+            tool_calls=tool_calls,
         )
         with self._tx():
             self._conn.execute(
                 "INSERT INTO artifacts (id, task_id, version, title, content, status,"
-                " created_at, accepted_at, supersedes) VALUES (?,?,?,?,?,?,?,?,?)",
+                " created_at, accepted_at, supersedes, model, tool_calls)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     artifact.id,
                     artifact.task_id,
@@ -1311,6 +1316,8 @@ class ArtifactRepo(_RepoBase):
                     artifact.created_at.isoformat(),
                     None,
                     artifact.supersedes,
+                    artifact.model,
+                    artifact.tool_calls,
                 ),
             )
         return artifact
@@ -1387,6 +1394,8 @@ class ArtifactRepo(_RepoBase):
             created_at=datetime.fromisoformat(row["created_at"]),
             accepted_at=_dt_in(row["accepted_at"]),
             supersedes=row["supersedes"],
+            model=row["model"] or "",
+            tool_calls=row["tool_calls"] or "",
         )
 
 

@@ -285,3 +285,41 @@ def test_cli_memory_empty_says_so(app: App, roles):
     r = Repl(app, out=buf)
     r.handle("/memory list")
     assert "还没记过" in buf.getvalue()
+
+
+# -- 5. 约定查询（进委派简报的那一份，V1.95 / 12.10.10） -------------------- #
+
+class TestConventions:
+    """``conventions()``：只取「约定」类，作用域口径与 core_block 相同。
+
+    偏好/目标描述的是**人**，混进简报就是拿人的事占执行器的上下文 ——
+    类别过滤在 SQL 里做，不是取回来再筛。
+    """
+
+    def test_kind_filter_and_scopes(self, mem, roles):
+        mem.add("本项目禁用 requests，只用标准库", kind="约定")
+        mem.add(
+            "周报先给结论",
+            kind="约定", scope=role_scope(roles["work"].id),
+        )
+        mem.add("我不喜欢早上开会", kind="偏好")           # 人的事，不进简报
+        mem.add("年内跑完半马", kind="目标", scope=role_scope(roles["work"].id))
+        got = mem.conventions((roles["work"].id,))
+        contents = [e.content for e in got]
+        assert "本项目禁用 requests，只用标准库" in contents
+        assert "周报先给结论" in contents
+        assert len(got) == 2, "偏好/目标必须被类别过滤挡掉"
+
+    def test_other_role_excluded(self, mem, roles):
+        mem.add(
+            "家庭账单走纸质", kind="约定", scope=role_scope(roles["family"].id)
+        )
+        assert mem.conventions((roles["work"].id,)) == []
+
+    def test_bounded(self, mem):
+        for i in range(5):
+            mem.add(f"约定{i}", kind="约定")
+        assert len(mem.conventions(())) == 3, "简报有界，默认三条"
+
+    def test_empty_by_default(self, mem):
+        assert mem.conventions(()) == []

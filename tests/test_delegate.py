@@ -20,15 +20,26 @@ from pathlib import Path
 import pytest
 
 from freeagent.app import build_app
-from freeagent.delegate import reclaim_abandoned, run_once
+from freeagent.delegate import (
+    DispatchOutcome,
+    reclaim_abandoned,
+    run_once,
+    run_once_with_tool_gate,
+)
 from freeagent.domain import FreeAgentError, RecordType, TaskState
 from freeagent.services.clock import FrozenClock
 from freeagent.services.delegate import (
     DelegationPolicy,
+    already_dispatched,
+    attempt_state,
     build_brief,
     check_project_allowed,
+    conventions_line,
     eligible_tasks,
+    last_attempt_line,
     parse_opencode_output,
+    project_history_line,
+    sibling_history,
 )
 from freeagent.cli.app import parse_delegate_args
 
@@ -1155,3 +1166,351 @@ class TestResultPushBack:
         self._run(app, db_path, tmp_path, self.CHAT)
         assert "验收" in sent[0][1], "回推文案必须提醒人验收"
         assert "进行中" in sent[0][1], "要说明事务状态没自动变完成"
+
+
+class TestToolGatePathRecordsDispatch:
+    """默认派发路径（执行期逐次授权）必须写下 ``DELEGATION_DISPATCHED``。
+
+    回归：这条路此前**只占租约、不写派出记录**，于是 ``attempt_state``
+    按「``failed`` 无前置 dispatched = 派发前被拒」把执行期失败判成
+    ``refused`` —— 模型 402、执行器崩溃这类**可重试**的失败从此永不
+    自动重派，``/feedback`` 还把它归进「派发前被拒」并附上一句并不成立
+    的理由。
+
+    执行全程离线：``run_with_tool_gate`` 用 monkeypatch 换掉，不起 opencode。
+    """
+
+    @staticmethod
+    def _started(tmp_path: Path, project: Path) -> str:
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            task = app.tasks.create(
+                "改点东西", [role.id], project_path=str(project)
+            )
+            return app.tasks.start(task.id).id
+        finally:
+            app.close()
+
+    @staticmethod
+    def _records(tmp_path: Path, task_id: str):
+        app = build_app(tmp_path / "a.db")
+        try:
+            return app.record_repo.list_for_task(task_id)
+        finally:
+            app.close()
+
+    def test_execution_failure_stays_retryable(self, tmp_path, monkeypatch):
+        """执行期失败 ⇒ ``failed``（可重派），不是 ``refused``。"""
+        import freeagent.delegate as delegate_module
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        task_id = self._started(tmp_path, project)
+        monkeypatch.setattr(
+            delegate_module, "run_with_tool_gate",
+            lambda *a, **k: DispatchOutcome(ok=False, summary="模型 402：余额不足"),
+        )
+        report = run_once_with_tool_gate(
+            db_path=tmp_path / "a.db", sender=None, approver="ou_x",
+            policy=DelegationPolicy(projects=(str(project),)),
+        )
+        assert report.failed == 1
+
+        records = self._records(tmp_path, task_id)
+        assert RecordType.DELEGATION_DISPATCHED in {r.type for r in records}, (
+            "默认路径必须留下派出记录，否则失败无法被正确分类"
+        )
+        assert attempt_state(records) == (False, "failed")
+        assert already_dispatched(records) is False, "可重试的失败不该被跳过"
+
+    def test_whitelist_refusal_leaves_no_dispatch_record(
+        self, tmp_path, monkeypatch
+    ):
+        """白名单拒绝 ⇒ **不写**派出记录，且根本没进执行。
+
+        顺序是这条语义的前提：先记派出再检查白名单的话，被拒的委派会
+        留下「已派出」的痕迹，``refused`` 这个类别就不存在了。
+        """
+        import freeagent.delegate as delegate_module
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        task_id = self._started(tmp_path, project)
+        called: list = []
+        monkeypatch.setattr(
+            delegate_module, "run_with_tool_gate",
+            lambda *a, **k: called.append(1),
+        )
+        run_once_with_tool_gate(
+            db_path=tmp_path / "a.db", sender=None, approver="ou_x",
+            policy=DelegationPolicy(projects=(str(elsewhere),)),
+        )
+        assert called == [], "白名单之外的项目绝不能进执行"
+
+        records = self._records(tmp_path, task_id)
+        assert RecordType.DELEGATION_DISPATCHED not in {r.type for r in records}
+        assert attempt_state(records)[1] == "refused"
+
+
+class TestBriefCarriesProjectHistory:
+    """同项目其它委派的踩坑史进简报（12.10.7 扩到项目级）。
+
+    执行器每次都是一个新生儿：它拿不到的是**这个项目以前败在哪**，
+    而那恰恰是「上层」唯一该给下层的东西。本任务级历史 V1.38 已有；
+    这一组锁的是**项目级**的聚合与边界。
+    """
+
+    def _mk(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        role = app.roles.create("工作")
+        return app, role
+
+    def _failed(self, app, role_id, project, title, reason):
+        t = app.tasks.create(title, [role_id], project_path=str(project))
+        t = app.tasks.start(t.id)
+        now = app.clock.now()
+        app.record_repo.append(t.id, RecordType.DELEGATION_DISPATCHED, "派出", now)
+        app.record_repo.append(t.id, RecordType.DELEGATION_FAILED, reason, now)
+        return t
+
+    def test_sibling_failure_enters_brief(self, tmp_path):
+        app, role = self._mk(tmp_path)
+        try:
+            project = tmp_path / "proj"
+            project.mkdir()
+            self._failed(app, role.id, project, "装依赖", "npm 安装失败：网络超时")
+            current = app.tasks.create("写测试", [role.id], project_path=str(project))
+            current = app.tasks.start(current.id)
+            brief = build_brief(
+                current, current.intent, current.definition_of_done,
+                records=app.record_repo.list_for_task(current.id),
+                project_history=sibling_history(
+                    app.task_repo, app.record_repo, current
+                ),
+            )
+            assert "同项目其它委派的历史" in brief
+            assert "装依赖" in brief
+            assert "npm 安装失败" in brief
+            assert "\n" not in brief, "简报必须单行"
+        finally:
+            app.close()
+
+    def test_other_project_and_self_are_excluded(self, tmp_path):
+        """别的项目与本任务自己都不得混入。"""
+        app, role = self._mk(tmp_path)
+        try:
+            pa = tmp_path / "a"
+            pb = tmp_path / "b"
+            pa.mkdir(); pb.mkdir()
+            self._failed(app, role.id, pb, "别项目的坑", "败因不该出现")
+            current = app.tasks.create("当前", [role.id], project_path=str(pa))
+            current = app.tasks.start(current.id)
+            now = app.clock.now()
+            app.record_repo.append(
+                current.id, RecordType.DELEGATION_DISPATCHED, "派出", now
+            )
+            app.record_repo.append(
+                current.id, RecordType.DELEGATION_FAILED, "本任务自己的坑", now
+            )
+            entries = sibling_history(app.task_repo, app.record_repo, current)
+            assert entries == [], "本任务与别项目都该被排除"
+        finally:
+            app.close()
+
+    def test_bounded_to_three_and_clipped(self, tmp_path):
+        """默认最多三条、单条错因 160 字内：简报是工作记忆不是编年史。"""
+        app, role = self._mk(tmp_path)
+        try:
+            project = tmp_path / "proj"
+            project.mkdir()
+            for i in range(5):
+                self._failed(app, role.id, project, f"任务{i}", "错因" * 200)
+            current = app.tasks.create("当前", [role.id], project_path=str(project))
+            entries = sibling_history(app.task_repo, app.record_repo, current)
+            line = project_history_line(entries)
+            assert line.count("执行失败") == 3, "默认有界三条"
+            assert ("错因" * 200) not in line, "错因必须被截断"
+        finally:
+            app.close()
+
+    def test_no_failure_no_block(self, tmp_path):
+        app, role = self._mk(tmp_path)
+        try:
+            project = tmp_path / "proj"
+            project.mkdir()
+            app.tasks.create("没跑过的", [role.id], project_path=str(project))
+            current = app.tasks.create("当前", [role.id], project_path=str(project))
+            entries = sibling_history(app.task_repo, app.record_repo, current)
+            assert project_history_line(entries) == ""
+        finally:
+            app.close()
+
+
+class TestBriefCarriesAcceptedPlan:
+    """已采纳的方案进简报（12.10.8）—— 人定的方案优先于机器转述。"""
+
+    def test_accepted_plan_enters_brief(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("改登录", [role.id])
+            t = app.tasks.start(t.id)
+            draft = app.artifacts.create_draft(
+                t.id, "方案", "第一步改鉴权中间件，第二步补测试"
+            )
+            app.artifacts.accept(draft.id)
+            brief = build_brief(
+                t, t.intent, t.definition_of_done,
+                accepted_plan=app.artifacts.accepted(t.id).content,
+            )
+            assert "你已经定下的方案，按它实施" in brief
+            assert "第一步改鉴权中间件" in brief
+            assert "\n" not in brief
+        finally:
+            app.close()
+
+    def test_draft_only_does_not_enter_via_helper(self, tmp_path):
+        """只采纳的才算：草稿未采纳时 ``_accepted_plan_text`` 必须给空串。"""
+        from freeagent.delegate import _accepted_plan_text
+
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("改登录", [role.id])
+            app.artifacts.create_draft(t.id, "方案", "还没定的草案")
+            assert _accepted_plan_text(app, t.id) == ""
+            draft = app.artifacts.list_for_task(t.id)[0]
+            app.artifacts.accept(draft.id)
+            assert _accepted_plan_text(app, t.id) == "还没定的草案"
+        finally:
+            app.close()
+
+    def test_long_plan_is_clipped_with_marker(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("x", [role.id])
+            t = app.tasks.start(t.id)
+            brief = build_brief(t, None, None, accepted_plan="长" * 2000)
+            assert "方案过长，此处截断" in brief, "截断必须留标记（3.6）"
+            assert "长" * 2000 not in brief
+            assert "\n" not in brief
+        finally:
+            app.close()
+
+    def test_plan_precedes_failure_history(self, tmp_path):
+        """方案是要照做的正文，历史是背景 —— 方案必须在历史之前。"""
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("改登录", [role.id])
+            t = app.tasks.start(t.id)
+            now = app.clock.now()
+            app.record_repo.append(t.id, RecordType.DELEGATION_DISPATCHED, "派出", now)
+            app.record_repo.append(t.id, RecordType.DELEGATION_FAILED, "上次败因", now)
+            brief = build_brief(
+                t, None, None,
+                records=app.record_repo.list_for_task(t.id),
+                accepted_plan="照这个方案做",
+            )
+            assert brief.index("你已经定下的方案") < brief.index("历史记录")
+        finally:
+            app.close()
+
+
+class TestAttemptLedger:
+    """一次委派的账：实际模型 + 用过的工具（12.10.9 / schema v27+v28）。
+
+    在此前这两个事实只写在产物正文的 HTML 注释里 —— 给人看的格式，
+    读侧要用就得解析自己的文案（「把文案当契约」，11.9.12 禁掉的那类事）。
+    """
+
+    def test_roundtrip_and_enters_brief(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("改登录", [role.id])
+            t = app.tasks.start(t.id)
+            app.artifacts.create_draft(
+                t.id, "opencode 产出", "正文",
+                model="opencode/big-pickle", tool_calls="edit、bash",
+            )
+            # 用户手写草稿两列皆空，天然被排除 —— 不靠标题认「执行器产出」。
+            app.artifacts.create_draft(t.id, "我的草稿", "手写方案")
+            line = last_attempt_line(app.artifacts.list_for_task(t.id))
+            assert "opencode/big-pickle" in line
+            assert "edit、bash" in line
+            assert "\n" not in line
+            brief = build_brief(t, None, None, last_attempt=line)
+            assert "上次实际用的模型" in brief
+        finally:
+            app.close()
+
+    def test_no_attempt_no_line(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("x", [role.id])
+            assert last_attempt_line(app.artifacts.list_for_task(t.id)) == ""
+            app.artifacts.create_draft(t.id, "草稿", "手写")
+            assert last_attempt_line(app.artifacts.list_for_task(t.id)) == ""
+        finally:
+            app.close()
+
+
+
+class TestBriefCarriesConventions:
+    """人记的「约定」进简报（12.10.10）—— 世界的事实，不是人的倾向。
+
+    这与 11.9.11「不做自我进化」不冲突：那条否掉的是**学人的倾向**，
+    同时写明该积累的是世界的事实 —— 约定是人**显式**记下的事实，
+    简报只是复述，不推断。
+    """
+
+    def test_enters_brief_with_qualifier(self, tmp_path):
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("改登录", [role.id])
+            brief = build_brief(
+                t, None, None,
+                conventions=["本项目禁用 requests，只用标准库"],
+            )
+            assert "人记过的约定" in brief
+            assert "可能过期，以当前为准" in brief, "记忆不是事实，定性必须带"
+            assert "禁用 requests" in brief
+            assert "\n" not in brief
+        finally:
+            app.close()
+
+    def test_bounded_and_clipped(self):
+        line = conventions_line(["约" * 300] * 5)
+        assert "约" * 121 not in line, "单条必须截到 120 字"
+        assert "约" * 120 in line, "截断不是丢弃 —— 120 字内必须保留"
+        assert line.count("；") == 2, "五条只取三条"
+
+    def test_empty_gives_empty_line(self):
+        assert conventions_line([]) == ""
+        assert conventions_line(["", "   "]) == ""
+
+    def test_conventions_precede_failure_history(self, tmp_path):
+        """约定是人定的规则，错因是机器的历史 —— 前者排在前面。"""
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("工作")
+            t = app.tasks.create("x", [role.id])
+            t = app.tasks.start(t.id)
+            now = app.clock.now()
+            app.record_repo.append(t.id, RecordType.DELEGATION_DISPATCHED, "派出", now)
+            app.record_repo.append(t.id, RecordType.DELEGATION_FAILED, "上次败因", now)
+            brief = build_brief(
+                t, None, None,
+                records=app.record_repo.list_for_task(t.id),
+                conventions=["禁止动配置文件"],
+            )
+            assert brief.index("人记过的约定") < brief.index("历史记录")
+        finally:
+            app.close()

@@ -2971,6 +2971,14 @@ class Repl:
                 raise FreeAgentError("还没有草稿可采纳，先 /draft")
         accepted = self.app.artifacts.accept(artifact.id)  # type: ignore[union-attr]
         self._say(f"已采纳 version {accepted.version}")  # type: ignore[union-attr]
+        # 验收是人看执行器产出的时刻 —— 该沉淀的「世界的事实」（11.9.11）
+        # 在这里最清楚。只提示不代记：写库必须显式（EXPLICIT_ONLY），
+        # 静默替人记一条约定和静默挂关系账是同一种越权。
+        if accepted.model:  # type: ignore[union-attr]
+            self._say(
+                "验收里如果有该沉淀为约定的（如项目禁用某库、客户不接受某类改动），"
+                "用 /memory add 约定 <内容> 记下来 —— 约定会进以后的委派简报。"
+            )
 
     def _cmd_steps(self, args: list[str]) -> None:
         if not args:

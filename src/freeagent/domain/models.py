@@ -242,6 +242,12 @@ class Artifact:
     created_at: datetime
     accepted_at: datetime | None = None
     supersedes: str | None = None
+    #: 这次委派**实际**用的模型（``provider/model``）；用户草稿没有，空串。
+    #: 落成列而不是只写正文注释：读侧要当**事实**用（重派简报、/feedback），
+    #: 而解析自己的 HTML 注释是「把文案当契约」。
+    model: str = ""
+    #: 这次委派用过的工具名（顿号分隔）；同上，空串 = 未记。
+    tool_calls: str = ""
 
     @property
     def is_editable(self) -> bool:

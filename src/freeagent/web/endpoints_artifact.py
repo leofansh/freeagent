@@ -76,13 +76,22 @@ def artifact_accept(app: App, task_id: str) -> dict[str, Any]:
     """
     task_id, artifact = _require_draft(app, task_id)
     accepted = app.artifacts.accept(artifact.id)
+    # 提示口径与终端 /accept 相同（只提示不代记）。Web 没有记忆入口，
+    # 所以指明去终端 —— 本应用是单用户本机的，那是同一个人的另一出口。
+    if artifact.model:
+        message = (
+            f"已验收 v{accepted.version}；有该沉淀的项目约定"
+            "（如禁用某库）可记：终端 /memory add 约定 <内容>"
+        )
+    else:
+        message = f"已验收 v{accepted.version}"
     return {
         "ok": True,
         "task_id": task_id,
         "artifact_id": accepted.id,
         "version": accepted.version,
         "status": accepted.status.value,
-        "message": f"已验收 v{accepted.version}",
+        "message": message,
     }
 
 
