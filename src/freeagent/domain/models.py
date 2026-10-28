@@ -227,6 +227,12 @@ class TaskRecord:
     # 每任务单调递增（RecordRepo.append 取号）。缺省 None 是给存量构造点
     # 留的兼容面：老记录（迁移回填前读出）没有它，排序会落到 ts 后面。
     seq: int | None = None
+    #: 引擎错误的**结构化类别**（见 ``services/engine_errors.py`` 的
+    #: ``EngineErrorKind``）；空串 = 这条记录不是引擎错误。
+    #:
+    #: 刻意是**列**而不是从 ``content`` 文本里解析 —— 错因文本每次带
+    #: 不同细节，按整句聚类会把同一类错误聚成 N 条，计数因此失去意义。
+    error_kind: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -383,3 +383,99 @@ class TestRevisionDrift:
         """行尾空格也是改动 —— 这里数的是**行**，不做「实质差异」判断。"""
         d = revision_drift("a\n", "a \n")
         assert (d.added, d.removed) == (1, 1)
+
+# ── 引擎错误的类别聚合（V1.96 / 12.10.11）─────────────────────────────── #
+
+class TestErrorKindAggregation:
+    """按**类别**聚类引擎错误（``task_records.error_kind`` 列）。
+
+    为什么要有这一段（而 ``top_reasons`` 不够）：错因文本每次带不同
+    细节 ——「Free usage limit reached…」后面跟着不同的 URL 与时间戳 ——
+    按整句聚类会把**同一类**错误聚成 N 条，每条计数都是 1，于是
+    「这类错我犯过 5 次」这句话根本说不出来。
+    """
+
+    def _failed_with_kind(self, app, task_id, clock, *, seconds, kind, reason):
+        base = NOW + datetime.timedelta(seconds=60 + seconds)
+        app.record_repo.append(
+            task_id, RecordType.DELEGATION_DISPATCHED, "派出", base
+        )
+        app.record_repo.append(
+            task_id, RecordType.DELEGATION_FAILED, reason,
+            base + datetime.timedelta(milliseconds=1),
+            error_kind=kind,
+        )
+
+    def test_same_kind_counts_together_despite_different_text(
+        self, env,
+    ):
+        """两次配额错误、文本不同 → 聚成「2 次」，而不是两条各 1 次。"""
+        app, role, clock = env
+        ids = []
+        for i, reason in enumerate([
+            "Free usage limit reached. Subscribe to OpenCode Go (url a)",
+            "Free usage limit reached. Subscribe to OpenCode Go (url b)",
+        ]):
+            t = app.tasks.create(f"任务{i}", [role.id], project_path="C:/p")
+            t = app.tasks.start(t.id)
+            self._failed_with_kind(
+                app, t.id, clock, seconds=i, kind="quota", reason=reason,
+            )
+            ids.append(t.id)
+
+        rep = feedback_report(ids, lambda tid: app.record_repo.list_for_task(tid))
+        assert rep.error_kinds == (("quota", 2),), (
+            f"同一类应聚成一条，实际：{rep.error_kinds}"
+        )
+        # 文本聚类那条**仍在**（原话给人核对），只是它分得不开。
+        assert len(rep.top_reasons) == 2
+
+    def test_different_kinds_are_separate(self, env):
+        app, role, clock = env
+        ids = []
+        for i, (kind, reason) in enumerate([
+            ("quota", "Free usage limit reached"),
+            ("auth", "401 unauthorized"),
+            ("auth", "403 forbidden"),
+        ]):
+            t = app.tasks.create(f"任务{i}", [role.id], project_path="C:/p")
+            t = app.tasks.start(t.id)
+            self._failed_with_kind(
+                app, t.id, clock, seconds=i, kind=kind, reason=reason,
+            )
+            ids.append(t.id)
+
+        rep = feedback_report(ids, lambda tid: app.record_repo.list_for_task(tid))
+        assert dict(rep.error_kinds) == {"quota": 1, "auth": 2}
+
+    def test_unclassified_failure_is_not_a_category(self, env):
+        """认不出的失败**不进类别表** —— 空串不是一个「类别」。"""
+        app, role, clock = env
+        t = app.tasks.create("任务", [role.id], project_path="C:/p")
+        t = app.tasks.start(t.id)
+        self._failed_with_kind(
+            app, t.id, clock, seconds=0, kind="", reason="bash: npm: not found",
+        )
+        rep = feedback_report([t.id], lambda tid: app.record_repo.list_for_task(tid))
+        assert rep.error_kinds == (), "认不出就不该造出一个类别"
+        assert rep.top_reasons, "但原话仍然摆着"
+
+    def test_success_has_no_kind(self, env):
+        app, role, clock = env
+        t = app.tasks.create("任务", [role.id], project_path="C:/p")
+        t = app.tasks.start(t.id)
+        _attempt(app, t.id, clock, seconds=0, succeeded=True)
+        rep = feedback_report([t.id], lambda tid: app.record_repo.list_for_task(tid))
+        assert rep.error_kinds == ()
+
+    def test_read_outcome_exposes_kind(self, env):
+        """单条读侧也要能拿到类别 —— 不只有批量报告有。"""
+        app, role, clock = env
+        t = app.tasks.create("任务", [role.id], project_path="C:/p")
+        t = app.tasks.start(t.id)
+        self._failed_with_kind(
+            app, t.id, clock, seconds=0, kind="quota", reason="额度用尽",
+        )
+        outcome = read_outcome(app.record_repo.list_for_task(t.id))
+        assert outcome.error_kind == "quota"
+        assert outcome.reason == "额度用尽", "原话与类别并存"

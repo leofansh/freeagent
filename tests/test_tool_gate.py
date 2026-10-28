@@ -631,6 +631,126 @@ class TestToolGateLoop:
         finally:
             app.close()
 
+    # ── 引擎错误的结构化分类（V1.96 / 12.10.11）──────────────────────────
+    #
+    # 此前失败摘要只给一句「执行器会话出错：<那句人话>」—— 用户知道
+    # 出了事，但不知道**该做什么**。而引擎其实把该做的信息都给了：
+    # ``statusCode: 403`` 说明是凭据/权限问题，不是代码问题。
+    #
+    # 这一组钉住「分类真的出现在摘要与记录里」—— 分类模块本身的存在
+    # 不够，落不到用户看得见的地方就等于没做。
+
+    def test_summary_carries_classification_and_next_step(
+            self, store: ApprovalStore) -> None:
+        server = _FakeServer([("session.error", self._FREE_TIER_ERROR)])
+        out = self._run(server, _FakeSender(), store)
+        assert out.ok is False
+        assert "凭据问题" in out.summary, "摘要要带类别"
+        assert "403" in out.summary, "摘要要带状态码"
+        assert "free tier" in out.summary, "摘要要保留原话"
+        assert "下一步" in out.summary, "摘要要给出路"
+
+    def test_quota_failure_does_not_advise_retry(
+            self, store: ApprovalStore) -> None:
+        """配额耗尽**不许建议重派** —— 重派多少次都是同一堵墙。
+
+        这条是本模块与 11.8 的边界在真链路上的一次兑现：11.8 按记录
+        形状判它「可重派」（确实是执行期失败），但那只是说「重派**允许**」，
+        不是说「重派**有用**」。
+        """
+        quota = {
+            "sessionID": "ses_fake",
+            "error": {
+                "name": "APIError",
+                "data": {
+                    "message": "Free usage limit reached. Subscribe to "
+                               "OpenCode Go to keep going",
+                    "statusCode": 429,
+                    "isRetryable": False,
+                },
+            },
+        }
+        server = _FakeServer([("session.error", quota)])
+        out = self._run(server, _FakeSender(), store)
+        assert out.ok is False
+        assert "额度耗尽" in out.summary
+        final = out.summary.split("下一步：")[-1]
+        assert "重派" not in final, "配额类不该建议重派"
+
+    def test_record_carries_kind_tag(self, tmp_path) -> None:
+        """记录要带类别 —— 落**列**（``error_kind``），不是塞进文本。
+
+        为什么是列：错因文本每次带不同细节，按整句聚类会把同一类错误
+        聚成 N 条，计数因此失去意义 —— 而「这类错我犯过 5 次」正是
+        用户要的那句话。而从文本里正则解析类别等于把措辞变成契约
+        （11.9.12 禁掉的那类事）。
+        """
+        from freeagent.app import build_app
+        from freeagent.delegate import _record_result
+        from freeagent.services.approval import ApprovalStore
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("默认脉络")
+            task = app.tasks.create("测试委派", [role.id], project_path="C:/p")
+            task = app.tasks.start(task.id)
+            server = _FakeServer([("session.error", self._FREE_TIER_ERROR)])
+            out = self._run(server, _FakeSender(), ApprovalStore(app.conn))
+            _record_result(app, task, out)
+            records = app.record_repo.list_for_task(task.id)
+            failed = [r for r in records
+                      if r.type is RecordType.DELEGATION_FAILED]
+            assert failed, "必须落一条失败记录"
+            assert failed[-1].error_kind == "auth", (
+                f"记录要带类别，实际：{failed[-1].error_kind!r}"
+            )
+        finally:
+            app.close()
+
+    def test_non_engine_failure_has_empty_kind(self, tmp_path) -> None:
+        """不是引擎错误的失败，类别留空 —— 空 = 未记，不猜。"""
+        from freeagent.app import build_app
+        from freeagent.delegate import _record_result
+        from freeagent.services.approval import ApprovalStore
+        app = build_app(tmp_path / "a.db")
+        try:
+            role = app.roles.create("默认脉络")
+            task = app.tasks.create("测试委派", [role.id], project_path="C:/p")
+            task = app.tasks.start(task.id)
+            out = self._run(
+                _FakeServer([("session.error", self._FREE_TIER_ERROR)]),
+                _FakeSender(), ApprovalStore(app.conn),
+            )
+            # 造一个**非 JSON** 的 detail（老路径的 shell 报错就是这样）
+            from freeagent.services.delegate import DispatchOutcome
+            out = DispatchOutcome(
+                ok=False, summary="执行器退出码 1", detail="bash: npm: not found",
+            )
+            _record_result(app, task, out)
+            records = app.record_repo.list_for_task(task.id)
+            failed = [r for r in records
+                      if r.type is RecordType.DELEGATION_FAILED]
+            assert failed
+            assert failed[-1].error_kind == "", "认不出就不该瞎标"
+            assert "npm" in failed[-1].content, "原话必须留着"
+        finally:
+            app.close()
+
+    def test_unknown_error_keeps_raw_text_and_no_invented_advice(
+            self, store: ApprovalStore) -> None:
+        """认不出时：保留原话，**不给编出来的建议**。"""
+        weird = {
+            "sessionID": "ses_fake",
+            "error": {"name": "SomethingNew", "data": {"message": "???"}},
+        }
+        server = _FakeServer([("session.error", weird)])
+        out = self._run(server, _FakeSender(), store)
+        assert out.ok is False
+        assert "未识别" in out.summary
+        assert "???" in out.summary, "原话必须留着"
+        assert "凭据" not in out.summary and "额度" not in out.summary, (
+            "认不出就不许给具体类别的建议"
+        )
+
 
 class TestTtlIsOneNumber:
     """**卡上的 TTL 与实际等待时长必须是同一个数。**

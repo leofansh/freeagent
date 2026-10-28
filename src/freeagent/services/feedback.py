@@ -67,6 +67,13 @@ class DelegationOutcome:
     reason: str = ""
     #: 这次尝试之后，用户对产出做了什么（12.9 之后的验收闭环）。
     verdict: str = ""
+    #: 引擎错误的**结构化类别**（空 = 不是引擎错误，或认不出）。
+    #:
+    #: 刻意与 :attr:`reason` 分开：``reason`` 是**原话**（给人判断引擎
+    #: 到底说了什么），``error_kind`` 是**类别**（给人聚类看「这类错
+    #: 犯过几次」）。两者都来自同一个事实，但用途不同 —— 混在一列里
+    #: 就得二选一。
+    error_kind: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +95,19 @@ class FeedbackReport:
     verdicts: tuple[tuple[str, int], ...]
     #: 被反复要求返工的产出（>=2 次返工），按返工次数降序。
     revised_tasks: tuple[tuple[str, str, int], ...]
+    #: 引擎错误的**类别**计数（``quota`` / ``auth`` / … → 次数），降序。
+    #:
+    #: 与 :attr:`top_reasons` 并存而不替代它：那条按**文本**聚类，
+    #: 而错因文本每次带不同细节（「Free usage limit reached…」后面跟着
+    #: 不同的 URL 与时间戳），按文本聚类会把同一类错误聚成 N 条 ——
+    #: 计数因此失去意义，而「这类错我犯过 5 次」恰恰是用户要的那句话。
+    #:
+    #: 类别来自 ``task_records.error_kind``（**列**，不是从文本解析）。
+    #: 空 = 这次失败不是引擎错误，或认不出（宁可漏，不猜）。
+    #:
+    #: **放在末尾**：dataclass 的默认值字段必须排在无默认值字段之后，
+    #: 否则构造器直接报 ``non-default argument follows default argument``。
+    error_kinds: tuple[tuple[str, int], ...] = ()
 
     @property
     def success_rate(self) -> float | None:
@@ -191,9 +211,13 @@ def read_outcome(records: Sequence[TaskRecord]) -> DelegationOutcome:
     _in_flight, last = attempt_state(records)
 
     reason = ""
+    error_kind = ""
     for record in reversed(records):
         if record.type is RecordType.DELEGATION_FAILED:
             reason = record.content.strip()
+            # 类别从**列**读（v29），不从文本解析 —— 文本是给人看的，
+            # 把它当契约就等于让措辞变成接口。
+            error_kind = record.error_kind
             break
         if record.type is RecordType.DELEGATION_SUCCEEDED:
             break
@@ -211,7 +235,10 @@ def read_outcome(records: Sequence[TaskRecord]) -> DelegationOutcome:
     elif drafts == 1:
         verdict = ""
 
-    return DelegationOutcome(outcome=last or "never", reason=reason, verdict=verdict)
+    return DelegationOutcome(
+        outcome=last or "never", reason=reason, verdict=verdict,
+        error_kind=error_kind,
+    )
 
 
 def feedback_report(
@@ -231,6 +258,7 @@ def feedback_report(
     """
     counts: Counter[str] = Counter()
     reasons: Counter[str] = Counter()
+    kinds: Counter[str] = Counter()
     verdicts: Counter[str] = Counter()
     revisions: Counter[str] = Counter()
 
@@ -239,6 +267,10 @@ def feedback_report(
         counts[outcome.outcome] += 1
         if outcome.outcome == "failed" and outcome.reason:
             reasons[outcome.reason] += 1
+        if outcome.outcome == "failed" and outcome.error_kind:
+            # 按**类别**聚类：认不出的（空串）不进来 —— 宁可少算一类，
+            # 也不把「认不出」当成一类摆给用户（那是个不存在的类别）。
+            kinds[outcome.error_kind] += 1
         if outcome.verdict:
             verdicts[outcome.verdict] += 1
         if outcome.verdict == "revised":
@@ -256,6 +288,7 @@ def feedback_report(
         refused=counts["refused"],
         never=counts["never"],
         top_reasons=tuple(reasons.most_common(5)),
+        error_kinds=tuple(kinds.most_common()),
         verdicts=tuple(verdicts.most_common()),
         revised_tasks=tuple(revised),
     )

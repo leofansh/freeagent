@@ -118,7 +118,9 @@ class TestMigration:
         # （为什么不是域通道一条脚本加两列：域通道 executescript 裸跑、
         # 靠脚本自身幂等，而 ADD COLUMN 没有 IF NOT EXISTS ——
         # test_rerun_is_idempotent 会抓住这个错。）
-        assert SCHEMA_VERSION == 28
+        # v29（task_records.error_kind，V1.96）：引擎错误的结构化类别落成列，
+        # 读侧按类别聚类不必解析错因文本（「把文案当契约」是 11.9.12 禁的）。
+        assert SCHEMA_VERSION == 29
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}
@@ -132,6 +134,19 @@ class TestMigration:
         """v27：artifacts 的 model / tool_calls（一次委派的账）。"""
         cols = {r[1] for r in conn.execute("PRAGMA table_info(artifacts)")}
         assert {"model", "tool_calls"} <= cols
+
+    def test_error_kind_column_exists(self, conn):
+        """v29：task_records.error_kind（引擎错误的结构化类别）。
+
+        为什么是**列**：错因文本每次带不同细节，按整句聚类会把同一类
+        错误聚成 N 条，计数因此失去意义 —— 而「这类错我犯过 5 次」
+        正是用户要的那句话。
+        """
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(task_records)")}
+        assert "error_kind" in cols, (
+            "v29 加的列。引擎错误的类别要能被读侧当事实用，"
+            "不能靠从错因文本里正则解析（那是把文案当契约）"
+        )
 
     def test_v26_upgrade_gains_attempt_ledger(self, tmp_path):
         """停在 v26 的旧库升到当前：两条 ALTER 走域通道，恰好一次。"""

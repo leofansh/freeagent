@@ -69,6 +69,10 @@ from .services.delegate import (
     projection_age_seconds,
     sibling_history,
 )
+from .services.engine_errors import (
+    classify_engine_error,
+    engine_error_line,
+)
 from .services.opencode_projects import authorized_names
 from .services.executors import (
     adapter_for,
@@ -1877,12 +1881,25 @@ def run_with_tool_gate(
     # 3 次）」而实际模型一次都没跑成（真机 403 实测）。
     if session_error is not None:
         raw = json.dumps(session_error, ensure_ascii=False)
-        reason = (extract_error_message(raw)
+        # V1.96：先**分类**再报。此前只挖 ``message`` 那一句人话，把
+        # ``error.type`` / ``error.status`` 全丢了 —— 而「下一步做什么」
+        # 恰恰只由 type 决定（实测 2026-10-28：``provider.quota`` /
+        # 429「Free usage limit reached」，重派多少次都是同一堵墙，
+        # 正确的出路是「等额度恢复或换模型」，不是「再点一次重派」）。
+        #
+        # **分类不取代原话**：原话仍在 detail 里（那是真机证据），
+        # summary 给「类别 + 下一步」—— 用户要的是能做什么。
+        err = classify_engine_error(session_error)
+        reason = (err.message
+                  or extract_error_message(raw)
                   or first_meaningful_line(raw)
                   or "（错误里挖不出可读原因）")
+        summary = f"执行器会话出错（{engine_error_line(err)}）"
+        if err.next_step:
+            summary += "\n" + err.next_step
         return DispatchOutcome(
             ok=False,
-            summary=f"执行器会话出错：{reason}",
+            summary=summary,
             detail=raw[:4000],
             session_id=session_id or None,
             tool_calls=tuple(handled),
@@ -2496,19 +2513,41 @@ def _record_result(app, task, outcome: DispatchOutcome) -> None:
     # 而不是「执行器退出码 1」这种没有行动价值的句子。
     # 优先从 JSON 里挖 ``message``（见 :func:`extract_error_message` 的理由），
     # 挖不到再退回取首行（非 JSON 的失败，比如 shell 报错）。
+    #
+    # V1.96：错因前面加**分类**。``/feedback`` 的「错因频次」按文本聚类，
+    # 而「充值」与「换模型」两件不同的事若都只是「Free usage limit
+    # reached…」这一句，就长得一样、聚成一条。用 ``engine_error_line``
+    # 给出「类别 · type · status · 原话」，让同类错误在读侧能分得开。
     summary_text = outcome.summary or ""
+    error_kind = ""
     if not outcome.ok:
-        reason = extract_error_message(outcome.detail or "") or first_meaningful_line(
-            outcome.detail or ""
+        detail_text = outcome.detail or ""
+        reason = extract_error_message(detail_text) or first_meaningful_line(
+            detail_text
         )
         if reason and reason not in summary_text:
             summary_text = f"{summary_text}（{reason}）"
+        # 只在**能分类**时记下类别；认不出就留空（不猜）。
+        #
+        # 类别落**列**（``task_records.error_kind``，schema v29）而不是塞进
+        # 文本前缀 —— 两个理由：
+        # 1. 「把文案当契约」是 11.9.12 禁掉的：读侧要从文本里正则解析
+        #    出类别，就等于把措辞变成了契约。
+        # 2. 错因文本每次带不同细节，按整句聚类会把同一类错误聚成 N 条，
+        #    计数因此失去意义 —— 而「这类错我犯过 5 次」正是用户要的。
+        try:
+            err = classify_engine_error(json.loads(detail_text))
+        except (ValueError, TypeError):
+            err = None
+        if err is not None and err.is_known:
+            error_kind = err.kind
     app.record_repo.append(
         task.id,
         RecordType.DELEGATION_SUCCEEDED if outcome.ok
         else RecordType.DELEGATION_FAILED,
         (summary_text or outcome.detail or "")[:300],
         now,
+        error_kind=error_kind,
     )
     # 这句承诺必须指向**真能重置**的入口。原文写「可以 /note 记下原因后重派」
     # 是个空头承诺：note 不在 terminal 集合里，对幂等判定完全不可见，

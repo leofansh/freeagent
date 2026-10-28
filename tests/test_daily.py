@@ -139,4 +139,4 @@ class TestMigration:
         # 这条断言跟着 SCHEMA_VERSION 走（v27/v28 = artifacts 加 model 与
         # tool_calls，一列一版，V1.95）—— 它守的是「表建得出来且版本号
         # 对得上」，不是具体哪个数。
-        assert SCHEMA_VERSION == 28
+        assert SCHEMA_VERSION == 29

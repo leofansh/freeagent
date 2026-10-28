@@ -790,7 +790,8 @@ class TaskRepo(_RepoBase):
 # --------------------------------------------------------------------------- #
 class RecordRepo(_RepoBase):
     def append(
-        self, task_id: str, type_: RecordType, content: str, ts: datetime
+        self, task_id: str, type_: RecordType, content: str, ts: datetime,
+        *, error_kind: str = "",
     ) -> TaskRecord:
         with self._tx():
             # seq 本任务内取 MAX+1（12.10.6 / V1.37）。不交由调用方传、
@@ -803,11 +804,12 @@ class RecordRepo(_RepoBase):
             ).fetchone()
             seq = (row[0] if row is not None else 0) + 1
             record = TaskRecord(
-                id=new_id(), task_id=task_id, ts=ts, type=type_, content=content, seq=seq
+                id=new_id(), task_id=task_id, ts=ts, type=type_, content=content,
+                seq=seq, error_kind=error_kind,
             )
             self._conn.execute(
-                "INSERT INTO task_records (id, task_id, ts, type, content, seq)"
-                " VALUES (?,?,?,?,?,?)",
+                "INSERT INTO task_records (id, task_id, ts, type, content, seq,"
+                " error_kind) VALUES (?,?,?,?,?,?,?)",
                 (
                     record.id,
                     record.task_id,
@@ -815,6 +817,7 @@ class RecordRepo(_RepoBase):
                     record.type.value,
                     record.content,
                     record.seq,
+                    record.error_kind,
                 ),
             )
         return record
@@ -861,6 +864,8 @@ class RecordRepo(_RepoBase):
             content=row["content"],
             # 旧行（迁移前）可能没有该列；列在 ALTER 后必然存在但值可为 NULL。
             seq=row["seq"],
+            # 同理：v29 加的列。存量记录是空串（不是引擎错误）。
+            error_kind=row["error_kind"] or "",
         )
 
 

@@ -1905,6 +1905,26 @@ class Repl:
             self._say("\n反复出现的错因（原样引用，不归类）：")
             for reason, n in rep.top_reasons:
                 self._say(f"  {n} 次　{reason}")
+        if rep.error_kinds:
+            # 上面那段是**原话**，按文本聚类 —— 同一类错误因细节不同会聚成
+            # N 条，计数因此失去意义。这一段是**类别**（从
+            # ``task_records.error_kind`` 列读，schema v29），回答的是
+            # 「这类错我犯过几次」。
+            #
+            # 两段并存：原话给人判断「引擎到底说了什么」，类别给人看
+            # 「哪一类在反复发生」。只留前者就看不出模式，只留后者就
+            # 没法自己核对。
+            self._say("\n引擎错误的类别（按类别计次）：")
+            for kind, n in rep.error_kinds:
+                label = {
+                    "quota": "额度耗尽",
+                    "auth": "凭据问题",
+                    "model_gone": "模型不可用",
+                    "context": "上下文超限",
+                    "tool": "工具失败",
+                    "upstream": "上游故障",
+                }.get(kind, kind)
+                self._say(f"  {n} 次　{label}")
         if rep.verdicts:
             self._say("\n产出验收：")
             for verdict, n in rep.verdicts:

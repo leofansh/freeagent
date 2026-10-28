@@ -56,7 +56,8 @@ __all__ = [
 #: 26 → dispatch_leases（「在跑」变成可观察的事实，V1.94）。
 #: 27 → artifacts.model（一次委派的账：实际用的模型，V1.95）。
 #: 28 → artifacts.tool_calls（一次委派的账：碰过的工具，V1.95）。
-SCHEMA_VERSION = 28
+#: 29 → task_records.error_kind（引擎错误的结构化类别，V1.96）。
+SCHEMA_VERSION = 29
 
 #: 按版本递增的迁移。**这里是「库的形状」唯一的写入口**：
 #: 新库也是从 v1 基线开始、逐版本重放这一串（见 :data:`_SCHEMA` 的注释），
@@ -483,6 +484,20 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 也是既有先例：pending_approvals 的 kind/answer_text/question_spec
         # 就是 v9/v10/v11 三连。
         "ALTER TABLE artifacts ADD COLUMN tool_calls TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "28 → 29：task_records 加 error_kind（引擎错误的结构化类别，V1.96）",
+        # 为什么是**列**而不是从 content 文本里解析出类别：
+        # 「把文案当契约」是 11.9.12 禁掉的那类事。错因文本每次都带
+        # 不同的细节（「Free usage limit reached...」后面跟着不同的
+        # URL 与时间戳），按整句聚类会把**同一类**错误聚成 N 条，
+        # 计数因此失去意义 —— 而「这类错我犯过 5 次」恰恰是用户要的。
+        #
+        # 与 v27/v28 同理走单语句通道（域通道的 executescript 要求脚本
+        # 自身幂等，而 ADD COLUMN 没有 IF NOT EXISTS 语法）。
+        #
+        # 空串 = 这条记录不是引擎错误（绝大多数记录都不是）。
+        "ALTER TABLE task_records ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''",
     ),
 )
 
