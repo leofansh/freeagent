@@ -137,6 +137,7 @@ class TestMigration:
         ).fetchone()
         assert row is not None, "daily_digests 表应已建出"
         # 这条断言跟着 SCHEMA_VERSION 走（v27/v28 = artifacts 加 model 与
-        # tool_calls，一列一版，V1.95）—— 它守的是「表建得出来且版本号
-        # 对得上」，不是具体哪个数。
-        assert SCHEMA_VERSION == 29
+        # tool_calls，一列一版，V1.95；v29 = task_records.error_kind，V1.96；
+        # v30 = retrieval_log + retrieval_hits，V1.98）—— 它守的是「表建得
+        # 出来且版本号对得上」，不是具体哪个数。
+        assert SCHEMA_VERSION == 31

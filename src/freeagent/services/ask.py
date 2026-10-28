@@ -30,6 +30,27 @@
 
 沿用 3.6 的纪律：报告「已用尽预算，还剩什么没做完」。
 半途停下而不说，用户会以为它跑完了。
+
+## core 记忆怎么进来（V1.97，设计文档 3.7.6 注入点①）
+
+``/ask`` 是唯一走模型的白话入口，而它此前把原题直接发给执行器 ——
+用户记下的约定/偏好，执行器一条都不知道（3.7.6 的注入点①于是成了
+「文档说有、代码没有」）。现在调用方可传 ``context``（一段拼好的文本），
+非空时拼在问题前面。
+
+三条刻意的边界：
+
+- **本模块只拼，不产**。``context`` 由调用方（CLI 经
+  :meth:`~freeagent.services.memory.MemoryService.core_block`）拼好带进来，
+  定性（「可能过期，以当前为准」）也由它自带 —— 本模块不另写、也不去掉。
+  **为什么不让本模块直接调 memory 服务**：那会把 ask 层耦合到存储层，
+  而它现在只认识 opencode_server；「一份能力一份实现」也要求拼装只有
+  core_block 一处。
+- **空块不注入**。``context`` 为空（或全空白）时问题原样发出 —— 不给
+  问题前面留一对孤零零的换行，那会让「没带记忆」看起来像出了错。
+- **brief 必须单行那条纪律（11.13.3）不适用于这里**：那是委派简报的
+  硬约束（实测换行会让 opencode 升级强模型），``/ask`` 走的是普通
+  prompt，多行无害。
 """
 
 from __future__ import annotations
@@ -91,6 +112,7 @@ def ask_executor(
     max_tool_calls: int = 20,
     max_seconds: float = DEFAULT_ASK_TIMEOUT,
     now: Callable[[], float] = time.monotonic,
+    context: str = "",
 ) -> AskOutcome:
     """问执行器一句，把答复拿回来。
 
@@ -100,12 +122,20 @@ def ask_executor(
     :param max_tool_calls: 轮次预算（11.10.4）。超了就**停下并报告**。
     :param max_seconds: 时长上限。用 ``time.monotonic`` —— 墙钟会被 NTP
         或用户改时间影响，于是「已经跑了 3 分钟」可能突然变成负数。
+    :param context: 拼好的一段 core 记忆（V1.97，3.7.6 注入点①）。
+        非空时拼在问题**前面**；空（或全空白）时问题原样发出。
+        本模块只拼不产 —— 定性与预算口径由调用方的 ``core_block`` 负责。
     """
     question = (question or "").strip()
     if not question:
         return AskOutcome(ok=False, reason="没问什么。")
 
     from .opencode_server import read_only_permission_config
+
+    # 记忆块拼在问题前面。块首尾的空白去掉 —— 留着一对换行只会让
+    # 「没带记忆」看起来像出了错（见模块 docstring 的边界说明）。
+    block = (context or "").strip()
+    prompt = f"{block}\n\n{question}" if block else question
 
     deadline = now() + max_seconds
     text = ""
@@ -117,7 +147,7 @@ def ask_executor(
             permission_config=read_only_permission_config(),
         ) as oc:
             session_id = oc.create_session()
-            oc.prompt_async(session_id, question, model=model)
+            oc.prompt_async(session_id, prompt, model=model)
 
             for kind, props in oc.events():
                 if now() > deadline:

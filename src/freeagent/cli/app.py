@@ -30,7 +30,12 @@ from ..domain import (
     WaitingOn,
 )
 from ..services.chat import ChatReplyKind
-from ..services.memory import GLOBAL_SCOPE, role_scope
+from ..services.memory import (
+    DEFAULT_REVIEW_DAYS,
+    DEFAULT_USAGE_DAYS,
+    GLOBAL_SCOPE,
+    role_scope,
+)
 from ..services.llm import (
     CANNOT_MUTATE_HINT,
     NOT_A_TASK_HINT,
@@ -99,7 +104,9 @@ _USAGE: dict[str, str] = {
     "/remember": "/remember <内容>    记一条全局偏好（= /memory add 偏好）",
     "/memory": (
         "/memory [list [global|角色]|add <偏好|约定|修正|目标> <内容>|"
-        "add-role <角色> <类别> <内容>|search <关键词>|edit <id> <新内容>|del <id>]"
+        "add-role <角色> <类别> <内容>|search <关键词>|stats [天数]|"
+        "review [天数]|review confirm <id> [<id>...]|"
+        "edit <id> <新内容>|del <id>]"
     ),
     # 刻意与 /note 分开成两条：/note 无校验，而这条要挡三种不许重派的情形。
     # 合成一条就等于把「用错入口静默无效」又请回来（见 _cmd_redispatch）。
@@ -149,7 +156,7 @@ _USAGE: dict[str, str] = {
     ),
     # 用法文本的值**必须以命令名开头**（test_doc_contract 会查）。
     "/agents": "/agents       有哪些执行器可用、装了没、能不能派（只看不派）",
-    "/ask": "/ask <问题>    问执行器一句（只读：不改文件、不建事务、不问审批）",
+    "/ask": "/ask <问题>    问执行器一句（只读：不改文件、不建事务、不问审批；会带上你记下的记忆）",
     "/help": "/help",
     "/quit": "/quit",
 }
@@ -261,6 +268,9 @@ _HELP = """\
   /memory add <类别> <内容>  记一条：类别是 偏好 / 约定 / 修正 / 目标
   /memory add-role <角色> <类别> <内容>   记到某个角色名下
   /memory search <关键词>    检索记忆（返回「怎么找到的」，可反驳）
+  /memory stats [天数]       哪些记忆好久没用了（默认近 90 天，只摆事实不建议删）
+  /memory review [天数]       哪些记忆好久没确认了（默认近 90 天；列候选，不自动删）
+  /memory review confirm <id>...  确认这条还留着（可一次多条；删仍用 /memory del）
   /memory edit <id> <新内容> 改内容（类别与范围不可改）
   /memory del <id>          删掉这条
 
@@ -278,7 +288,7 @@ _HELP = """\
   /tick               手动检查提醒
   /llm                当前智能层与配置（不显示 Key）
   /agents             执行器探针：装了没、什么版本、能不能派（只看不派）
-  /ask <问题>         问执行器一句就回来（只读：不改文件、不建事务、不问审批）
+  /ask <问题>         问执行器一句就回来（只读：不改文件、不建事务、不问审批；会带上你记下的记忆）
   /pair <配对码>      把飞书某个人加进白名单（码来自 bot 私聊发的那张卡）
   /reset-data <确认口令>
                       「恢复出厂」：清空全部事务数据（角色脉络/配置/Key 保留），
@@ -2108,6 +2118,15 @@ class Repl:
 
         函数内导入：``ask_executor`` 会起一个**真进程**，那是本文件导入期
         绝不该发生的事。
+
+        V1.97 起会**带上用户记下的 core 记忆**（global 作用域 —— 3.7.6
+        注入点①的落地）：执行器不再对你的约定一无所知。块自带「可能过期，
+        以当前为准」的定性；一条都没记时不注入、也不打印。
+
+        V1.99 起注入集**按问题的相关度选**（不再一律取最新 N 条）：
+        相关度命中就说带了几条相关的；落空就说「相关度没命中，带了最近的
+        几条」；相关度那条腿本身坏了也明说（按时间倒序带，不装作按相关度）。
+        三种说法都在 :class:`CoreBlock` 的 ``leg`` 里，日志同值可复核。
         """
         executor = "opencode"
         if args and args[0] == "hermes":
@@ -2136,12 +2155,44 @@ class Repl:
 
         project = pathlib.Path.cwd()
         self._say(f"（问的是这个目录：{project}，执行器 {executor}）")
+        # V1.97：把用户记下的 core 记忆带给执行器（3.7.6 注入点①的落地）。
+        # 只取 global 作用域 —— /ask 没有事务上下文，判不出「命中角色」；
+        # 角色作用域的记忆走 12.10.10 的委派简报（conventions(role_ids)）。
+        # 定性（「可能过期，以当前为准」）由 core_block 自带，这里不另拼。
+        # 空记忆不注入、也不打印：用户问的是问题，不是记忆状态，而
+        # 「什么都没记」不存在被误当作「注入了」的余地。
+        # V1.99：把问题本身当查询词 —— 注入集按相关度选，不一律取最新。
+        block = self.app.memory.core_block(consumer="/ask", query=question)
+        if block.text:
+            # 三种 leg 三种说法：选法不同，告诉用户的话就不同 ——
+            # 「按相关度选的」与「只是最近写的」混成一句，等于让自己猜。
+            if block.leg == "bm25":
+                note = (
+                    f"（带上了你记下的记忆里与这个问题相关的 {block.selected} 条，"
+                    "可能过期，以当前为准"
+                )
+            elif block.leg == "tail":
+                note = (
+                    f"（带上了你记下的记忆里最近的 {block.selected} 条"
+                    "——相关度没命中，可能过期，以当前为准"
+                )
+            else:
+                note = "（带上了你记下的记忆，可能过期，以当前为准"
+            if block.degraded_reason:
+                # 相关度没走成必须说：否则「按相关度选的」会被当成真的。
+                note += f"；{block.degraded_reason}"
+            if block.truncated:
+                note += f"；还有 {block.extra} 条未带上，用 /memory list 看全部"
+            self._say(note + "）")
         outcome = ask_executor(
             question,
             project=project,
             command=executor,
             make_server=make_server,
             model=(self.app.config.model if self.app.config else None),
+            # 只把文本交给执行器 —— CoreBlock 的 leg/selected 是给我们自己
+            # 看的（措辞与日志），执行器不需要知道这批是怎么选出来的。
+            context=block.text,
         )
         if outcome.ok:
             self._say("")
@@ -2769,7 +2820,8 @@ class Repl:
         self._say(f"记住了（偏好）：{entry.content}")
 
     def _cmd_memory(self, args: list[str]) -> None:
-        """``/memory`` 命令族。子命令：list / add / add-role / search / edit / del。
+        """``/memory`` 命令族。子命令：list / add / add-role / search / stats /
+        review / edit / del。
 
         与 ``/remember`` 共用同一个 :class:`MemoryService` —— 这里只做参数解析
         与呈现，不重复任何写入逻辑。
@@ -2785,6 +2837,10 @@ class Repl:
             return self._memory_add_role(rest)
         if sub == "search":
             return self._memory_search(rest)
+        if sub == "stats":
+            return self._memory_stats(rest)
+        if sub == "review":
+            return self._memory_review(rest)
         if sub == "edit":
             return self._memory_edit(rest)
         if sub == "del":
@@ -2837,13 +2893,176 @@ class Repl:
         if not args:
             self._usage("/memory")
             return
-        result = self.app.memory.retrieve(" ".join(args))
+        result = self.app.memory.retrieve(" ".join(args), consumer="/memory search")
         # 来源说明**永远**打出来（含空结果）—— 与知识检索同一条：不只列结果。
         self._say(f"检索：{result.describe_sources()}")
         for h in result.hits:
             e = h.entry
             self._say(f"  [{e.kind}·{self._memory_scope_name(e.scope)}] {e.content}"
                       f"  （{h.via_label}）")
+
+    def _memory_stats(self, args: list[str]) -> None:
+        """``/memory stats [天数]`` —— 记忆的**使用留痕**（V1.98 / 3.7）。
+
+        回答的是「哪条记忆好久没用过了」：记过什么由 ``/memory list`` 说，
+        用过什么只有留痕知道。没有留痕就没有框架凝练的原料 ——
+        V1.96 的教训：没有计数的规律不可反驳。
+
+        **不自动建议删除**：计数 0 只说明这段没人用，不说明它错了
+        （3.7.5 的不自动 consolidation 在这里同样成立）。删不删是人决定。
+        """
+        days = DEFAULT_USAGE_DAYS
+        if args:
+            raw = args[0]
+            if not raw.isdigit() or int(raw) <= 0:
+                raise FreeAgentError(
+                    f"天数要写正整数（比如 /memory stats 30），收到 {raw!r}"
+                )
+            days = int(raw)
+        report = self.app.memory.usage_report(days=days)
+        if not report.rows:
+            self._say("还没记过任何记忆 —— 用 /remember 或 /memory add 记一条。")
+            return
+        head = f"记忆留痕（近 {report.days} 天）：检索 {report.retrievals} 次 · 注入 {report.injections} 次"
+        if report.last_event_at is not None:
+            head += f" · 最近一次 {report.last_event_at.strftime('%m-%d %H:%M')}"
+        self._say(head)
+        if report.degraded_reason:
+            # 「读不到」与「没有」必须能区分 —— 否则 0 次会被当成真相。
+            self._say(f"（{report.degraded_reason}，下面的计数不可信）")
+        used, stale = report.used, report.stale
+        if used:
+            self._say(f"用过的（{len(used)} 条）：")
+            for row in used:
+                self._say(
+                    f"  [{row.entry.kind}·{self._memory_scope_name(row.entry.scope)}]"
+                    f" {row.entry.content} —— 检索 {row.retrievals} ·"
+                    f" 注入 {row.injections} · 最近"
+                    f" {row.last_event_at.strftime('%m-%d') if row.last_event_at else '—'}"
+                )
+        if stale:
+            self._say(f"近 {report.days} 天没用过的（{len(stale)} 条）：")
+            for row in stale:
+                when = (
+                    f"上次 {row.last_event_at.strftime('%m-%d')}"
+                    if row.last_event_at else "从未被检索或注入"
+                )
+                self._say(
+                    f"  [{row.entry.kind}·{self._memory_scope_name(row.entry.scope)}]"
+                    f" {row.entry.content} —— {when}"
+                )
+        if not used:
+            self._say(
+                "（这段时间里没有任何记忆被检索或注入过 —— 要么没在用 /memory search"
+                " 与 /ask，要么注入口没带上它。）"
+            )
+
+    def _memory_review(self, args: list[str]) -> None:
+        """``/memory review [天数]`` / ``/memory review confirm <id>...``
+        （V1.100 / 3.7.8）。
+
+        回答的是「该整理了吗」：core 要小才有效，而记下来的东西只变多。
+        V1.98 的留痕让「好久没用」成为事实，但**事实不产生动作** ——
+        没有人会主动翻 ``/memory stats``，所以候选要自己找上门。
+
+        候选两条口径：**好久没动静**（窗口内没被检索/注入/确认过，连写下
+        来都超窗）与**内容相近**（bigram Jaccard ≥ 0.5 的对子 —— 只说相近，
+        不说冲突：可能记重了，也可能一条改了另一条没改，分诊留给人）。
+
+        **只摆不动**：不自动删、不自动 consolidation（3.7.5 纪律在此原样
+        成立）。动作只有两个且都由人发起：``/memory review confirm <id>``
+        与既有的 ``/memory del``（一份能力一份实现，不另造删的口子）。
+        """
+        if args and args[0] == "confirm":
+            return self._memory_review_confirm(args[1:])
+        days = DEFAULT_REVIEW_DAYS
+        if args:
+            raw = args[0]
+            if not raw.isdigit() or int(raw) <= 0:
+                raise FreeAgentError(
+                    f"天数要写正整数（比如 /memory review 30），收到 {raw!r}"
+                )
+            days = int(raw)
+        report = self.app.memory.review_candidates(days=days)
+        if report.degraded_reason:
+            # 读不出来 ≠ 没有候选。说清楚判断不了，一条候选都不摆 ——
+            # 把故障显示成「整理干净了」比崩溃更糟（用户会以为刚整理过）。
+            self._say(
+                f"（{report.degraded_reason}，判断不了哪些好久没动静）"
+            )
+            return
+        if not report.candidates and not report.near_duplicates:
+            # 空也要明说 —— 与 /week 空分区、/memory list 空库同一条纪律。
+            if report.total == 0:
+                self._say(
+                    "还没记过任何记忆 —— 用 /remember 或 /memory add 记一条。"
+                )
+            else:
+                self._say(
+                    f"近 {report.days} 天没有待整理的候选 —— {report.total} 条"
+                    "记忆在窗口内都有过动静（记下 / 检索 / 注入 / 确认）。"
+                )
+            return
+        parts = []
+        if report.candidates:
+            parts.append(f"{len(report.candidates)} 条好久没动静")
+        if report.near_duplicates:
+            parts.append(f"{len(report.near_duplicates)} 组内容相近")
+        self._say(
+            f"记忆 review（近 {report.days} 天）：{' · '.join(parts)}"
+            f"（共 {report.total} 条）"
+        )
+        if report.candidates:
+            self._say(f"好久没动静的（{len(report.candidates)} 条，最旧在前）：")
+            for row in report.candidates:
+                e = row.entry
+                # 给**完整 id**：confirm 与 del 都按全 id 认（不搞前缀匹配，
+                # 那是任务侧的另一套规矩）。摆出来就要能照着敲。
+                self._say(
+                    f"  [{e.kind}·{self._memory_scope_name(e.scope)}] {e.content}"
+                    f"  ({e.id})\n"
+                    f"    —— 最后一次动静"
+                    f" {row.last_attention_at.strftime('%m-%d')}，"
+                    f"{report.days} 天没被检索/注入/确认"
+                )
+        if report.near_duplicates:
+            self._say(
+                f"内容相近的（{len(report.near_duplicates)} 组）—— 相近不一定"
+                "是冲突：可能记重了，也可能一条改了另一条没改："
+            )
+            for pair in report.near_duplicates:
+                for e in (pair.left, pair.right):
+                    self._say(
+                        f"  [{e.kind}·{self._memory_scope_name(e.scope)}]"
+                        f" {e.content}  ({e.id})"
+                    )
+                self._say(
+                    f"    —— 相近度 {pair.similarity:.0%}（bigram 重合），"
+                    "留哪条、怎么改，你定"
+                )
+        self._say(
+            "确认还留着：/memory review confirm <id>（可一次多条）"
+            "；删掉：/memory del <id>。候选只是摆出来 —— 绝不自动删。"
+        )
+
+    def _memory_review_confirm(self, args: list[str]) -> None:
+        """``/memory review confirm <id> [<id>...]`` —— 确认还留着。
+
+        一次确认多条：队列的意义就是成批 triage，一条一条敲会把
+        「整理一下」变成十轮操作。某条没找到时报错并点名那一条
+        （前面的已经生效 —— 与其它批量操作同一条语义）。
+        """
+        if not args:
+            self._usage("/memory")
+            return
+        for entry_id in args:
+            entry = self.app.memory.confirm(entry_id)
+            if entry is None:
+                raise FreeAgentError(f"没找到这条记忆：{entry_id}")
+            self._say(
+                f"确认留着：{entry.content}"
+                "（退出本轮候选；窗口过后仍没被用过，它还会再出现）"
+            )
 
     def _memory_edit(self, args: list[str]) -> None:
         if len(args) < 2:

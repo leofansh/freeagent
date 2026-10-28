@@ -322,7 +322,7 @@ class Config:
 
     @property
     def api_key(self) -> SecretStr | None:
-        """拿 Key：��**环境变量优先、``llm.env`` 兜底**。未配置返回 ``None``。
+        """拿 Key：**环境变量优先、``llm.env`` 兜底**。未配置返回 ``None``。
 
         刻意用 :class:`~freeagent.secrets.SecretStr` 而不是裸 ``str``：
         这样 ``log.info("%s", config.api_key)`` 之类的手写法在**类型层面**

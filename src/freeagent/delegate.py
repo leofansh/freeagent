@@ -626,7 +626,8 @@ def run_once_with_tool_gate(
                                 # 这里只复述。
                                 conventions=tuple(
                                     e.content for e in app.memory.conventions(
-                                        task.role_ids
+                                        task.role_ids,
+                                        consumer="delegate_brief",
                                     )
                                 ),
                             ),
@@ -1182,7 +1183,7 @@ class _TaskRepoProgress:
 #: 「允许」。于是**人是被同意淹没了，不是被拦住了**。
 #:
 #: 为什么这里必须是**代码**而不是 prompt：请 agent「别无限重试」是把安全
-#: 押在一个可以忽略它的东西上���而这个上限由我们自己数、由我们自己停。
+#: 押在一个可以忽略它的东西上——而这个上限由我们自己数、由我们自己停。
 #:
 #: 默认值 40：一条真实的多文件改动会用到几十次工具调用，而一个正常任务
 #: 不该超过这个数。超了**不是失败**，是「这件事该拆开」——所以报错里
@@ -1720,7 +1721,7 @@ def run_with_tool_gate(
                     # 那会让 agent 干等，而人这边什么都不知道。
                     log.warning("【执行期】收到认不出的 permission.asked：%r", props)
                     continue
-                # ── 步数硬上限：防「无限循环」的���效部件 ──────────────────
+                # ── 步数硬上限：防「无限循环」的无效部件 ──────────────────
                 #
                 # **检查放在问人之前**，理由很实际：否则会发出一张卡，人正在
                 # 点它，而我们会立刻中止会话 —— 那张卡点了没有任何后果，
@@ -2370,7 +2371,9 @@ def _dispatch_one(
         last_attempt=last_attempt_line(app.artifacts.list_for_task(task.id)),
         # 人记下的约定（12.10.10）：世界的事实，不是人的倾向。
         conventions=tuple(
-            e.content for e in app.memory.conventions(task.role_ids)
+            e.content for e in app.memory.conventions(
+                task.role_ids, consumer="delegate_brief"
+            )
         ),
     )
     title = task.title[:60]

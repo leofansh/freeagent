@@ -57,7 +57,9 @@ __all__ = [
 #: 27 → artifacts.model（一次委派的账：实际用的模型，V1.95）。
 #: 28 → artifacts.tool_calls（一次委派的账：碰过的工具，V1.95）。
 #: 29 → task_records.error_kind（引擎错误的结构化类别，V1.96）。
-SCHEMA_VERSION = 29
+#: 30 → retrieval_log + retrieval_hits（检索与注入的留痕，V1.98）。
+#: 31 → memory_reviews（记忆 review 队列的「确认」记录，V1.100）。
+SCHEMA_VERSION = 31
 
 #: 按版本递增的迁移。**这里是「库的形状」唯一的写入口**：
 #: 新库也是从 v1 基线开始、逐版本重放这一串（见 :data:`_SCHEMA` 的注释），
@@ -499,6 +501,34 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 空串 = 这条记录不是引擎错误（绝大多数记录都不是）。
         "ALTER TABLE task_records ADD COLUMN error_kind TEXT NOT NULL DEFAULT ''",
     ),
+    (
+        "29 → 30：占位 —— v30 的真实步骤是多语句（retrieval_log + retrieval_hits"
+        " + 索引），走 _DOMAIN_STEPS keyed-30。",
+        # 与 v19 的占位同一种情况（索引位本来就是自己的，只是要跑域通道），
+        # 不是 v8/v17 那种「多语句版本占了索引位」—— 只需语法占位。
+        "SELECT 1",
+    ),
+    (
+        "30 → 31：memory_reviews（记忆 review 队列的「确认」记录，V1.100）",
+        # 单语句通道（``CREATE TABLE IF NOT EXISTS`` 自身幂等）—— 先例是
+        # v26 的 dispatch_leases，同一种「一张小表记一件事」。
+        #
+        # 为什么不带索引：这表一行一次「人确认过」，量级由人的动作决定
+        # （一年几十行），与 retrieval_log 那种「一次检索一行」的不可控
+        # 增长不同；读侧是一次 ``GROUP BY entry_id`` 的全表扫，够了。
+        #
+        # 为什么不设外键 / ON DELETE CASCADE：同 retrieval_hits（最近的
+        # 「按条目记日志」先例）—— 条目删掉后，确认记录是无害的孤儿
+        # （``MAX(created_at)`` 按 entry_id 分组，再也没有条目来问它），
+        # 而级联删除会让「确认记录」与「记忆」同生共死，多一层要维护的耦合。
+        """
+        CREATE TABLE IF NOT EXISTS memory_reviews (
+            id         TEXT PRIMARY KEY NOT NULL,
+            entry_id   TEXT NOT NULL,          -- 确认的是哪条记忆
+            created_at TEXT NOT NULL
+        )
+        """,
+    ),
 )
 
 
@@ -630,6 +660,57 @@ CREATE TRIGGER IF NOT EXISTS memory_au BEFORE UPDATE ON memory BEGIN
 END;
 """
 
+#: 检索留痕（3.7 / V1.98）的建表脚本。
+#:
+#: ## 治的是哪个缺口
+#:
+#: 在此之前，「哪条记忆 90 天没被用上」这个问题**无法回答** —— 检索与注入
+#: 都不留痕，读侧只能看到「记过什么」，看不到「用过什么」。于是
+#: 「不断完善个人知识图谱」缺了最基础的原料：没有留痕，就不知道本地
+#: 什么时候真的不够（该不该接在线检索），也没有「这条规律是从哪些记录
+#: 推出来的」可指。V1.96 的教训在这里同样成立：**没计数的观点不可反驳**。
+#:
+#: ## 为什么是两张表而不是一张带 id 列表的表
+#:
+#: 把命中的条目 id 拼成一列文本（逗号分隔 / JSON）也能存，但读侧要按
+#: 条目聚合「被检索几次」时就得**解析自己的文案** —— 11.9.12 禁掉的那类
+#: 事，且 id 列表里多一个少一个分隔符都不会报错。拆成 ``retrieval_hits``
+#: 一行一条之后，聚合是一次 ``GROUP BY entry_id``，且写入时就能约束
+#: （log_id + entry_id 主键，重复命中同一行会当场冲突而不是静默合并）。
+#:
+#: ## 为什么日志不设上限、不自动清理
+#:
+#: 自动清理 = 静默删除，正是本仓反复避开的那类事（「只进不出」的解法是
+#: 给人看的 review 队列，不是悄悄扔）。而量级不值一提：一次检索一行
+#: 日志 + 至多几条命中，日积月累也远小于任何一张业务表。真要清理时，
+#: 也该是一条明说删了什么的命令，而不是迁移里的隐式动作。
+_RETRIEVAL_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS retrieval_log (
+    id              TEXT PRIMARY KEY NOT NULL,
+    event           TEXT NOT NULL,          -- retrieve / inject，见 LOG_EVENTS
+    layer           TEXT NOT NULL,          -- memory / knowledge，见 LOG_LAYERS
+    query           TEXT NOT NULL DEFAULT '',   -- 原话；inject 事件没有查询词
+    scope           TEXT NOT NULL DEFAULT '',   -- 候选范围（'global' / 'role:<id>' / ''）
+    legs            TEXT NOT NULL DEFAULT '',   -- bm25 / tail / none / recency
+    hit_count       INTEGER NOT NULL DEFAULT 0,
+    consumer        TEXT NOT NULL DEFAULT '',   -- 谁消费的：'/memory search' / '/ask' / 'delegate_brief'
+    degraded        INTEGER NOT NULL DEFAULT 0,
+    degraded_reason TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_hits (
+    log_id    TEXT NOT NULL,
+    entry_id  TEXT NOT NULL,
+    position  INTEGER NOT NULL,             -- 在结果里的位次，用于复现排序
+    PRIMARY KEY (log_id, entry_id)
+);
+
+-- 读侧的两种查法都要快：按条目聚合（被检索/被注入几次）、按时间取最近一次。
+CREATE INDEX IF NOT EXISTS idx_retrieval_hits_entry ON retrieval_hits(entry_id);
+CREATE INDEX IF NOT EXISTS idx_retrieval_log_created ON retrieval_log(created_at);
+"""
+
 #: 关系对象与对外承诺（11.19 / V1.51）的建表脚本。
 #:
 #: **为什么是两张表而不是 tasks 上的两列**：
@@ -749,6 +830,13 @@ _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
     # 时已有同款建表，重复执行无害。理由见 _PROMISE_SCHEMA 的注释
     # （为什么是两张表、为什么 task_id 一对一）。
     (19, _PROMISE_SCHEMA),
+    # 30 → retrieval_log + retrieval_hits（3.7 / V1.98）：检索与注入的留痕。
+    #
+    # 走多语句通道的原因同 v19：这一版要建**两张表 + 两个索引**。
+    # 整表新建所以走 CREATE TABLE IF NOT EXISTS，本身幂等；新库 init_schema
+    # 时已有同款建表，重复执行无害。为什么必须留痕见 _RETRIEVAL_LOG_SCHEMA
+    # 的注释（没有它，「哪条记忆 90 天没被用上」无法回答）。
+    (30, _RETRIEVAL_LOG_SCHEMA),
 )
 
 #: 覆盖默认数据目录的环境变量名。

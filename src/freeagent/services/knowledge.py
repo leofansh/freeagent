@@ -82,6 +82,7 @@ from typing import Any, Literal
 from ..domain import RecordType, new_id
 from ..storage.repos import RoleRepo
 from .clock import Clock
+from .retrieval_log import record_retrieval
 
 __all__ = [
     "KnowledgeKind",
@@ -269,6 +270,9 @@ class KnowledgeService:
                 entry.created_at.isoformat(),
             ),
         )
+        # 必须提交：连接的 isolation_level 是默认值（隐式事务），不提交
+        # 等于回滚（V1.98 与 memory 层同一处修，见那边更长的说明）。
+        self._conn.commit()
         return entry
 
     def delete(self, entry_id: str) -> bool:
@@ -280,7 +284,10 @@ class KnowledgeService:
         cur = self._conn.execute(
             "DELETE FROM role_knowledge WHERE id=?", (entry_id,)
         )
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+        if deleted:
+            self._conn.commit()      # 同 add：不提交 = 回滚（V1.98）
+        return deleted
 
     # -- 读 ------------------------------------------------------------------ #
     def list_for_role(self, role_id: str, limit: int = 50) -> list[KnowledgeEntry]:
@@ -303,6 +310,7 @@ class KnowledgeService:
         query: str,
         *,
         limit: int = DEFAULT_LIMIT,
+        consumer: str = "",
     ) -> RetrievalResult:
         """检索该角色的知识。**返回值自带来源说明。**
 
@@ -313,17 +321,44 @@ class KnowledgeService:
         任何一步出错都**降级而不是抛**：检索是辅助能力，不该让整个命令失败。
         但降级**必须自报**（``degraded`` + 原因），否则「搜不到」会被误读成
         「没有这条知识」。
+
+        :param consumer: 谁在检索。同 :meth:`freeagent.services.memory.MemoryService.retrieve`：
+            不知道就传空串，不猜。**这一层目前没有生产入口**（13.2 的边界），
+            所以留痕先接在这里：等入口接通那天，「本地什么时候不够」
+            的判据已经在积累了，而不是又从零开始。
         """
         limit = max(1, int(limit))
         try:
-            return self._retrieve(role_id, query, limit)
+            result = self._retrieve(role_id, query, limit)
         except sqlite3.OperationalError as exc:
             # 典型触发：库是从 v7 升上来但知识域没建成（不该发生，schema 会建），
             # 或 FTS5 不可用（某些 Python 构建没编译）。
-            return RetrievalResult(
+            result = RetrievalResult(
                 degraded=True,
                 degraded_reason=f"检索不可用（{exc}）",
             )
+        if result.degraded:
+            legs, degraded, reason = "none", True, result.degraded_reason
+        elif result.bm25_hits:
+            legs, degraded, reason = "bm25", False, ""
+        elif result.tail_hits:
+            legs, degraded, reason = "tail", False, ""
+        else:
+            legs, degraded, reason = "none", False, ""
+        record_retrieval(
+            self._conn,
+            self._clock,
+            event="retrieve",
+            layer="knowledge",
+            entry_ids=[h.entry.id for h in result.hits],
+            query=query,
+            scope=role_id,
+            legs=legs,
+            consumer=consumer,
+            degraded=degraded,
+            degraded_reason=reason,
+        )
+        return result
 
     def _retrieve(
         self, role_id: str, query: str, limit: int

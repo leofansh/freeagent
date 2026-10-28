@@ -120,7 +120,11 @@ class TestMigration:
         # test_rerun_is_idempotent 会抓住这个错。）
         # v29（task_records.error_kind，V1.96）：引擎错误的结构化类别落成列，
         # 读侧按类别聚类不必解析错因文本（「把文案当契约」是 11.9.12 禁的）。
-        assert SCHEMA_VERSION == 29
+        # v30（retrieval_log + retrieval_hits，V1.98）：检索与注入的留痕，
+        # 多语句走 _DOMAIN_STEPS keyed-30（同 v19 的占位理由）。
+        # v31（memory_reviews，V1.100）：记忆 review 队列的「确认」记录，
+        # 单语句 CREATE TABLE，索引 30（源版本 30 → 31）。
+        assert SCHEMA_VERSION == 31
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}
@@ -147,6 +151,48 @@ class TestMigration:
             "v29 加的列。引擎错误的类别要能被读侧当事实用，"
             "不能靠从错因文本里正则解析（那是把文案当契约）"
         )
+
+    def test_memory_reviews_table_exists(self, conn):
+        """v31：memory_reviews（记忆 review 队列的「确认」记录）。
+
+        为什么是**独立表**而不是 memory 上的时间列：「我看过它，它还作数」
+        与「我改了它」是两件事 —— 混在 ``updated_at`` 上，「这条什么时候
+        变的」再也答不出来，而同一条记忆可以被确认很多次（一窗一次），
+        时间列存不下这个历史。
+        """
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "memory_reviews" in tables, (
+            "v31 加的表。没有它，/memory review 的「确认」无处可记，"
+            "候选会每轮重复出现 —— 确认动作变成一个摆设"
+        )
+
+    def test_v30_upgrade_gains_memory_reviews(self, tmp_path):
+        """停在 v30 的旧库升到当前：memory_reviews 恰好建一次。"""
+        from freeagent.storage.db import migrate
+
+        db = tmp_path / "old.db"
+        conn = connect(db)
+        try:
+            migrate(conn, 30)
+            tables = {
+                r[0]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert "memory_reviews" not in tables, "v30 的库不该有这张表"
+            migrate(conn)
+            # 集合是快照 —— 第二次 migrate 之后必须重新查，否则断言的是过去
+            tables = {
+                r[0]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert "memory_reviews" in tables
+            # 再跑一次 migrate：CREATE TABLE IF NOT EXISTS 不得重放报错
+            migrate(conn)
+        finally:
+            conn.close()
 
     def test_v26_upgrade_gains_attempt_ledger(self, tmp_path):
         """停在 v26 的旧库升到当前：两条 ALTER 走域通道，恰好一次。"""

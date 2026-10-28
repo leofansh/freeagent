@@ -1872,7 +1872,7 @@ def _menu_entries() -> list[tuple[str, str]]:
 def _run_menu(value: dict[str, Any], *, who: str) -> dict[str, Any]:
     """点了菜单项 → 把对应的内容发回聊天窗口，然后把按钮收掉。
 
-    与 :func:`_run_view_choice` 同构（发气泡 + 收按钮），但多���个分支：
+    与 :func:`_run_view_choice` 同构（发气泡 + 收按钮），但多一个分支：
     菜单项不全是视图，有些是「给你一段该发的话」。
 
     「角色」那一支刻意**转手交给** :func:`_run_view_choice`，而不是自己查库

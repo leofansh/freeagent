@@ -151,7 +151,7 @@ class TestBrokenRuleDoesNotBreakDelivery:
         """绕过服务层直接改库 —— 模拟历史数据被手改。
 
         刻意不提供「后门」方法：真产品里没有「故意写坏规则」的入口，
-        所以只能用测试自己开一条路���这正是这条测试要验的场景。
+        所以只能用测试自己开一条路——这正是这条测试要验的场景。
         """
         with app.tasks._tasks._tx():  # noqa: SLF001
             app.conn.execute(  # noqa: SLF001

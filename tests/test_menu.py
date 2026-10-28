@@ -179,7 +179,7 @@ def test_menu_card_is_json_1_0():
 
 
 def test_menu_card_buttons_carry_object_value():
-    """`value` 必须是 object —— 飞书 SDK 只支持 object 形态的���传数据。"""
+    """`value` 必须是 object —— 飞书 SDK 只支持 object 形态的透传数据。"""
     card = menu_card("要做什么", [("委派", "delegate")], chat_id="oc_1")
     button = card["elements"][1]["actions"][0]
     assert button["value"] == {

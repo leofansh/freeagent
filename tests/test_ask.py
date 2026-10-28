@@ -262,3 +262,45 @@ class TestSessionError:
         out, _ = _ask([_delta("半句"), ("session.error", {"error": "boom"})])
         assert out.ok is False
         assert out.partial == "半句"
+
+
+# --------------------------------------------------------------------------- #
+# core 记忆注入（V1.97，设计文档 3.7.6 注入点①）
+# --------------------------------------------------------------------------- #
+
+class TestMemoryContext:
+    """``/ask`` 把用户记下的 core 记忆带给执行器。
+
+    纪律继承自 ``core_block``，本模块只负责拼：
+
+    - 块拼在问题**前面**，块自带的「可能过期」定性不许被本模块去掉；
+    - **空块不注入** —— 不能给问题前面留一对孤零零的换行，那会让
+      「没带记忆」看起来像出了错；
+    - 11.13.3「brief 必须单行」是委派简报的约束，**不适用**于普通 prompt。
+    """
+
+    def test_context_is_prepended_to_the_question(self):
+        block = "以下是你之前让我记住的东西（可能过期，以当前为准）：\n- [约定] 回复先给结论"
+        out, srv = _ask([IDLE], context=block)
+        assert out.ok is True
+        _, sent = srv.prompts[0]
+        assert sent.startswith(block), "记忆块没拼在前面，或定性被改了"
+        assert sent.endswith("这个项目是干什么的？"), "问题没跟在块后面"
+        assert f"{block}\n\n这个项目是干什么的？" == sent
+
+    def test_empty_context_sends_the_question_unchanged(self):
+        """一条都没记 ⇒ 问题原样发出。留一对换行会让「没带」像出错。"""
+        out, srv = _ask([IDLE], context="")
+        _, sent = srv.prompts[0]
+        assert sent == "这个项目是干什么的？"
+
+    def test_whitespace_only_context_is_treated_as_empty(self):
+        out, srv = _ask([IDLE], context="  \n\t ")
+        _, sent = srv.prompts[0]
+        assert sent == "这个项目是干什么的？"
+
+    def test_context_does_not_change_the_answer_path(self):
+        """带记忆只是多拼一段 —— 答复怎么攒、预算怎么数，全不变。"""
+        out, _ = _ask([_delta("答"), IDLE], context="- [偏好] 简洁")
+        assert out.ok is True
+        assert out.text == "答"

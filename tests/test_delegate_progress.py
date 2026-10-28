@@ -304,7 +304,7 @@ class TestAuthorizationCardsThreadUnderProgressCard:
 
         def _q():
             # 载荷形状照 **V1 实测**：questions 是**字符串数组**，
-            # 不是带 header/options 的对象数组。解析器遇到不认识���形状
+            # 不是带 header/options 的对象数组。解析器遇到不认识的形状
             # 会整条放弃（宁可响亮失败，也不要残缺的答案），所以这里
             # 写错形状的表现是「一条卡都没发」，而不是发错。
             yield ("question.asked", {
