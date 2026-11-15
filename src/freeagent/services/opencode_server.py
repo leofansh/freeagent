@@ -35,7 +35,7 @@ import logging
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from .executors import (
     ExecutorAdapter,
@@ -162,6 +162,67 @@ def read_only_permission_config() -> dict[str, Any]:
     自觉。详见 :func:`freeagent.services.executors._v1_read_only_config`。
     """
     return current_adapter().build_read_only_config()
+
+
+#: 「本目录内自动」要**放宽**的动作名。它们是**有后果**的那一类（写文件、
+#: 跑命令），也正是默认档里 ``ask`` 的那几个。
+#:
+#: 刻意**不含** ``webfetch`` / ``websearch``：出网不是「在目录里干活」，
+#: 它的后果落在目录外。也不含 ``*``：未登记的动作必须继续走兜底 ``ask``，
+#: 否则「自动」就成了「任何插件注入的新工具都静默放行」——那正是复盘 0001
+#: 里那个 ``*: allow`` 的老坑。
+_AUTO_DIR_ALLOW_ACTIONS = frozenset({
+    "edit", "write", "multiedit", "apply_patch", "patch", "bash", "shell",
+})
+
+
+def auto_dir_permission_config() -> dict[str, Any]:
+    """「本目录内自动」的 permission 配置（V1.114 / 21.1 的自动档）。
+
+    ## 它做什么、不做什么
+
+    只把 :func:`delegation_permission_config` 里**写类与 shell** 的 ``ask``
+    翻成 ``allow``；``external_directory`` 仍是 ``deny``，子代理仍是 ``deny``，
+    出网仍是 ``ask``，**兜底 ``*: ask`` 一个字不动**。
+
+    所以这一档的语义是「在你选的那个目录里放手干，但越界仍然不可能」——
+    它**不是**「全自动」，也**不是**「关了闸门」。未登记的工具（插件注入的、
+    将来 opencode 新增的）照样会来问一次；那时它问的是**我们没预料到的东西**，
+    那一次必须有人看。
+
+    ## 为什么从既有配置**改写**而不是另抄一份
+
+    动作名与规则形状是执行器特有的知识，唯一的真源在
+    :mod:`freeagent.services.executors`。另抄一份必然在下次改动作名时腐烂，
+    而腐烂的方向在这里恰好是**放松**（旧名字匹配不上 ⇒ 那条规则变成 allow
+    ⇒ 静默放行）。改写只动 ``effect`` 这一格，名字错了就是「没放宽、
+    依旧 ask」，失效方向是**收紧**。
+    """
+    container = current_adapter().field_names["container"]
+    full = delegation_permission_config()
+    rules = full.get(container)
+    if isinstance(rules, dict):  # V1：{动作名: 结论}
+        settled = {
+            name: ("allow" if name in _AUTO_DIR_ALLOW_ACTIONS and effect == "ask"
+                   else effect)
+            for name, effect in rules.items()
+        }
+        return {**full, container: settled}
+    if isinstance(rules, list):  # V2：[{action, resource, effect}]
+        settled_rules = []
+        for rule in rules:
+            if (
+                isinstance(rule, dict)
+                and rule.get("action") in _AUTO_DIR_ALLOW_ACTIONS
+                and rule.get("effect") == "ask"
+            ):
+                rule = {**rule, "effect": "allow"}
+            settled_rules.append(rule)
+        return {**full, container: settled_rules}
+    raise ServerError(
+        "认不出权限配置的形状（既不是 V1 的对象也不是 V2 的数组）"
+        "—— 拒绝把自动档猜成放行"
+    )
 
 
 def build_isolated_config(config: dict[str, Any] | None = None) -> str:
@@ -601,7 +662,7 @@ class OpenCodeServer:
         startup_timeout: float = 60.0,
         extra_env: dict[str, str] | None = None,
         isolate: bool = True,
-        permission_config: dict[str, Any] | None = None,
+        permission_config: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
         apply_gate: bool = False,
     ) -> None:
         self._project = pathlib.Path(project)
@@ -616,6 +677,13 @@ class OpenCodeServer:
         # 刻意**存下整个 dict 而不是一个布尔开关**：将来若还有第三种
         # （比如「只读 + 允许出网」），加一个参数比加一个 if 分支更容易看清
         # 「有几种权限形状、分别是谁在用」。
+        #
+        # **也可以是一个返回 dict 的可调用对象**（V1.114 起）。理由：权限
+        # 配置的键名随主版本而变（V1 ``permission`` / V2 ``permissions``），
+        # 而版本要等 :meth:`_adopt_installed_adapter` 才知道 —— 常驻宿主在
+        # 构造服务器时**还不知道**本机装的是哪一版。传一个惰性 getter，
+        # 让它在写覆盖层那一刻（版本已定）再算，就不会拿别的版本的键名
+        # 去写一份「opencode 不认识、于是静默回默认 allow」的配置。
         self._permission_config = permission_config
         #: 是否把本项目审批闸门写成**项目级覆盖层**压进 opencode 的真实配置。
         #: 只给**派发 / /ask**（要强制闸门，且要借用用户原生的全局插件/MCP）；
@@ -671,8 +739,13 @@ class OpenCodeServer:
         # 本项目审批闸门。能力（插件/MCP/技能）一律不在这里给 —— 它们由
         # opencode 原生从用户的全局/项目配置加载，我们不去复制（那样会重装、
         # 且离了网就坏）。覆盖层机制见 :meth:`_write_overlay`。
-        return dict(self._permission_config) if self._permission_config is not None \
-            else dict(delegation_permission_config())
+        #
+        # 惰性 getter（见 ``__init__`` 里那段）：**在覆盖层落盘前一刻**才求值，
+        # 那时适配器已经按本机实际版本定好，键名才是对的。
+        cfg = self._permission_config
+        if callable(cfg):
+            cfg = cfg()
+        return dict(cfg) if cfg is not None else dict(delegation_permission_config())
 
     def _adopt_installed_adapter(self) -> None:
         """把当前适配器切成**本机实际装的**那个 opencode 主版本。
@@ -1067,6 +1140,43 @@ class OpenCodeServer:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self._port}"
+
+    @property
+    def pid(self) -> int:
+        """子进程 pid；进程不在（没起来 / 已退出）时返回 0。
+
+        常驻宿主需要它来「说出自己在跑哪个进程」—— 没有 pid 的宿主只能报
+        「我应该是好的」，而进程崩掉之后那句话是假的。
+        """
+        proc = self._proc
+        if proc is None:
+            return 0
+        try:
+            return int(proc.pid) if proc.poll() is None else 0
+        except (OSError, ValueError):  # pragma: no cover - 平台差异兜底
+            return 0
+
+    def healthy(self, *, timeout: float = 3.0) -> bool:
+        """服务还答不答话（打一次就绪探针）。
+
+        ## 为什么不能用 ``proc.poll()`` 代替
+
+        「进程活着」与「服务能接请求」是两件事：插件装到一半、端口被别的
+        东西占了、事件泵挂了 —— 进程都在。判活要判**它在答话**。
+
+        ## 为什么返回布尔而不是抛
+
+        调用方（常驻宿主）的处置是「停掉重起」，那是一个正常的恢复动作，
+        不是异常。真要把原因说清的地方在重启之后的状态里（``error`` 字段）。
+        """
+        api = current_adapter().api
+        if api is None:  # hermes 那类没有 opencode 的 API 表
+            return False
+        try:
+            code, _ = self.call(api.ready_path, timeout=timeout)
+        except (OSError, ValueError):  # pragma: no cover - 连接层兜底
+            return False
+        return code == 200
 
     @classmethod
     def discovery(cls, *, executable: str = "opencode",

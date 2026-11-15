@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import itertools
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -396,3 +397,183 @@ class TestReadOnlyInvariant:
             [], [], {}, WEDNESDAY, contacts=contacts, open_promises=promises,
         )
         assert not view.is_empty
+
+
+# ------------------------------------------- 时段凝练：集中在哪（V1.101）
+_done_seq = itertools.count()
+
+
+def _done(hour: int, day: int = 0) -> Task:
+    """一条在「WEDNESDAY 前 day 天的 hour 点」完成的事务。
+
+    id 走递增计数器而不是 ``hash(...)``：同一天同一小时可以完成多件事，
+    id 必须条条不同（否则「一条事务完成了三次」会悄悄混进「三个人都在
+    21 点完工」—— 峰是计数事实，样本本身不能有歧义）。
+    """
+    return _task(
+        f"t{next(_done_seq):04d}", "事", ("r1",),
+        state=TaskState.DONE,
+        completed_at=datetime(2026, 10, 21, hour, 30) - timedelta(days=day),
+    )
+
+
+def _view_of(tasks) -> PersonalModelView:
+    return build_personal_model(tasks, [], {"r1": "工作"}, WEDNESDAY)
+
+
+class TestCompletionPeak:
+    """「完成集中在哪」的凝练结论（V1.101 / 11.17 节奏面）。
+
+    纪律（每条都有实测撑着）：
+
+    - **每条结论带计数**：V1.96「没有计数的规律不可反驳」在框架层的落地 ——
+      「集中在 21-23 点」必须连「多少次、占几成」一起说；
+    - **判定不出是 None，不是「分布平坦」**：后者是把判定结果说成结论；
+    - **宁可漏判**：孤例（1 次）不定义段的边界、3 次与三分之一两道线都卡着 ——
+      漏判的代价是看分布原图，错判的代价是队列/结论里出现一个假规律；
+    - 这是**统计描述不是评价**：「37 次里 13 次在 21-23 点」可以说，
+      「你总在深夜干活」不可以说（11.17 原样成立）。
+    """
+
+    def test_adjacent_hours_merge_into_one_span(self):
+        tasks = [_done(21)] * 4 + [_done(22)] * 4 + [_done(23)] * 4
+        tasks += [_done(h) for h in (1, 3, 5, 7)]
+        view = _view_of(tasks)
+        assert view.hour_peak == (21, 23, 12)
+
+    def test_lone_hour_does_not_extend_the_span(self):
+        """20 点只完成过 1 次 —— 孤例不把「21-23 点」撑成「20-23 点」。"""
+        tasks = [_done(20)] + [_done(21)] * 4 + [_done(22)] * 4 + [_done(23)] * 4
+        tasks += [_done(h) for h in (1, 3, 5, 7, 9, 11, 13)]
+        view = _view_of(tasks)
+        assert view.hour_peak == (21, 23, 12)
+
+    def test_single_hour_span_is_not_a_range(self):
+        """3 次全在 21 点 —— 起止相同，呈现层说「21 点」不说「21-21 点」。"""
+        view = _view_of([_done(21)] * 3 + [_done(h) for h in (1, 3, 5, 7, 9, 11)])
+        assert view.hour_peak == (21, 21, 3)
+
+    def test_below_min_count_is_not_a_peak(self):
+        """一段里只有 2 次 —— 偶发不算规律（同 _MIN_ROLLOVERS 的精神）。"""
+        view = _view_of([_done(21)] * 2 + [_done(h) for h in (1, 3, 5, 7)])
+        assert view.hour_peak is None
+
+    def test_below_share_is_not_a_peak(self):
+        """3 次在 21 点但只占 3/23 —— 那是「分布平坦」，不是「集中」。"""
+        view = _view_of([_done(21)] * 3 + [_done(h) for h in range(0, 20)])
+        assert view.hour_peak is None
+
+    def test_exactly_one_third_counts(self):
+        """边界值：3/9 恰好三分之一 —— 判定线是「≥」，不含糊。"""
+        view = _view_of([_done(21)] * 3 + [_done(h) for h in (1, 2, 3, 4, 5, 6)])
+        assert view.hour_peak == (21, 21, 3)
+
+    def test_tie_takes_earlier_span(self):
+        """两段并列时取起始早的 —— 稳定、可预期，不引入随机兜底。"""
+        # 两段各 8 次并列；其余 8 次散点 ⇒ 8*3=24 ≥ 24，两段都过线，
+        # 于是「同数取起始早」这条真被走到（不是只有一个候选）。
+        tasks = [_done(9)] * 4 + [_done(10)] * 4 + [_done(21)] * 4 + [_done(22)] * 4
+        tasks += [_done(h) for h in (1, 3, 5, 7, 11, 13, 15, 17)]
+        view = _view_of(tasks)
+        assert view.hour_peak == (9, 10, 8)
+
+    def test_scattered_singles_are_not_a_peak(self):
+        """每小时各 1 次：没有任何一段够得上「集中」。"""
+        view = _view_of([_done(h) for h in range(0, 12)])
+        assert view.hour_peak is None
+
+    def test_no_completions_no_peak(self):
+        view = _view_of([])
+        assert view.hour_peak is None
+        assert view.dow_peak is None
+
+    def test_dow_peak_picks_the_busiest_day(self):
+        # 散日只取 1..6：day 7 是一周前的同一天，会把周三多算一次。
+        # 2026-10-21 是周三（weekday 2，见 WEDNESDAY 常量的注释）。
+        tasks = [_done(21, 0)] * 13
+        tasks += [_done(10, d) for d in range(1, 7)]
+        tasks += [_done(11, d) for d in range(1, 5)]
+        view = _view_of(tasks)
+        assert view.dow_peak == (2, 13)
+
+    def test_dow_below_threshold_is_none(self):
+        view = _view_of([_done(9, 0)] * 2 + [_done(10, d) for d in range(1, 5)])
+        assert view.dow_peak is None
+
+    def test_peak_count_matches_the_distribution(self):
+        """峰里的计数 = 分布里那一段的小时计数之和（可对账）。"""
+        tasks = [_done(21)] * 5 + [_done(22)] * 5 + [_done(23)] * 3
+        tasks += [_done(h) for h in range(0, 20, 2)]
+        view = _view_of(tasks)
+        start, end, count = view.hour_peak
+        assert count == sum(
+            c for h, c in view.completion_by_hour if start <= h <= end
+        )
+
+    def test_peak_is_not_added_to_is_empty(self):
+        """凝练结论不改变「有没有可归纳的事实」的判定 —— 那是 done 的事。"""
+        view = _view_of([_done(21)] * 3 + [_done(h) for h in (1, 3, 5)])
+        assert view.hour_peak == (21, 21, 3)
+        assert not view.is_empty
+
+
+class TestPeakRendering:
+    """峰在 CLI 输出里长什么样（V1.101）。"""
+
+    def test_peak_stated_with_count_and_share(self):
+        tasks = [_done(21)] * 5 + [_done(22)] * 5 + [_done(23)] * 3
+        tasks += [_done(h) for h in range(0, 20, 2)]
+        text = render_model(_view_of(tasks), {})
+        assert "其中 13 次（56%）集中在 21-23 点" in text
+
+    def test_single_hour_peak_label(self):
+        text = render_model(_view_of([_done(21)] * 3 + [_done(h) for h in (1, 3, 5, 7, 9, 11)]), {})
+        assert "其中 3 次（33%）集中在 21 点" in text
+        assert "21-21" not in text
+
+    def test_dow_peak_stated(self):
+        tasks = [_done(21, 0)] * 13
+        tasks += [_done(10, d) for d in range(1, 7)]
+        tasks += [_done(11, d) for d in range(1, 5)]
+        text = render_model(_view_of(tasks), {})
+        assert "其中 13 次（56%）集中在周三" in text
+
+    def test_missing_peak_explains_the_threshold(self):
+        """判不出要说清判定线 —— 一声不响只会让人以为漏印了一行。"""
+        text = render_model(_view_of([_done(9), _done(14), _done(20)]), {})
+        assert "没有达到「集中」的判定线" in text
+        assert "至少 3 次" in text and "三分之一" in text
+
+    def test_peak_is_a_description_not_advice(self):
+        """统计描述不是评价：输出里不许出现「建议 / 应该 / 不如」。"""
+        tasks = [_done(21)] * 5 + [_done(22)] * 5 + [_done(23)] * 3
+        tasks += [_done(h) for h in range(0, 20, 2)]
+        text = render_model(_view_of(tasks), {})
+        for word in ("建议", "应该", "不如", "熬夜"):
+            assert word not in text
+
+    def test_empty_window_says_no_completions(self):
+        """空库走 is_empty 早退（「还没有可归纳的记录」）—— 没有峰行可摆。"""
+        text = render_model(_view_of([]), {})
+        assert "还没有可归纳的记录" in text
+        assert "集中在" not in text
+        assert "判定线" not in text
+
+
+class TestModelPayloadPeaks:
+    """``/api/model`` 的峰字段（V1.101）：判定在服务层，web 只拼形状。"""
+
+    def test_payload_exposes_peaks_as_arrays(self):
+        from freeagent.web.serialize import model_payload
+
+        tasks = [_done(21)] * 3 + [_done(h) for h in (1, 3, 5, 7, 9, 11)]
+        payload = model_payload(_view_of(tasks), WEDNESDAY)
+        assert payload["hour_peak"] == [21, 21, 3]
+        assert payload["dow_peak"] is not None
+
+    def test_payload_peak_is_null_when_not_judged(self):
+        from freeagent.web.serialize import model_payload
+
+        payload = model_payload(_view_of([_done(9), _done(14), _done(20)]), WEDNESDAY)
+        assert payload["hour_peak"] is None
+        assert "done_in_window" in payload, "占比要能由前端现算，总数必须在"

@@ -36,6 +36,13 @@ class _FakeServer:
     def create_session(self) -> str:
         return "ses_fake"
 
+    def call(self, path, method="GET", body=None, *, timeout=30.0):
+        """收尾的改动账会问一次 ``/api/session/{sid}/message``（12.10.13）。
+
+        这个假服务里没有工具调用，所以回一页空的 = 「零改动」。
+        """
+        return 200, b'{"data": []}'
+
     def prompt_async(self, session_id, question, model=None) -> None:
         self.prompts.append((session_id, question))
 
@@ -304,3 +311,134 @@ class TestMemoryContext:
         out, _ = _ask([_delta("答"), IDLE], context="- [偏好] 简洁")
         assert out.ok is True
         assert out.text == "答"
+
+# --------------------------------------------------------------------------- #
+# 知识边界分档（V1.104 / 11.10.9）
+# --------------------------------------------------------------------------- #
+
+def _read(path):
+    """带路径的读文件事件（V1 形状：``part.state.input.filePath``）。"""
+    return ("tool", {"tool": "read", "state": {"input": {"filePath": path}}})
+
+
+def _bash(cmd):
+    return ("tool", {"tool": "bash", "state": {"input": {"command": cmd}}})
+
+
+class TestEvidenceCollection:
+    """``tool_calls`` 是**计数**（预算用），``evidence`` 是**凭据**（边界用）。
+
+    两者刻意分开：预算不该因为认不出形状而少算一次调用（那会放开轮次
+    上限），边界也不该因为认不出形状而假装它查过。
+    """
+
+    def test_read_event_yields_evidence(self):
+        out, _ = _ask([_read("README.md"), _delta("答"), IDLE])
+        assert len(out.evidence) == 1
+        assert out.evidence[0].tool == "read"
+        assert out.evidence[0].target == "README.md"
+
+    def test_unrecognizable_tool_still_counts_for_budget(self):
+        """``_tool()`` 没有工具名 —— 认不出，但**必须**计进轮次预算。"""
+        out, _ = _ask([_tool(), _delta("答"), IDLE])
+        assert out.tool_calls == 1
+        assert out.evidence == ()
+
+    def test_v2_shape_is_recognized(self):
+        """V2 的 ``data.input`` 折成 ``state.input`` 后同样要认得。"""
+        from freeagent.services.tool_evidence import tool_evidence
+
+        ev = tool_evidence("tool", {"tool": "read",
+                                    "state": {"input": {"path": "a.py"}}})
+        assert ev is not None and ev.target == "a.py"
+
+    def test_failed_ask_still_carries_evidence(self):
+        """半截答复照样有凭据问题 —— 读没读过与答没答完是两件事。
+
+        **三次都在**（预算 2 却记了 3 条）：第三次调用真的发生了 ——
+        事件已经到了，这一轮才判超预算。凭据记的是「发生过什么」，
+        不该因为「它超了」把已经发生的那一次抹掉。
+        """
+        out, _ = _ask([_read("README.md"), _read("a.py"), _read("b.py")],
+                      max_tool_calls=2)
+        assert out.ok is False
+        assert len(out.evidence) == 3
+        assert out.tool_calls == 3
+
+
+class TestKnowledgeBoundary:
+    """三档只看「查没查」，不看模型口吻（逐句归因做不到，不做）。"""
+
+    def test_no_tool_calls_is_guessed(self):
+        out, _ = _ask([_delta("答"), IDLE])
+        from freeagent.services.ask import knowledge_boundary
+
+        b = knowledge_boundary(out.evidence, ".")
+        assert (b.grade, b.label) == ("guessed", "猜想")
+        assert "一次工具都没调用" in b.basis
+
+    def test_existing_file_is_verified(self):
+        out, _ = _ask([_read("README.md"), _delta("答"), IDLE])
+        from freeagent.services.ask import knowledge_boundary
+
+        b = knowledge_boundary(out.evidence, ".")
+        assert (b.grade, b.label) == ("verified", "确定")
+        assert b.checked == ("README.md",)
+        assert "可自己复核" in b.basis
+
+    def test_missing_file_is_inferred(self):
+        out, _ = _ask([_read("definitely/not/here.py"), _delta("答"), IDLE])
+        from freeagent.services.ask import knowledge_boundary
+
+        b = knowledge_boundary(out.evidence, ".")
+        assert b.grade == "inferred"
+        assert "没有一个目标落在" in b.basis
+
+    def test_glob_pattern_is_not_treated_as_missing(self):
+        """通配模式拿去 exists() 永远为假 —— 不能因此判成「凭据落空」。"""
+        from freeagent.services.ask import knowledge_boundary
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        b = knowledge_boundary((ToolEvidence("glob", "**/*.py"),), ".")
+        assert b.grade == "inferred"
+        assert "通配模式" in b.basis
+
+    def test_bash_command_is_never_a_path(self):
+        """``bash`` 的 target 是命令。拿命令去 exists() 必然假，
+        于是「跑过命令」会被误判成「凭据落空」—— 所以它根本不算文件类。"""
+        from freeagent.services.ask import knowledge_boundary
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        b = knowledge_boundary((ToolEvidence("bash", "README.md"),), ".")
+        assert b.grade == "inferred"
+
+    def test_one_existing_target_is_enough(self):
+        from freeagent.services.ask import knowledge_boundary
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        b = knowledge_boundary(
+            (ToolEvidence("read", "no.py"), ToolEvidence("read", "README.md")),
+            ".",
+        )
+        assert b.grade == "verified"
+
+    def test_relative_targets_resolve_against_project(self, tmp_path):
+        from freeagent.services.ask import knowledge_boundary
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "a.py").write_text("x", encoding="utf-8")
+        b = knowledge_boundary((ToolEvidence("read", "src/a.py"),), tmp_path)
+        assert b.grade == "verified"
+
+    def test_checked_list_is_bounded(self):
+        from freeagent.services.ask import knowledge_boundary
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        ev = tuple(ToolEvidence("read", f"src/freeagent/{n}")
+                   for n in (
+                       "app.py", "config.py", "__init__.py",
+                   ))
+        b = knowledge_boundary(ev, ".")
+        assert b.grade == "verified"
+        assert len(b.checked) <= 5

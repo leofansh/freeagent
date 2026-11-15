@@ -6,7 +6,9 @@
 一条硬约束（设计文档第七章）：**每条排序信号的理由必须出现在响应里**，
 且响应必须带上免责标记。前端想「画得好看」也不能把它们藏起来。
 
-单实体与信封类响应在 :mod:`serialize_api`，公共字段投影在 :mod:`_fields`。
+单实体与信封类响应在 :mod:`serialize_api`，公共字段投影在 :mod:`_fields`，
+个人画像的投影在 :mod:`serialize_model`（``serialize.py`` 曾顶到 250 行上限，
+``TestWebPackageStaysSmall`` 守着那条线）。
 """
 
 from __future__ import annotations
@@ -14,7 +16,8 @@ from __future__ import annotations
 from ..domain import Role, ScoredTask
 from ..services.sorting import DISCLAIMER_MARKER
 from ..services.today import TodayView
-from ._fields import base_task, iso, signals
+from ._fields import base_task, signals
+from .serialize_model import model_payload
 
 __all__ = [
     "DISCLAIMER_MARKER",
@@ -114,40 +117,6 @@ def today_payload(
                 for i in view.rollover.items
             ],
         },
-    }
-
-
-def model_payload(view, now=None) -> dict:
-    """连续性个人模型（11.17 / V1.59）：节奏 / 关系 / 承诺 三面。
-
-    只读聚合的投影，不含任何业务判断 —— 逾期标 ``overdue``、违约交给用户，
-    与 /api/contacts、/api/promises 同一份「只摆事实」纪律（11.19.5）。
-    """
-    return {
-        "kind": "personal_model",
-        "since": view.since.isoformat(),
-        "until": view.until.isoformat(),
-        "window_tasks": view.window_tasks,
-        "done_in_window": view.done_in_window,
-        "completion_by_hour": [list(p) for p in view.completion_by_hour],
-        "completion_by_dow": [list(p) for p in view.completion_by_dow],
-        "rollover_total": view.rollover_total,
-        "tasks_rolled_over": [
-            {"id8": t[0], "title": t[1], "n": t[2]} for t in view.tasks_rolled_over
-        ],
-        "stuck_waiting": [
-            {"id8": t[0], "title": t[1], "age_days": t[2]} for t in view.stuck_waiting
-        ],
-        "role_activity": [{"name": n, "count": c} for (n, c) in view.role_activity],
-        # V1.59 新增两面：关系账 + 承诺与目标。
-        "relationships": [
-            {"id": r[0], "name": r[1], "open_promises": r[2], "open_waitings": r[3]}
-            for r in view.relationships
-        ],
-        "commitments": [{"kind": c[0], "text": c[1], "overdue": c[2]} for c in view.commitments],
-        # V1.69 滋养兴趣（记录优先）：记下的「偏好」原样带出，不评价不催促
-        "preferences": [{"text": t} for _k, t in view.preferences],
-        "disclaimer": DISCLAIMER_MARKER,
     }
 
 

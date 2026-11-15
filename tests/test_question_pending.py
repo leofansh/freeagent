@@ -124,7 +124,15 @@ class TestMigration:
         # 多语句走 _DOMAIN_STEPS keyed-30（同 v19 的占位理由）。
         # v31（memory_reviews，V1.100）：记忆 review 队列的「确认」记录，
         # 单语句 CREATE TABLE，索引 30（源版本 30 → 31）。
-        assert SCHEMA_VERSION == 31
+        # v32（decision_log，V1.112）：拍板当时那板的**冻结快照**
+        # （代价文本逐字冻结，现算即漂移），单语句 CREATE TABLE，
+        # 索引 31（源版本 31 → 32）。
+        # v33（workbench_turns，V1.115）：工作台每一轮的行（我说了什么、
+        # 它回了什么、停在哪一步），单语句 CREATE TABLE，索引 32。
+        # v34（workbench_turns.context_note，V1.115）：这一轮带了什么上下文；
+        # 独立一版是因为 v33 可能已被重放，改它的建表语句会让同一版本号
+        # 出现两种形状。
+        assert SCHEMA_VERSION == 34
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

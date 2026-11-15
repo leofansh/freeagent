@@ -92,6 +92,13 @@ class _FakeServer:
             raise self.raise_on_session
         return "ses_fake"
 
+    def call(self, path, method="GET", body=None, *, timeout=30.0):
+        """收尾的改动账会问一次 ``/api/session/{sid}/message``（12.10.13）。
+
+        这个假服务里没有工具调用，所以回一页空的 = 「零改动」。
+        """
+        return 200, b'{"data": []}'
+
     def prompt_async(self, session_id, brief, *, model="", agent="",
                       variant="", directory=None):
         self.prompts.append((session_id, brief))

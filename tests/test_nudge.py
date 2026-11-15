@@ -429,19 +429,17 @@ class TestNudgeCommands:
 
     def test_out_of_range_index_is_explained(self, env):
         app, _clock, role = env
-        # id 是随机 hex；`/nudge 5` 先试序号（越界）再试 id 前缀匹配，
-        # 若某候选 id 恰好以 "5" 开头（1/16 概率），会被 id 前缀匹配到草稿
-        # 而非「没有第 5 条」。所以要保证候选 id 不以 "5" 开头，序号 5
-        # 才**确定**越界。重试几乎必成（15/16 每建一次就中）。
-        for _ in range(100):
-            made = _waiting(
-                app, role, follow_up_at=datetime(2026, 10, 18, 9, 0)
-            )
-            if not made.id[:8].startswith("5"):
-                break
+        # ``/nudge N`` 先试序号、再试 id 前缀匹配，所以「越界」能不能测到，
+        # 取决于有没有候选 id 恰好以 N 开头（hex 里 1/16）。
+        # 老写法是「建一条、若撞了就再建一条」—— **多建的那条本身就是新候选**，
+        # 撞过的那条也还留在候选里，于是 `/nudge 5` 被前缀匹配到草稿，
+        # 整套断言随机红（实测 1/5 次）。改成：只建一条，从 5-9 里挑一个
+        # 它**没占掉**的数字前缀 —— 一条候选至多占一个，剩下的确定越界。
+        made = _waiting(app, role, follow_up_at=datetime(2026, 10, 18, 9, 0))
+        index = next(i for i in range(5, 10) if str(i) != made.id[0])
         repl, buf = self._repl(app)
-        repl.handle("/nudge 5")
-        assert "没有第 5 条" in buf.getvalue()
+        repl.handle(f"/nudge {index}")
+        assert f"没有第 {index} 条" in buf.getvalue()
 
     def test_unknown_prefix_says_look_at_list(self, env):
         app, _clock, role = env

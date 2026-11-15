@@ -65,11 +65,19 @@ LOG_LAYERS: frozenset[str] = frozenset({"memory", "knowledge"})
 #:   :meth:`freeagent.services.memory.MemoryService.core_block`）；
 #: - ``recency`` —— 注入类事件「没有相关度可依」时的取值：没传查询、
 #:   查询切不出 token、或相关度不可用（后两种看 ``degraded`` 列分辨）；
+#: - ``online`` —— **本地关键词空手、外部腿补上了**（V1.105，只出现在检索
+#:   事件里；注入不走外部）。它回答的正是本模块开头那个问题「本地什么时候
+#:   真的不够」，所以取值不能与 ``tail`` 合并：``tail`` 是「本地没有相关的，
+#:   只有最近的」，``online`` 是「本地连最近的都没能顶事，问了外面」；
 #: - ``none`` —— 没有命中（含降级）。
+#:
+#: **``hit_count`` 只数本地条目**：外部结果没有 id、不进 ``retrieval_hits``，
+#: 于是 ``legs='online'`` 的行可能同时有 ``hit_count>0``（那是 tail 回落的
+#: 近期条目）或 ``=0``（本地一条都没有）。两个数回答的是不同问题，别相加。
 #:
 #: 注入事件的腿**不是装饰**：「按相关度选的」与「只是最近写的」价值不同，
 #: 混起来就等于让三个月后的自己猜 —— 而猜不出来，因为日志里没有。
-LOG_LEGS: frozenset[str] = frozenset({"bm25", "tail", "none", "recency"})
+LOG_LEGS: frozenset[str] = frozenset({"bm25", "tail", "none", "recency", "online"})
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

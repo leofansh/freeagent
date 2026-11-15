@@ -32,6 +32,7 @@ from freeagent.services.delegate import (
     DelegationPolicy,
     already_dispatched,
     attempt_state,
+    brief_quadrant,
     build_brief,
     check_project_allowed,
     conventions_line,
@@ -491,6 +492,161 @@ class TestBriefCarriesFailureHistory:
         from freeagent.services import feedback as fb
 
         assert "build_brief" not in inspect.getsource(fb)
+
+# =============================================================================
+# 协作象限标注（12.10.12 / V1.103）
+# =============================================================================
+class TestBriefQuadrant:
+    """四象限判的是「谁手里有做法的一手材料」，不是「谁更懂」。
+
+    * 讲授 = 人给过做法，机器没跑过
+    * 共识 = 两边都有
+    * 暗知 = 机器跑过（留下账），人没给做法
+    * 双盲 = 两边都空
+
+    两条纪律用测试守着：① 判空必须复用产出那段的那份推导（不另写规则）；
+    ② 象限**只标注不决策** —— 它绝不出现在派发资格/阻断判定里。
+    """
+
+    def _failed(self, app, tid):
+        now = app.clock.now()
+        app.record_repo.append(tid, RecordType.DELEGATION_DISPATCHED, "派出", now)
+        app.record_repo.append(
+            tid, RecordType.DELEGATION_FAILED, "闸门缺口", now
+        )
+        return app.record_repo.list_for_task(tid)
+
+    def test_nothing_on_either_side_is_blind(self):
+        q = brief_quadrant()
+        assert (q.quadrant, q.label) == ("blind", "双盲")
+        assert q.human_side == () and q.machine_side == ()
+        assert q.says_how_much and q.what_to_add
+
+    def test_plan_alone_is_teach(self):
+        q = brief_quadrant(accepted_plan="先做接口再做界面")
+        assert (q.quadrant, q.label) == ("teach", "讲授")
+        assert q.human_side == ("你已采纳的方案",)
+        assert q.machine_side == ()
+
+    def test_conventions_alone_is_teach(self):
+        q = brief_quadrant(conventions=("这个项目不用 npm",))
+        assert q.quadrant == "teach"
+        assert q.human_side == ("人记过的约定",)
+
+    def test_machine_records_alone_is_tacit(self, app, work, tmp_path):
+        tid = make_delegation(app, work, str(tmp_path))
+        q = brief_quadrant(records=self._failed(app, tid))
+        assert (q.quadrant, q.label) == ("tacit", "暗知")
+        assert q.human_side == ()
+        assert q.machine_side == ("本任务上次失败的错因",)
+        # 暗知最危险的误读：把机器的账当人定的规则。
+        assert "不是人定的规则" in q.brief_line
+
+    def test_last_attempt_alone_is_tacit(self):
+        q = brief_quadrant(last_attempt="上次实际用的模型：claude-opus-5")
+        assert q.quadrant == "tacit"
+        assert q.machine_side == ("上次实际用的模型与工具",)
+
+    def test_both_sides_is_shared(self, app, work, tmp_path):
+        tid = make_delegation(app, work, str(tmp_path))
+        q = brief_quadrant(
+            accepted_plan="先做接口再做界面",
+            records=self._failed(app, tid),
+        )
+        assert (q.quadrant, q.label) == ("shared", "共识")
+        assert set(q.human_side) and set(q.machine_side)
+
+    def test_blank_input_counts_as_nothing(self):
+        """空白不是材料 —— 否则会出现「讲授」但正文里一个字的方案都没有。"""
+        q = brief_quadrant(accepted_plan="   ", conventions=("  ", " "))
+        assert q.quadrant == "blind"
+
+    def test_unrelated_project_history_is_not_material(self, app, work, tmp_path):
+        """同项目「其它任务」若没踩过坑，不算机器有账（判空走同一份推导）。"""
+        other = app.tasks.create(
+            "另一次委派", [work.id], intent="在别处完成",
+            project_path=str(tmp_path),
+        )
+        app.record_repo.append(
+            other.id, RecordType.DELEGATION_DISPATCHED, "派出", app.clock.now()
+        )
+        history = [(other.title, app.record_repo.list_for_task(other.id))]
+        q = brief_quadrant(project_history=history)
+        assert q.quadrant == "blind"
+        assert project_history_line(history) == ""
+
+    # ---- 进简报的那一句：只在会被误读时说话 ---- #
+
+    def test_teach_and_shared_add_nothing(self, app, work, tmp_path):
+        """人有材料时一个字不加 —— 材料就在上面，摆着比说着有力。"""
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        teach = build_brief(
+            task, task.intent, None, accepted_plan="先做接口再做界面"
+        )
+        assert "本次没有" not in teach
+        shared = build_brief(
+            task, task.intent, None,
+            accepted_plan="先做接口再做界面",
+            records=self._failed(app, tid),
+        )
+        assert "本次没有" not in shared
+
+    def test_blind_names_all_three_missing_pieces(self, app, work, tmp_path):
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        brief = build_brief(task, task.intent, None)
+        assert "本次没有已采纳方案、约定和历史执行记录" in brief
+
+    def test_tacit_says_records_are_not_rules(self, app, work, tmp_path):
+        tid = make_delegation(app, work, str(tmp_path))
+        task = app.tasks.get(tid)
+        brief = build_brief(
+            task, task.intent, None, records=self._failed(app, tid)
+        )
+        assert "不是人定的规则" in brief
+
+    def test_quadrant_does_not_gate_anything(self):
+        """象限是**标注**不是闸门：不许出现在资格/阻断判定里（12.10.2）。"""
+        import inspect
+
+        from freeagent.services import delegate as svc
+
+        for fn in (svc.eligible_tasks, svc.dispatch_blocker,
+                   svc.already_dispatched):
+            assert "quadrant" not in inspect.getsource(fn), (
+                f"{fn.__name__} 不该读象限"
+            )
+
+    def test_brief_is_assembled_in_exactly_one_place(self):
+        """预览与实发必须逐字相同 —— 组装只能有一处（12.1.1）。"""
+        import inspect
+
+        from freeagent import delegate as outer
+
+        src = inspect.getsource(outer.run_once_with_tool_gate)
+        assert "assemble_brief(app, task).text" in src
+        assert "build_brief(" not in src, "不许再内联拼装第二份"
+
+    def test_assemble_brief_collects_the_same_parts(self, app, work, tmp_path):
+        """``assemble_brief`` 的产物与手工拼 build_brief 一致。"""
+        from freeagent.delegate import assemble_brief
+
+        tid = make_delegation(app, work, str(tmp_path))
+        records = self._failed(app, tid)
+        task = app.tasks.get(tid)
+        assembled = assemble_brief(app, task)
+        manual = build_brief(
+            task, task.intent, task.definition_of_done,
+            records=records,
+            project_history=sibling_history(app.task_repo, app.record_repo, task),
+            accepted_plan="",
+            last_attempt=last_attempt_line(app.artifacts.list_for_task(tid)),
+            conventions=(),
+        )
+        assert assembled.text == manual
+        assert assembled.quadrant.quadrant == "tacit"
+
 
 # =============================================================================
 # 启动恢复（12.11.1 / V1.39）

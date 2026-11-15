@@ -11,7 +11,13 @@ from __future__ import annotations
 
 __all__ = ["JS_MODEL"]
 
-JS_MODEL = r"""async function renderModel(root) {
+# weekday（0=周一）→ 中文。与 CLI render 的 ``_WEEKDAY_CN`` 同一个口径 ——
+# 标签是呈现层翻译，不是业务判断（12.1.1：判定在服务层，这里只拼字）。
+# **必须在 JS 字符串里定义**：它是拼进页面的 JS 常量，写在 Python 模块级
+# 进不了浏览器作用域。
+JS_MODEL = r"""const DOW_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+
+async function renderModel(root) {
   root.innerHTML = "";
   let m;
   try {
@@ -28,6 +34,22 @@ JS_MODEL = r"""async function renderModel(root) {
   if (m.done_in_window) rhythm.push("完成 " + m.done_in_window + " 件");
   if (m.rollover_total) rhythm.push("顺延 " + m.rollover_total + " 次");
   if (m.stuck_waiting.length) rhythm.push("卡住的等候 " + m.stuck_waiting.length + " 件");
+  // V1.101 凝练结论：集中在哪 + 计数与占比（判定在服务层，前端只拼标签；
+  // 判定不出时照说「未达判定线」，不静默跳过 —— 与 CLI 同一条口径）。
+  if (m.hour_peak) {
+    const p = m.hour_peak;
+    const span = p[0] === p[1] ? p[0] + " 点" : p[0] + "-" + p[1] + " 点";
+    rhythm.push(p[2] + " 次（" + Math.floor((p[2] * 100) / m.done_in_window) +
+      "%）集中在 " + span);
+  } else if (m.done_in_window) {
+    rhythm.push("时段分布未达「集中」判定线（至少 3 次且占三分之一）");
+  }
+  if (m.dow_peak) {
+    const p = m.dow_peak;
+    rhythm.push(p[1] + " 次集中在" + DOW_CN[p[0]]);
+  } else if (m.done_in_window) {
+    rhythm.push("星期分布未达「集中」判定线");
+  }
   if (rhythm.length) {
     root.appendChild(el("h3", null, "节奏"));
     root.appendChild(el("div", "meta", rhythm.join(" · ")));

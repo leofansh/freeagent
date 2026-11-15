@@ -22,6 +22,7 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
   </header>
   <nav id="nav" hidden>
     <button data-view="chat" aria-selected="true">对话</button>
+    <button data-view="workbench">工作台</button>
     <button data-view="today">今天<span class="badge" id="b-today" hidden></span></button>
     <button data-view="all">全部未结束</button>
     <button data-view="closed">已结束</button>

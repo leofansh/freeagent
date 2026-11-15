@@ -24,6 +24,13 @@
    （升级本仓 vs. 对着真机实测），合成一句「不可用」等于让人自己猜。
 3. **``detected_major`` 探不到是 ``None``，不是 ``0``。** 两者都能比较，
    但 ``0`` 会被当成「版本 0」而进入别的分支，然后给出一句莫名其妙的话。
+
+## 「派出去拿什么身份调模型」不在本模块
+
+那是另一件事（另立 :mod:`.executor_credentials`）：本模块答「装没装、能不能派」，
+那个答「凭据从哪来」。分开的理由不是洁癖 —— 凭据那一问的判据是**文件内容与
+进程环境**，而它的纪律也不同（只报观察到的事实，不报「能不能调通」）。
+这里只把结果装进 :attr:`ExecutorProbe.credential` 两个字段，呈现不在这儿写第二遍。
 """
 
 from __future__ import annotations
@@ -31,6 +38,14 @@ from __future__ import annotations
 import dataclasses
 import shutil
 from typing import Callable, Literal, Sequence
+
+from .executor_credentials import (
+    UNTESTED,
+    CredentialProbe,
+    CredentialState,
+    probe_opencode_credentials,
+    render_credential,
+)
 
 __all__ = [
     "ExecutorProbe",
@@ -77,6 +92,12 @@ class ExecutorProbe:
     capabilities: tuple[Bucket, ...]
     #: 不可派发时，**给一句能照着做的话**；可派发时为空串。
     unavailable_reason: str = ""
+    #: 派出去之后拿什么身份调模型（:mod:`.executor_credentials`）。
+    #: 默认 ``untested``（= 本仓没有它的凭据探针），**不是「没凭据」** ——
+    #: 两者混起来，hermes 会被写成「两处都没看到」，那是在替它断言。
+    credential: CredentialState = UNTESTED
+    #: 凭据的**观察结果**（查了哪里、看到什么）。绝不含密钥值。
+    credential_detail: str = ""
 
 
 def _buckets_for(*, verified: bool) -> tuple[Bucket, ...]:
@@ -101,6 +122,7 @@ def _probe_executor(
     capabilities: Callable[[bool], tuple[Bucket, ...]] = lambda v: _buckets_for(
         verified=v
     ),
+    credential: CredentialProbe | None = None,
 ) -> ExecutorProbe:
     """探测一个执行器的**共同骨架**。
 
@@ -128,6 +150,9 @@ def _probe_executor(
 
     ``capabilities`` 默认按 ``verified`` 给三桶；需要单独覆盖（曾经是 hermes
     只 /ask 知识问答，现在停用了）—— 见 :func:`probe_hermes`。
+
+    ``credential`` 不传就是 ``untested``：本仓**没有**这个执行器的凭据探针。
+    刻意不给默认的「没凭据」—— 那是替它断言，而断言的方向最好是「不知道」。
     """
     from .executors import adapter_for, dispatchable_majors
 
@@ -172,6 +197,7 @@ def _probe_executor(
     else:
         reason = unverified_reason(detected)
 
+    cred = credential if credential is not None else CredentialProbe(UNTESTED)
     return ExecutorProbe(
         name=name,
         installed=installed,
@@ -180,6 +206,8 @@ def _probe_executor(
         verified=verified,
         capabilities=capabilities(verified),
         unavailable_reason=reason,
+        credential=cred.state,
+        credential_detail=cred.detail,
     )
 
 
@@ -201,6 +229,10 @@ def probe_opencode(command: str = "opencode") -> ExecutorProbe:
             "要接它得先对着一个真实实例实测适配器的字段形状 —— "
             "猜一个「看起来很像对的」形状比拒绝更危险：它会静默地不生效。"
         ),
+        # 凭据是**文件 + 环境**的观察，不起进程、不落库，所以装没装都探。
+        # 「装了但 PATH 没了」与「装了、版本对、但没登录」是两种完全不同的坑，
+        # 后者正是 401/402 的来源 —— 那一行要在同一次 `/agents` 里就能看到。
+        credential=probe_opencode_credentials(),
     )
 
 
@@ -297,6 +329,11 @@ def render_probe(probe: ExecutorProbe) -> str:
     )
     caps = "、".join(probe.capabilities) if probe.capabilities else "**一桶都不给**"
     lines.append(f"  能力（read/write/approve）：{caps}")
+    # 凭据放在能力之后、理由之前：它答的是另一个问题（派出去拿谁的身份），
+    # 而不是「为什么不能派」。放错位置会被读成「不能派的原因是没凭据」。
+    cred_line = render_credential(probe.credential, probe.credential_detail)
+    if cred_line:
+        lines.append(f"  {cred_line}")
     if probe.unavailable_reason:
         lines.append("")
         lines.append(f"  为什么不可派发：{probe.unavailable_reason}")

@@ -106,6 +106,22 @@ def unverified_major(monkeypatch):
 # 三桶（11.10.3）
 # --------------------------------------------------------------------------- #
 
+@pytest.fixture(autouse=True)
+def _pin_credentials_untested(monkeypatch):
+    """把凭据探针钉成「未探测」，于是本文件**不读开发者的家目录**。
+
+    不钉的话：本机碰巧有 ``~/.local/share/opencode/auth.json`` 的人看到一行
+    「登录态（3 个提供方）」，没有的人看到「两处都没看到」—— 同一份断言在两地
+    是两种颜色，而那种红绿没人能解释。凭据本身的行为在
+    ``tests/test_executor_credentials.py`` 里全注入地测。
+    """
+    from freeagent.services.executor_credentials import UNTESTED, CredentialProbe
+
+    monkeypatch.setattr(
+        P, "probe_opencode_credentials", lambda **_kw: CredentialProbe(UNTESTED)
+    )
+
+
 class TestBuckets:
     def test_verified_gets_all_three_in_order(self, which, major):
         """穷尽且**互斥有序**：read ⊂ write，approve 覆盖 write。"""
@@ -262,6 +278,58 @@ class TestRender:
         which(True)
         major(1)
         assert "为什么不可派发" not in P.render_probe(P.probe_opencode())
+
+
+class TestCredentialLine:
+    """凭据那一行的接线（判据在 ``tests/test_executor_credentials.py``）。
+
+    这里只守两件事：**接上了**，以及**没探针的不许被写成「两处都没看到」**。
+    """
+
+    def _pin(self, monkeypatch, probe):
+        monkeypatch.setattr(P, "probe_opencode_credentials", lambda **_kw: probe)
+
+    def test_line_appears_when_probed(self, which, major, monkeypatch):
+        from freeagent.services.executor_credentials import LOGIN, CredentialProbe
+
+        which(True)
+        major(1)
+        self._pin(monkeypatch, CredentialProbe(LOGIN, "`~/x/auth.json` 里有 1 个提供方"))
+        text = P.render_probe(P.probe_opencode())
+        assert "凭据来源：登录态" in text
+        assert "1 个提供方" in text
+
+    def test_line_sits_before_the_reason(self, which, major, monkeypatch, unverified_major):
+        """凭据在「为什么不可派发」**之前**。
+
+        放后面会被读成「不能派的原因是没凭据」—— 而那是另一个问题
+        （11.10.2：合成一句话等于让人自己猜下一步）。
+        """
+        from freeagent.services.executor_credentials import NONE, CredentialProbe
+
+        which(True)
+        major(unverified_major)
+        self._pin(monkeypatch, CredentialProbe(NONE, "两处都没有"))
+        lines = P.render_probe(P.probe_opencode()).splitlines()
+        i_cred = next(i for i, l in enumerate(lines) if "凭据来源" in l)
+        i_reason = next(i for i, l in enumerate(lines) if "为什么不可派发" in l)
+        assert i_cred < i_reason
+
+    def test_hermes_gets_no_credential_line(self, monkeypatch):
+        """hermes 没有凭据探针 → **整行不打印**，而不是打印「两处都没看到」。
+
+        后者是替它断言，而且会被人当成「hermes 没登录」去折腾 ——
+        它真正的问题是已停用。
+        """
+        import freeagent.delegate as D
+
+        monkeypatch.setattr(D, "detect_hermes_version", lambda _cmd="hermes": 0)
+        monkeypatch.setattr(P.shutil, "which", lambda _cmd: "C:/x/hermes")
+        got = P.probe_hermes()
+        from freeagent.services.executor_credentials import UNTESTED
+
+        assert got.credential == UNTESTED
+        assert "凭据来源" not in P.render_probe(got)
 
 
 # --------------------------------------------------------------------------- #

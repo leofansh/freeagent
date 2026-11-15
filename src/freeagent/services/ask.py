@@ -51,6 +51,20 @@
 - **brief 必须单行那条纪律（11.13.3）不适用于这里**：那是委派简报的
   硬约束（实测换行会让 opencode 升级强模型），``/ask`` 走的是普通
   prompt，多行无害。
+
+## 答复的凭据档（V1.104，设计文档 11.10.9）
+
+``/ask`` 把「它查过没有」和「它说了什么」混在同一段话里，语气还完全一样 ——
+用户没法区分「读了代码才这么说」和「凭训练数据这么说」。三档由**可观察
+事实**判，不看模型口吻：
+
+* 确定 —— 至少一个文件类工具的目标在本机存在（``_resolve_target``）
+* 推理 —— 调过工具，但没有一个目标能核（没带目标 / 通配模式 / 不存在）
+* 猜想 —— 一次工具都没调用
+
+**不做逐句归因**：要把「这句话属于哪一档」判出来，得做语义判断；让模型
+自己标又不可信 —— 那只是把不确定换了个语气。所以只给**整段答复**的档，
+并把它说成「凭据」而不是「正确性」（``KnowledgeBoundary`` 的字段注释）。
 """
 
 from __future__ import annotations
@@ -58,9 +72,18 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
-__all__ = ["AskOutcome", "ask_executor", "DEFAULT_ASK_TIMEOUT"]
+from .tool_evidence import ToolEvidence, tool_evidence
+
+__all__ = [
+    "AskOutcome",
+    "ask_executor",
+    "DEFAULT_ASK_TIMEOUT",
+    "KnowledgeBoundary",
+    "knowledge_boundary",
+    "GRADE_LABELS",
+]
 
 #: 单次 ``/ask`` 的总时长上限。刻意比委派短：问一句不该跑成一场委派。
 DEFAULT_ASK_TIMEOUT = 180.0
@@ -81,6 +104,112 @@ class AskOutcome:
     #: 而丢掉它就等于让用户重跑一次。
     partial: str = ""
     notes: list[str] = field(default_factory=list)
+    #: 这次实际认得出的工具调用（V1.104）。**带默认值必须排最后** ——
+    #: 插在前面会让构造器签名直接崩（non-default argument follows default）。
+    evidence: tuple[ToolEvidence, ...] = ()
+
+
+#: 知识边界三档的机器键 → 中文名。键是契约（CLI / 测试按它判）。
+GRADE_LABELS = {
+    "verified": "确定",
+    "inferred": "推理",
+    "guessed": "猜想",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeBoundary:
+    """一条答复的**知识边界**：它站在本机凭据上，还是站在模型自己的知识上。
+
+    ## 「确定」不等于「对」
+
+    这一档说的是**凭据**，不是结论 —— 它读到了真文件，不代表从文件得出的
+    判断就对。所以字段叫 ``grade``（凭据档位），输出里也必须带那句定性；
+    把它读成「这句话是对的」就是这套东西最坏的误用。
+    """
+
+    grade: str
+    label: str
+    basis: str
+    checked: tuple[str, ...] = ()
+
+
+def _resolve_target(target: str, project: Path) -> Path | None:
+    """把工具目标解析成本机路径；**不是可核的路径就返回 ``None``**。
+
+    三类刻意不核：
+
+    * **glob 模式**（含 ``*`` / ``?`` / ``[``）—— 拿去 ``exists()`` 永远为假，
+      于是「用它找过文件」会被误判成「凭据落空」。而误判的方向最坏：
+      一个老实查过文件、只是用了 glob 的答复会被标成「推理」。
+    * 空串 / 明显不是路径的（无分隔符且无扩展名）。
+    * 解析或探测抛异常（Windows 上非法字符、路径过长）—— 那一项算**没核到**，
+      不往上抛：边界标注坏了不该让一次成功的提问变成失败。
+    """
+    raw = target.strip()
+    if not raw or any(ch in raw for ch in "*?["):
+        return None
+    try:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = project / path
+        return path if path.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
+def knowledge_boundary(
+    evidence: Sequence[ToolEvidence],
+    project: str | Path,
+) -> KnowledgeBoundary:
+    """按**这次实际碰到的本机凭据**分档（11.10.9），不看模型的口吻。
+
+    三条判据全部是可观察事实，逐条都能反驳：
+
+    * ``verified``（确定）—— 至少一个文件类工具的目标在本机存在：它碰到了
+      真的东西，人可以照着清单自己去看。
+    * ``inferred``（推理）—— 调过工具，但没有一个目标能核（没带目标 /
+      目标不存在 / 只用了 glob）：动过手，但没落到可核的位置。
+    * ``guessed``（猜想）—— **一次工具都没调用**：这段答复来自它已有的
+      知识，不是本机查证。对通用知识够用，对本项目细节要当心。
+
+    判不出「哪一句话属于哪一档」—— 逐句归因需要语义判断，程序做不到，
+    让模型自评又不可信（那只是把不确定换了个语气）。所以这里只给**整段
+    答复**的档位，并把它说清楚（12.10.12 同一个取舍：宁可粗，不要假）。
+    """
+    project_path = Path(project)
+    if not evidence:
+        return KnowledgeBoundary(
+            grade="guessed",
+            label=GRADE_LABELS["guessed"],
+            basis="一次工具都没调用 —— 这段答复来自它已有的知识，不是本机查证",
+        )
+
+    checked: list[str] = []
+    for ev in evidence:
+        if not ev.is_file_tool or not ev.target:
+            continue
+        resolved = _resolve_target(ev.target, project_path)
+        if resolved is not None and ev.target not in checked:
+            checked.append(ev.target)
+
+    if checked:
+        shown = "、".join(checked[:5])
+        more = f" 等 {len(checked)} 个" if len(checked) > 5 else ""
+        return KnowledgeBoundary(
+            grade="verified",
+            label=GRADE_LABELS["verified"],
+            basis=f"查过本机，可自己复核：{shown}{more}",
+            checked=tuple(checked),
+        )
+    return KnowledgeBoundary(
+        grade="inferred",
+        label=GRADE_LABELS["inferred"],
+        basis=(
+            f"调了 {len(evidence)} 次工具，但没有一个目标落在"
+            "本机能核的位置上（没带路径、用了通配模式，或路径不存在）"
+        ),
+    )
 
 
 def _text_from_part(props: Any) -> str:
@@ -140,6 +269,11 @@ def ask_executor(
     deadline = now() + max_seconds
     text = ""
     tool_calls = 0
+    #: 认得出来的工具调用（V1.104）。``tool_calls`` 是**计数**（预算用），
+    #: 这个是**凭据**（边界用）—— 两者刻意分开：预算不该因为认不出形状而
+    #: 少算一次调用（那会放开轮次上限），边界也不该因为认不出形状而假装
+    #: 它查过（``tool_evidence`` 返回 ``None`` 时不进这里）。
+    evidence: list[ToolEvidence] = []
 
     try:
         with make_server(
@@ -158,6 +292,7 @@ def ask_executor(
                         tool_calls=tool_calls,
                         partial=text,
                         notes=["它可能已经读了一堆文件；重试前先看上面这段。"],
+                        evidence=tuple(evidence),
                     )
 
                 if kind == "message.part.delta":
@@ -176,6 +311,9 @@ def ask_executor(
                     # 所以若哪天 opencode 改了这个名字，预算会**静默失效**。
                     # 这个局限写在模块 docstring 里，不藏。
                     tool_calls += 1
+                    found = tool_evidence(kind, props)
+                    if found is not None:
+                        evidence.append(found)
                     if max_tool_calls > 0 and tool_calls > max_tool_calls:
                         # ⚠️ **不静默截断**：说清「用尽预算、停在哪」。
                         # 半途停下而不说，用户会以为它跑完了。
@@ -189,6 +327,7 @@ def ask_executor(
                             tool_calls=tool_calls,
                             partial=text,
                             notes=["它还没答完；上面是已拿到的半截。"],
+                            evidence=tuple(evidence),
                         )
                     continue
 
@@ -207,6 +346,7 @@ def ask_executor(
                         ),
                         tool_calls=tool_calls,
                         partial=text,
+                        evidence=tuple(evidence),
                     )
 
                 if kind == "session.error":
@@ -225,6 +365,7 @@ def ask_executor(
                         ok=False, reason=reason,
                         tool_calls=tool_calls,
                         partial=text,
+                        evidence=tuple(evidence),
                     )
 
                 if kind == "session.idle":
@@ -255,6 +396,7 @@ def ask_executor(
                     ),
                     tool_calls=tool_calls,
                     partial=text,
+                    evidence=tuple(evidence),
                 )
     except Exception as exc:  # noqa: BLE001 - 提问失败不该掀翻终端
         return AskOutcome(
@@ -262,9 +404,13 @@ def ask_executor(
             reason=f"起执行器失败：{exc!r}",
             tool_calls=tool_calls,
             partial=text,
+            evidence=tuple(evidence),
         )
 
-    return AskOutcome(ok=True, text=text.strip(), tool_calls=tool_calls)
+    return AskOutcome(
+        ok=True, text=text.strip(), tool_calls=tool_calls,
+        evidence=tuple(evidence),
+    )
 
 
 def _abort_quietly(oc: Any, session_id: str) -> None:

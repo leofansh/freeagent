@@ -277,6 +277,19 @@ class _FakeServer:
     def reply_permission(self, request_id, decision, *, directory=None) -> None:
         self.replies.append((request_id, decision))
 
+    def call(self, path, method="GET", body=None, *, timeout=30.0):
+        """收尾会问两次执行器（12.10.13 改动账 / 12.10.14 结局对账）。
+
+        这两条都是**只读标注**，假服务里没有工具调用、也没有落定的结局，
+        所以回「一页空消息」与「没有 outcome」—— 刻意不伪造文件列表或
+        `failed`：这些用例验的是闸门与留痕，账与对账的真实性由
+        ``test_engine_ledger.py`` / ``test_engine_verdict.py`` 守着。
+        """
+        if "/message" in path:
+            return 200, b'{"data": []}'
+        assert path.startswith("/api/session/"), f"收尾问错了路径：{path}"
+        return 200, b'{"data": {}}'
+
 
 class _FakeSender:
     def __init__(self, *, auto: Decision = "allow") -> None:

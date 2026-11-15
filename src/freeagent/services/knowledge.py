@@ -82,6 +82,7 @@ from typing import Any, Literal
 from ..domain import RecordType, new_id
 from ..storage.repos import RoleRepo
 from .clock import Clock
+from .online_leg import OnlineLeg
 from .retrieval_log import record_retrieval
 
 __all__ = [
@@ -188,6 +189,13 @@ class RetrievalResult:
     #: 检索整体不可用（表缺失 / 查询非法）时为 ``True``，此时 hits 为空。
     degraded: bool = False
     degraded_reason: str = ""
+    #: 在线腿（3.7.9 / V1.105）。默认值是「未启用」—— 于是这个字段对
+    #: 不关心它的调用方（``knowledge`` 层、所有既有测试）完全无害。
+    #:
+    #: **它与 ``hits`` 是两类证据，不许混排**：``hits`` 是「你记过的」，
+    #: ``online.snippets`` 是「网上有个人这么说」。本地条目有 id、进得了
+    #: 3.7.7 的留痕；外部摘要没有 id、进不了任何表。
+    online: OnlineLeg = dataclasses.field(default_factory=OnlineLeg)
 
     @property
     def is_empty(self) -> bool:

@@ -22,6 +22,7 @@ from ..domain import (
     ConflictError,
     Contact,
     ContactKind,
+    DecisionLog,
     InvariantViolation,
     NotFoundError,
     Promise,
@@ -1584,6 +1585,211 @@ class CareRepo(_RepoBase):
             next_due=_d_in(row["next_due"]),
             created_at=_dt_in(row["created_at"]),
         )
+
+
+class DecisionLogRepo(_RepoBase):
+    """拍板快照的存取（V1.112 / 设计文档 7.6）。
+
+    **只做存储，不做业务判断**：什么时候对峙、冻结哪几行文本，
+    全在 :class:`freeagent.services.decision`。
+    """
+
+    def add(
+        self,
+        *,
+        chosen_index: int,
+        options_json: str,
+        reason_text: str,
+        conflict_text: str,
+        decided_at: datetime,
+        confront_on: date,
+    ) -> DecisionLog:
+        decision_id = new_id()
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO decision_log (id, chosen_index, options_json,"
+                " reason_text, conflict_text, decided_at, confront_on)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    decision_id,
+                    chosen_index,
+                    options_json,
+                    reason_text,
+                    conflict_text,
+                    _dt_out(decided_at),
+                    _d_out(confront_on),
+                ),
+            )
+        return DecisionLog(
+            id=decision_id,
+            chosen_index=chosen_index,
+            options_json=options_json,
+            reason_text=reason_text,
+            conflict_text=conflict_text,
+            decided_at=decided_at,
+            confront_on=confront_on,
+        )
+
+    def list_all(self) -> list[DecisionLog]:
+        """全部拍板快照，按**拍板时刻倒序**（最近的先列）。
+
+        同刻怎么办：**``rowid DESC``** 兜底 —— 与 ``tasks`` / ``contacts``
+        / ``promises`` 同一条先例。**不是 ``id``**：``id`` 是随机 hex，
+        拿它定序等于随机排序（同刻定序那条纪律）。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM decision_log"
+            " ORDER BY decided_at DESC, rowid DESC"
+        ).fetchall()
+        return [self._row_to_decision(r) for r in rows]
+
+    def latest_on(self, day: date) -> DecisionLog | None:
+        """``decided_at`` 落在 ``day`` 当天的**最后一条**（没有则 ``None``）。
+
+        **按 ``substr(decided_at, 1, 10)`` 取日** —— ISO 串的前 10 位
+        就是**本地日历日**。
+
+        **为什么不用 SQLite 的 ``date()``**：它对带时区偏移的串会先折成
+        UTC，日期可能整体挪一天。而 ``confront_on`` 是按**本地日 + 7 天**
+        算的（``DecisionService.record``），两边必须对得上 —— 差一天，
+        「同一天拍的两板」就会被当成两天拍的。
+        """
+        row = self._conn.execute(
+            "SELECT * FROM decision_log WHERE substr(decided_at, 1, 10) = ?"
+            " ORDER BY decided_at DESC, rowid DESC LIMIT 1",
+            (_d_out(day),),
+        ).fetchone()
+        return self._row_to_decision(row) if row is not None else None
+
+    def due_on(self, day: date) -> list[DecisionLog]:
+        """``confront_on`` 恰好落在 ``day`` 的快照 —— 今天该拉出来对峙的。
+
+        只查**恰好落在**今天，不查「已经过期但没被看过」——
+        那属于「错过」，由 :meth:`list_all` 摆出来时一并报，
+        不在这里偷偷扩大范围（静默扩大 = 隐瞒）。
+
+        同刻按 ``rowid ASC`` 定序（插入序），理由同 :meth:`list_all`。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM decision_log WHERE confront_on = ?"
+            " ORDER BY decided_at ASC, rowid ASC",
+            (_d_out(day),),
+        ).fetchall()
+        return [self._row_to_decision(r) for r in rows]
+
+    def _row_to_decision(self, row: sqlite3.Row) -> DecisionLog:
+        return DecisionLog(
+            id=row["id"],
+            chosen_index=row["chosen_index"],
+            options_json=row["options_json"],
+            reason_text=row["reason_text"],
+            conflict_text=row["conflict_text"],
+            decided_at=_dt_in(row["decided_at"]),
+            confront_on=_d_in(row["confront_on"]),
+        )
+
+
+class WorkbenchTurnRepo(_RepoBase):
+    """工作台每一轮的存取（V1.115 / 设计文档 21.4）。**只存取，不判断。**
+
+    五态各自什么意思、什么时候算失败、重启后残留的 ``running`` 要不要改，
+    全在 :class:`freeagent.services.agent_turn.AgentTurnService` —— 写进
+    存储层就等于让存储层知道有谁在读它（与 :class:`LeaseRepo` 同一条理由）。
+
+    ## 写入分两次：先 ``add`` 再 ``finish``
+    一轮可能跑十分钟，只在结束时写会让列表里长时间看不见它。代价是进程
+    被杀时库里剩一行 ``running`` —— 那是事实，不是脏数据；由 :meth:`reap`
+    在下次启动时落成 ``failed`` 并写明原因。
+    """
+
+    def add(
+        self,
+        *,
+        turn_id: str,
+        brief: str,
+        directory: str,
+        mode: str,
+        started_at: datetime,
+        model: str = "",
+        agent: str = "",
+        variant: str = "",
+        status: str = "running",
+        context_note: str = "",
+    ) -> None:
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO workbench_turns (id, brief, directory, model, agent,"
+                " variant, mode, status, started_at, context_note)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    turn_id, brief, directory, model, agent, variant, mode,
+                    status, _dt_out(started_at), context_note,
+                ),
+            )
+
+    def finish(
+        self,
+        turn_id: str,
+        *,
+        status: str,
+        text: str,
+        reason: str,
+        notes: Sequence[str],
+        tools: Sequence[str],
+        steps: Sequence[dict[str, str]],
+        tool_calls: int,
+        elapsed: float,
+        finished_at: datetime,
+    ) -> None:
+        """把这一轮的结局写回去。``ok`` 由 ``status`` 决定，调用方不传 ——
+        两个字段表达同一件事时，让它们从同一个来源算，否则必然漂移。"""
+        with self._tx():
+            self._conn.execute(
+                "UPDATE workbench_turns SET status=?, text=?, reason=?,"
+                " notes_json=?, tools_json=?, steps_json=?, tool_calls=?,"
+                " finished_at=?, elapsed=?, ok=? WHERE id=?",
+                (
+                    status, text, reason,
+                    json.dumps(list(notes), ensure_ascii=False),
+                    json.dumps(list(tools), ensure_ascii=False),
+                    json.dumps(list(steps), ensure_ascii=False),
+                    int(tool_calls), _dt_out(finished_at),
+                    float(elapsed), 1 if status == "done" else 0, turn_id,
+                ),
+            )
+
+    def get(self, turn_id: str) -> dict[str, object] | None:
+        row = self._conn.execute(
+            "SELECT * FROM workbench_turns WHERE id = ?", (turn_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def recent(self, limit: int = 20) -> list[dict[str, object]]:
+        """最近 ``limit`` 轮，**新的先列**。
+
+        定序用 ``rowid`` 而不是 ``started_at``：连点两次「交给它」会落在
+        同一秒，而 ``started_at`` 是秒级 ISO 文本 —— 同刻用它定序等于随机
+        （V1.113 修过两处同样的违规）。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM workbench_turns ORDER BY rowid DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def reap(self, now: datetime, *, reason: str) -> int:
+        """把上次进程留下的 ``running`` / ``waiting`` 落成 ``failed``。
+
+        返回改了几行（0 表示干净）。**幂等**：条件只命中未收口的行，
+        收口过的不会再被改。
+        """
+        with self._tx():
+            cursor = self._conn.execute(
+                "UPDATE workbench_turns SET status='failed', reason=?,"
+                " finished_at=? WHERE status IN ('running', 'waiting')",
+                (reason, _dt_out(now)),
+            )
+        return int(cursor.rowcount or 0)
 
 
 def _replace(obj: _T, **changes: object) -> _T:

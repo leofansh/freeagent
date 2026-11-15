@@ -44,6 +44,7 @@ from typing import Any, Callable, ContextManager, Protocol, Sequence
 
 from .app import build_app
 from .domain import FreeAgentError, RecordType, TaskState
+from .domain.models import Task as DomainTask
 from .services.approval import (
     BYPASS_FLAGS,
     DEFAULT_DENIED_COMMANDS,
@@ -56,9 +57,11 @@ from .services.approval import (
 )
 from .services.delegate import (
     PROJECTION_STALE_SECONDS,
+    BriefQuadrant,
     DelegationPolicy,
     DispatchOutcome,
     attempt_state,
+    brief_quadrant,
     build_brief,
     check_project_allowed,
     eligible_tasks,
@@ -73,7 +76,15 @@ from .services.engine_errors import (
     classify_engine_error,
     engine_error_line,
 )
+from .services.engine_ledger import (
+    CHANGED,
+    EngineLedger,
+    read_session_ledger,
+    render_ledger,
+)
+from .services.engine_verdict import disagreement_line, read_engine_verdict
 from .services.opencode_projects import authorized_names
+from .services.tool_evidence import tool_evidence
 from .services.executors import (
     adapter_for,
     dispatchable_majors,
@@ -524,6 +535,50 @@ def _accepted_plan_text(app, task_id: str) -> str:
     return (artifact.content or "") if artifact is not None else ""
 
 
+@dataclass(frozen=True, slots=True)
+class Brief:
+    """一次组装的产物：简报原文 + 它的协作象限（V1.103 / 12.10.12）。"""
+
+    text: str
+    quadrant: BriefQuadrant
+
+
+def assemble_brief(app, task: DomainTask) -> Brief:
+    """按派发口径组装简报 —— **只有这一处**（V1.103）。
+
+    ``/brief`` 预览与实发必须逐字相同。预览说「没给方案」而实发带上了方案，
+    比没有预览更坏 —— 人以为自己看过了。所以「六样零件各从哪来」只写一遍，
+    预览侧只负责排版，不负责收集。
+    """
+    records = app.record_repo.list_for_task(task.id)
+    project_history = sibling_history(app.task_repo, app.record_repo, task)
+    accepted_plan = _accepted_plan_text(app, task.id)
+    last_attempt = last_attempt_line(app.artifacts.list_for_task(task.id))
+    conventions = tuple(
+        e.content for e in app.memory.conventions(
+            task.role_ids, consumer="delegate_brief"
+        )
+    )
+    text = build_brief(
+        task, task.intent, task.definition_of_done,
+        records=records,
+        project_history=project_history,
+        accepted_plan=accepted_plan,
+        last_attempt=last_attempt,
+        conventions=conventions,
+    )
+    # 象限用**同一组原始入参**再判一次，而不是去解析刚拼好的简报文本：
+    # 解析文本等于把文案当契约（11.9.12）。
+    quadrant = brief_quadrant(
+        accepted_plan=accepted_plan,
+        conventions=conventions,
+        records=records,
+        project_history=project_history,
+        last_attempt=last_attempt,
+    )
+    return Brief(text=text, quadrant=quadrant)
+
+
 def run_once_with_tool_gate(
     *,
     db_path: Path | None = None,
@@ -606,31 +661,9 @@ def run_once_with_tool_gate(
                     ):
                         outcome = run_with_tool_gate(
                             task, project,
-                            build_brief(
-                                task, task.intent, task.definition_of_done,
-                                # V1.38：上次失败的错因回流进简报（12.10.7）。
-                                records=app.record_repo.list_for_task(task.id),
-                                # 同项目其它委派的踩坑史：同一目录里 A 任务
-                                # 趟过的坑，B 任务不该再趟一次。
-                                project_history=sibling_history(
-                                    app.task_repo, app.record_repo, task,
-                                ),
-                                # 人已采纳的方案优先于需求转述（12.10.8）。
-                                accepted_plan=_accepted_plan_text(app, task.id),
-                                # 上次尝试的账：实际模型 + 用过的工具（12.10.9）。
-                                last_attempt=last_attempt_line(
-                                    app.artifacts.list_for_task(task.id)
-                                ),
-                                # 人记下的约定（12.10.10）：世界的事实，
-                                # 不是人的倾向 —— 收集在 memory 服务、
-                                # 这里只复述。
-                                conventions=tuple(
-                                    e.content for e in app.memory.conventions(
-                                        task.role_ids,
-                                        consumer="delegate_brief",
-                                    )
-                                ),
-                            ),
+                            # V1.103：组装只在 assemble_brief 一处 ——
+                            # /brief 预览走同一个函数，避免「预览与实发不一致」。
+                            assemble_brief(app, task).text,
                             policy=the_policy, store=store, sender=sender,
                             progress_sender=progress_sender,
                             # V1.40：把两个角色拆开传。``requested_by`` 只记
@@ -925,22 +958,6 @@ def first_meaningful_line(text: str, limit: int = 160) -> str:
     return ""
 
 
-def _as_dict(value: Any) -> dict[str, Any]:
-    """取出 dict，**不是 dict 就当空的**。
-
-    ## 为什么不写 ``x.get("k") if isinstance(x.get("k"), dict) else {}``
-
-    那种写法把 ``get`` 调了两次，而**类型收窄不跨两次调用** —— 检查器在
-    真值那一侧收窄了，取值那一侧拿到的还是 ``X | None``，于是每一个
-    ``.get()`` 都报「可能为 None 的属性」。
-
-    那是**运行绝不会错、类型却过不了**的报错，而本项目禁止
-    ``# type: ignore``。所以这里收窄和取值是同一次调用 ——
-    既过了类型检查，也少一次字典查找。
-    """
-    return value if isinstance(value, dict) else {}
-
-
 def tool_event_label(kind: str, props: Any) -> str:
     """从一条 SSE 事件里挖出「正在做什么」，挖不出就返回 ``""``。
 
@@ -959,34 +976,15 @@ def tool_event_label(kind: str, props: Any) -> str:
 
     :return: 一句话说明（如 ``read D:/a.py``）；不是工具事件则空串。
     """
-    if not isinstance(props, dict):
+    # V1.104：形状识别搬到 ``services/tool_evidence.py`` —— ``/ask`` 的知识
+    # 边界（11.10.9）要判「这次查过本机没有」，用的是同一个形状。两份实现的
+    # 后果是「进度卡显示得出来、边界判不出来」，而且不会报错。
+    evidence = tool_evidence(kind, props)
+    if evidence is None:
         return ""
-    part = _as_dict(props.get("part"))
-    name = (props.get("tool") or props.get("toolName")
-            or part.get("tool") or part.get("name") or "")
-    if not isinstance(name, str) or not name:
-        return ""
-    # 事件名里带 tool、或工具名就摆在顶层，才算工具事件。两者至少命中
-    # 一个 —— 否则一条 `message.part.updated`（纯文本增量）会被当成
-    # 工具调用报出去，而「显示错」比「不显示」更坏。
-    looks_like_tool = (
-        part.get("type") == "tool"
-        or "tool" in kind.lower()
-        or props.get("tool") is not None
-        or props.get("toolName") is not None
-    )
-    if not looks_like_tool:
-        return ""
-    # 参数在 ``part.state.input`` 里（实测形状），但也有版本放顶层
-    # ``state``。**两个都找** —— 找错了就退化成「正在执行 read」，
-    # 丢掉文件名，而那正是用户唯一想看的部分。
-    state = _as_dict(part.get("state")) or _as_dict(props.get("state"))
-    target = _as_dict(state.get("input")) or _as_dict(state.get("args"))
-    arg = (target.get("filePath") or target.get("path")
-           or target.get("pattern") or target.get("command") or "")
-    if not isinstance(arg, str) or not arg:
-        return f"正在执行 {name}"
-    return f"正在执行 {name}：{arg[:80]}"
+    if not evidence.target:
+        return f"正在执行 {evidence.tool}"
+    return f"正在执行 {evidence.tool}：{evidence.target[:80]}"
 
 
 class ToolCardSender(Protocol):
@@ -1837,6 +1835,40 @@ def run_with_tool_gate(
         else "时长超限" if time_capped
         else "已完成"
     )
+    # ── 改动账（V1.110，12.10.13）──────────────────────────────────────
+    #
+    # 在**级联之前**算一次，让收尾卡与各分支的 summary 读的是同一本账。
+    # 两处各查一次必然漂移，而漂移方向总是「卡片上有、回推里没有」——
+    # 同一份预览与实发要同源（V1.103 的教训）。
+    #
+    # 覆盖失败与叫停：step_capped / time_capped / user_stopped 的正文都写着
+    # 「已完成的改动还在，剩下的没做」—— **改了哪几个文件**正是那句话该接的
+    # 下一句，而此前它一个字都说不出。
+    # 走 ``oc`` 的公开接口（``/api/session/{sid}/message``），不读它的库。
+    # 收尾时服务还活着：整段在 ``with make_server(...) as oc`` 之内，
+    # ``close()`` 在退出 ``with`` 时才发生。读库那条路在 V2 上会静默报零改动
+    # （``part`` 表已不再写入），详见 ``services/engine_ledger`` 模块文档。
+    change_ledger = read_session_ledger(session_id, server=oc)
+    change_note = render_ledger(change_ledger)
+    # ── 执行器自报的结局对账（V1.111，12.10.14）───────────────────────
+    #
+    # 只在**我们记成功、它说 failed** 时开口（``disagreement_line`` 的判据）。
+    # 空 outcome 有四种来源（我们 abort 了 / 流提前结束 / 读早了一步 /
+    # 还在跑），收尾那一刻分不开，所以不猜 —— 见 ``engine_verdict`` 模块文档。
+    #
+    # ``ok_by_five`` 是本文件五条排除法的**同一份**表达式，照抄自下面那串
+    # ``if``：分开写两份，一改就会漂移，而漂移的方向是「对账说完成、实际
+    # 记失败」—— 正是这个模块要防的那类错。
+    ok_by_five = (
+        session_error is None
+        and not unanswered
+        and not user_stopped
+        and not step_capped
+        and not time_capped
+    )
+    verdict_note = disagreement_line(
+        read_engine_verdict(session_id, server=oc), ours_ok=ok_by_five
+    )
     # ── 收尾卡正文（V1.41）：统计 + 最近判定明细 ─────────────────────
     #
     # 滚动瘦身把执行途中的旧卡都撤了，聊天里「做过的决定」就集中在
@@ -1860,8 +1892,10 @@ def run_with_tool_gate(
     )
     _close_progress_stream(
         f"**项目**：{project}\n\n**状态**：{_final_status}\n\n"
-        f"**工具调用**：{tool_calls} 次（允许 {granted} 次）"
-        f"{_ledger}"
+        f"**工具调用**：{tool_calls} 次（允许 {granted} 次）\n\n"
+        f"**改动**：{change_note}"
+        + (f"\n\n**对账**：{verdict_note}" if verdict_note else "")
+        + f"{_ledger}"
     )
     # 收尾清行。放在**状态词算完之后、统一收口那里**（而不是每个 return
     # 分支各清一次）：分开放的必然漏一条，而漏掉的那条症状是
@@ -1898,6 +1932,10 @@ def run_with_tool_gate(
         summary = f"执行器会话出错（{engine_error_line(err)}）"
         if err.next_step:
             summary += "\n" + err.next_step
+        # 出错时人第一个要问的就是「它已经动了什么」—— 会话崩了，代码可能
+        # 只改了一半。**不做 schema 变更**：账只进文案，不进表（一个没人读的
+        # 字段等于没记，参考 KnowledgeService 那笔欠账）。
+        summary += f"\n  改动：{change_note}"
         return DispatchOutcome(
             ok=False,
             summary=summary,
@@ -1912,7 +1950,8 @@ def run_with_tool_gate(
         return DispatchOutcome(
             ok=False,
             summary="执行期有提问没箅到答案 —— 已停下会话"
-                    "（已答的部分不会被重放）",
+                    "（已答的部分不会被重放）"
+                    f"\n  改动：{change_note}",
             session_id=session_id or None, tool_calls=tuple(handled),
         )
     if user_stopped:
@@ -1925,7 +1964,8 @@ def run_with_tool_gate(
                 "你叫停了这条委派 —— 会话已中止，agent 不会继续动手。\n"
                 "  已经完成的那几步改动**仍然有效**，剩下的没做。\n"
                 f"  想接着做的话重新发一条委派就行；"
-                f"已做的部分可以先看一眼（{session_id or '会话已关'}）。"
+                f"已做的部分可以先看一眼（{session_id or '会话已关'}）。\n"
+                f"  改动：{change_note}"
             ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
@@ -1941,7 +1981,8 @@ def run_with_tool_gate(
                 f"  这不是失败，是**这件事该拆开**：已完成的改动还在，"
                 f"剩下的没做。\n"
                 f"  下一步：把需求拆成几条更小的委派，"
-                f"或者调高上限（DEFAULT_MAX_TOOL_CALLS）。"
+                f"或者调高上限（DEFAULT_MAX_TOOL_CALLS）。\n"
+                f"  改动：{change_note}"
             ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
@@ -1956,14 +1997,34 @@ def run_with_tool_gate(
                 f"  这不是「要做的事太多」，是**这件事卡住了**："
                 f"它一直有动静，所以次数没超，但时间拖到了上限。\n"
                 f"  已完成的改动还在，剩下的没做。可以看一眼它卡在哪，"
-                f"或者调高上限（当前 {max_seconds:g} 秒）。"
+                f"或者调高上限（当前 {max_seconds:g} 秒）。\n"
+                f"  改动：{change_note}"
             ),
             session_id=session_id or None, tool_calls=tuple(handled),
         )
     note = (f"执行期问了 {len(handled)} 次，允许 {granted} 次"
             if handled else "未触发授权请求")
+    # **状态词只在「有改动且两边一致」时才叫「完成」**（V1.110 / V1.111）。
+    #
+    # ``ok`` 仍是 True —— 零改动**不是失败**：有些委派本来就不该改文件
+    # （查一件事、答一个问题），判成失败会让人去排查一个不存在的 bug。
+    # 但「完成」这个词会让人直接去验收，而「一个字没改」正是这一刀要堵的
+    # 那类错判，所以抬头换成「结束」，把判断交回给人。
+    #
+    # 同理，执行器自报 failed 时也不叫「完成」：抬头与对账行不能互相打脸
+    # （说「完成」又说「先别按完成验收」，读的人只会记住前一句）。
+    # ``ok`` 不变 —— 对账是标注，不是判据（12.10.14）。
+    headline = (
+        "完成"
+        if change_ledger.state == CHANGED and not verdict_note
+        else "结束"
+    )
     return DispatchOutcome(
-        ok=True, summary=f"完成（{note}）",
+        ok=True,
+        summary=(
+            f"{headline}（{note}）\n  {change_note}"
+            + (f"\n  {verdict_note}" if verdict_note else "")
+        ),
         session_id=session_id or None, tool_calls=tuple(handled),
     )
 
@@ -2359,23 +2420,9 @@ def _dispatch_one(
         return outcome
 
     # V1.38：把本任务的历史错因带进简报（12.10.7）—— 第三次踩同一个坑
-    # 之前，执行者就该知道前两次败在哪。
-    brief = build_brief(
-        task, task.intent, task.definition_of_done,
-        records=app.record_repo.list_for_task(task.id),
-        # 同项目其它委派的踩坑史（12.10.7 扩到项目级）。
-        project_history=sibling_history(app.task_repo, app.record_repo, task),
-        # 人已采纳的方案优先于需求转述（12.10.8）。
-        accepted_plan=_accepted_plan_text(app, task.id),
-        # 上次尝试的账：实际模型 + 用过的工具（12.10.9）。
-        last_attempt=last_attempt_line(app.artifacts.list_for_task(task.id)),
-        # 人记下的约定（12.10.10）：世界的事实，不是人的倾向。
-        conventions=tuple(
-            e.content for e in app.memory.conventions(
-                task.role_ids, consumer="delegate_brief"
-            )
-        ),
-    )
+    # 之前，执行者就该知道前两次败在哪。组装的六样零件只在
+    # :func:`assemble_brief` 里写一遍（V1.103：预览与实发必须逐字相同）。
+    brief = assemble_brief(app, task).text
     title = task.title[:60]
 
     # ---- 闸门：派发**之前**必须有 allow 记录（设计文档 11.9.7 规则 1）----

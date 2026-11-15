@@ -41,6 +41,9 @@ from .js_oc_selection import JS_OC_SELECTION
 from .js_settings import JS_SETTINGS
 from .js_settings_llm import JS_SETTINGS_LLM
 from .js_vision import JS_VISION
+from .js_workbench import JS_WORKBENCH
+from .js_workbench_card import JS_WORKBENCH_CARD
+from .js_workbench_page import JS_WORKBENCH_PAGE
 from .markup import PAGE_MARKUP
 from .style import STYLE_CSS
 
@@ -115,6 +118,13 @@ INDEX_HTML = (
             # services 提供 loadServices（boot 分发 data-view=services 用），
             # 必须在 JS_BOOT 之前进页面。
             JS_SERVICES,
+            # 工作台（21.4 / V1.114）：state → card → page 是三段依赖序
+            # （paint 会调 wbAsk，page 会调 wbSend/wbPaint）。用 JS_CORE 的
+            # el/esc/api/toast 与 JS_DETAIL 的 post，必须在 JS_BOOT 之前
+            # （boot 会调 wbStopPoll / loadWorkbench）。
+            JS_WORKBENCH,
+            JS_WORKBENCH_CARD,
+            JS_WORKBENCH_PAGE,
             JS_BOOT,
         )
     )

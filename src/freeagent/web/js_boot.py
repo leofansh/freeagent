@@ -55,6 +55,9 @@ function setBadge(id, n) {
 async function load(next) {
   view = next;
   detail = null;
+  // 切走时停掉工作台的轮询：否则它会在一个已经不存在的 DOM 上一路重画
+  // （typeof 守卫：模块没进页面时不能炸）。
+  if (typeof wbStopPoll === "function") wbStopPoll();
   $("#nav").hidden = false;
   document.querySelectorAll("#nav button").forEach((b) =>
     b.setAttribute("aria-selected", String(b.dataset.view === view)));
@@ -69,6 +72,12 @@ async function load(next) {
     }
     if (view === "chat") {
       await loadChat();
+      return;
+    }
+    if (view === "workbench") {
+      // 工作台（21.4）：选目录 / 模型 / 授权档，一句话进去干活。
+      // 提前 return，不加「新建事务」表单 —— 那一页不是事务入口。
+      await loadWorkbench();
       return;
     }
     if (view === "oc") {

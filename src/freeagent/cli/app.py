@@ -34,6 +34,7 @@ from ..services.memory import (
     DEFAULT_REVIEW_DAYS,
     DEFAULT_USAGE_DAYS,
     GLOBAL_SCOPE,
+    MemoryMinimalPair,
     role_scope,
 )
 from ..services.llm import (
@@ -45,6 +46,7 @@ from ..services.llm import (
 )
 from ..services.llm.deepseek import DeepSeekProvider
 from ..services.sorting import DISCLAIMER_MARKER, score_and_sort
+from ..services.weigh import weigh
 from . import parse, render
 
 __all__ = ["Repl", "main", "DEFAULT_ROLE_NAME", "KIND_ALIASES"]
@@ -69,7 +71,10 @@ KIND_ALIASES: dict[str, TaskKind] = {
 
 _USAGE: dict[str, str] = {
     "/today": "/today",
+    "/weigh": "/weigh     代价对照：两件事撞在同一处时，把各自的代价摆出来供你拍板（只摆事实，不替你决定）\n"
+    "           /weigh <序号> 记下这一板（当时那板会被冻结，7 天后与现在并排对质）",
     "/week": "/week      本周回顾：完成了什么、卡在哪、下周承诺了什么",
+    "/decisions": "/decisions  决策日志：拍过哪些板，以及今天到期的那些（当时那板 vs 现在，只摆事实）",
     "/feedback": "/feedback   留痕：审批分账、委派履历、改版差异、以及没派出去的卡在哪",
     "/model": "/model      连续性个人模型：从你的记录现推的画像（节奏/关系账/承诺与目标），只读聚合，只摆事实不评价",
     "/pending": "/pending [N [标题]|drop N]   待处理收集器：收下的图片/文件；N 澄清成事务，drop N 明确忽略",
@@ -111,6 +116,8 @@ _USAGE: dict[str, str] = {
     # 刻意与 /note 分开成两条：/note 无校验，而这条要挡三种不许重派的情形。
     # 合成一条就等于把「用错入口静默无效」又请回来（见 _cmd_redispatch）。
     "/redispatch": "/redispatch <id> [原因]",
+    # 简报是派发给执行器的唯一输入，此前人看不到它（/brief 预览，V1.103）。
+    "/brief": "/brief <id>    看这条委派实发的简报与协作象限",
     # 配对码**只能由桥接签发**（它看得见发消息的人），终端只负责核销。
     "/pair": "/pair <配对码>",
     "/draft": "/draft <id> [要求]",
@@ -210,6 +217,10 @@ _HELP = """\
 个人事务助手 · 命令
   ── 视图 ──
   /today              今天视图（含顺延标记与每条信号的理由）
+  /weigh              代价对照：两件以上的事争同一天时，把各自的代价（带出处）摆出来供你拍板
+                      （只摆事实不替你决定，不排序；没有真取舍时如实说没有）
+  /weigh <序号>       记下这一板：冻结「当时那板」，7 天后拿出来跟现在并排对质
+  /decisions          决策日志：拍过哪些板，以及今天到期的那些（当时那板 vs 现在，只摆事实）
   /week               本周回顾（完成了什么 / 卡在哪 / 下周承诺了什么，只摆事实）
   /feedback           留痕：审批分账（把「没人看」从「拒绝」里拆开）、委派履历、
                       改版差异、以及没派出去的各自卡在哪一步
@@ -261,6 +272,9 @@ _HELP = """\
         让这条委派可以「重新派发」。「派发前就被拒」（白名单不符 / 没闸门）
         不会自动重试 —— 改配置前重试多少次都是同一个结果。
         改好配置后跑这条，执行器下次扫到就会再派一次。
+  /brief <id>
+        看这条委派**实发的那份简报**（逐字，含协作象限）：
+        象限告诉你「还说少了什么」，正文告诉你「它已经知道什么」。
 
   ── 记忆（设计文档 3.7）──
   /remember <内容>          记一条全局偏好（= /memory add 偏好 <内容>）
@@ -1336,6 +1350,10 @@ class Repl:
             "/mode-plan": self._cmd_mode_plan,
             "/mode-build": self._cmd_mode_build,
             "/today": self._cmd_today,
+            "/weigh": self._cmd_weigh,
+            # 决策日志（7.6 / V1.112）。跟 /weigh 挨着 —— 那是拍板的地方，
+            # 这是回头看拍过哪些板的地方。
+            "/decisions": self._cmd_decisions,
             "/week": self._cmd_week,
             "/feedback": self._cmd_feedback,
             "/model": self._cmd_model,
@@ -1372,6 +1390,7 @@ class Repl:
             "/memory": self._cmd_memory,
             # 委派恢复入口。与 /note 分开：那条无校验，这条要挡三种不许重派。
             "/redispatch": self._cmd_redispatch,
+            "/brief": self._cmd_brief,
             # 飞书配对（设计文档 11.9.8）。码由桥接侧签发，终端只核销。
             "/pair": self._cmd_pair,
             "/draft": self._cmd_draft,
@@ -1440,6 +1459,103 @@ class Repl:
             self._last_task_action = (
                 top.id, top.title, STATE_LABELS[top.state],
             )
+
+    def _cmd_weigh(self, args: list[str]) -> None:
+        """代价对照（设计文档 7.5 / 20.1.14）。
+
+        **只摆代价，不替用户做取舍** —— 这是 19.2 第 2 条壁垒兑现的地方：
+        通用产品倾向黑箱打分「显得更智能」，这里反着来 —— 把两件事各自的
+        代价摆出来，让主人自己拍板。
+
+        三条纪律落在实现里（``services/weigh.py`` 有详述）：
+
+        * **代价带出处**：每项代价标它的来源列，主人可核对
+        * **事实不足就不给**：没有真取舍时如实说「没有需要拍板的取舍」，
+          不降格成「那就先做 X」
+        * **陈述句**：不出现「你应该」「建议」
+
+        **不读人的任何决策** —— 所以不碰 11.9.11 的自我进化边界：
+        本命令的输出与「人点过什么」无关。
+
+        两种形态（**给已有命令加参数，不新增命令** —— 同 V1.91
+        ``/mode-build`` 的那条纪律：命令表每多一条，说明书与设计文档的
+        计数就跟着漂移一次）：
+
+        * ``/weigh`` —— 只摆取舍
+        * ``/weigh <序号>`` —— **记下这一板**（设计文档 7.6）
+
+        **序号指向「此刻重算出来的那组取舍」** —— 与 ``/pending N``
+        同一条路：列表会随事务状态变动，超界时说清当前有几位，
+        不让用户对空气拍板。
+        """
+        now = self.app.clock.now()
+        today = self.app.clock.today()
+        # 全部未结束事务都参与争用 —— 冲突不只发生在今天排的那几条里
+        # （一条没排期但今天到期的事，同样抢今天）。
+        candidates = self.app.tasks.list_open()
+        scored = score_and_sort(
+            candidates,
+            now,
+            today,
+            dependents_of=self.app.task_repo.count_dependents,
+            energy_windows=self.app.energy_windows,
+            promise_of=self.app.promise.promise_of,
+        )
+        promises_by_task = {
+            p.task_id: p for p in self.app.promise.open_promises()
+        }
+        result = weigh(
+            scored,
+            now,
+            today=today,
+            promises_by_task=promises_by_task,
+        )
+
+        if not args:
+            self._say(render.render_weigh(result))
+            return
+
+        # /weigh <序号>：记下这一板
+        if len(args) != 1 or not args[0].isdigit():
+            self._usage("/weigh")
+            return
+        index = int(args[0])
+        if result is None:
+            # 没有取舍就没有可拍板的东西 —— 如实说，不降级成「那就先做 X」
+            self._say(render.render_weigh(None))
+            return
+        if not 1 <= index <= len(result.options):
+            self._say(
+                f"没有第 {index} 个 —— 此刻摆出来的是 {len(result.options)} 个。"
+                "（列表会随事务状态变动，先 /weigh 看现在有哪几个）"
+            )
+            return
+        recorded = self.app.decision.record(result, index - 1)
+        self._say(
+            render.render_weigh_picked(result, index - 1, is_new=recorded.is_new)
+        )
+
+    def _cmd_decisions(self, args: list[str]) -> None:
+        """决策日志（设计文档 7.6 / 19.5.4 候选 D）。
+
+        两块：**今天到期的那些**（当时那板 vs 现在，并排对质），
+        以及**拍过哪些板**的索引。
+
+        **只摆事实，不评价** —— 它不说「你选对了」也不说「你选错了」。
+        对峙的价值在于把「当时怎么想的」和「现在各自什么状态」摆到
+        一起让人自己看，不是替人下结论（7.1 / 〇.8.4）。
+
+        **不读人的审批决策** —— 本命令的输出与「人点过什么」无关。
+        """
+        if args:
+            self._usage("/decisions")
+            return
+        today = self.app.clock.today()
+        due = self.app.decision.due(today)
+        confrontations = [self.app.decision.confront(d) for d in due]
+        self._say(render.render_decisions(confrontations, today=today))
+        self._say("")
+        self._say(render.render_decision_history(self.app.decision.history()))
 
     def _cmd_week(self, args: list[str]) -> None:
         """周回顾（设计文档 6.5）。
@@ -2145,7 +2261,7 @@ class Repl:
 
         import pathlib
 
-        from ..services.ask import ask_executor
+        from ..services.ask import ask_executor, knowledge_boundary
         from ..services.opencode_server import OpenCodeServer
 
         def make_server(p, c, **kw):
@@ -2197,6 +2313,14 @@ class Repl:
         if outcome.ok:
             self._say("")
             self._say(outcome.text or "（它没给出文字答复。）")
+            # V1.104：答复之后立刻给凭据档（11.10.9）。放在**后面**是有意的 ——
+            # 先看答案再看「这个答案站在什么上」，否则人会拿一行标注代替阅读。
+            self._say("")
+            self._say(
+                render.render_boundary(
+                    knowledge_boundary(outcome.evidence, project)
+                )
+            )
             return
         self._say("")
         self._say(f"没答成：{outcome.reason}")
@@ -2206,6 +2330,13 @@ class Repl:
             self._say(outcome.partial)
         for note in outcome.notes:
             self._say(note)
+        # 失败也给：**半截答复照样有凭据问题** —— 它读没读过东西，与
+        # 「答没答完」是两件事。没有证据就是「猜想」，这个结论不会因为
+        # 中途失败而变。
+        self._say("")
+        self._say(
+            render.render_boundary(knowledge_boundary(outcome.evidence, project))
+        )
 
     def _cmd_tick(self, args: list[str]) -> None:
         digest = self.app.reminders.due()
@@ -2900,6 +3031,11 @@ class Repl:
             e = h.entry
             self._say(f"  [{e.kind}·{self._memory_scope_name(e.scope)}] {e.content}"
                       f"  （{h.via_label}）")
+        # 在线腿（V1.105）：本地关键词空手、且用户配了端点时才有话要说。
+        # **单列一块**，不与上面的本地条目混排 —— 两类证据可信度不同。
+        online = render.render_online_leg(result.online)
+        if online:
+            self._say(online)
 
     def _memory_stats(self, args: list[str]) -> None:
         """``/memory stats [天数]`` —— 记忆的**使用留痕**（V1.98 / 3.7）。
@@ -2956,6 +3092,32 @@ class Repl:
                 "（这段时间里没有任何记忆被检索或注入过 —— 要么没在用 /memory search"
                 " 与 /ask，要么注入口没带上它。）"
             )
+        # 在线腿开关放在最后：它是「我到底开了什么」的交代，不是这次统计的
+        # 一部分。开着就说发往哪；关着就说关着 —— 否则人会以为「本地搜不到
+        # 就是真没有」，而它默认是不开的。
+        self._say(self._online_leg_status())
+
+    def _online_leg_status(self) -> str:
+        """在线腿现在是开是关（V1.105 / 3.7.9）。
+
+        放在 ``/memory stats`` 里而不是检索输出里：检索时没开就说一句
+        「未启用」是噪声（每搜一次一次），而这个地方本来就是「记账与诊断」
+        —— 人会来这里查「我到底开了什么」。
+        """
+        from ..services.online_leg import ONLINE_URL_ENV, OnlineSearchConfig
+
+        cfg = OnlineSearchConfig.from_env()
+        if not cfg.enabled:
+            return (
+                "在线检索：未启用（默认关闭 —— 本仓默认不联网）。"
+                f"要开就配 {ONLINE_URL_ENV}，见使用说明书。"
+            )
+        if cfg.error:
+            return f"在线检索：配置有问题 —— {cfg.error}"
+        return (
+            f"在线检索：已启用，本地关键词空手时发往 {cfg.host}"
+            "（查询原文会离开本机）"
+        )
 
     def _memory_review(self, args: list[str]) -> None:
         """``/memory review [天数]`` / ``/memory review confirm <id>...``
@@ -2967,7 +3129,8 @@ class Repl:
 
         候选两条口径：**好久没动静**（窗口内没被检索/注入/确认过，连写下
         来都超窗）与**内容相近**（bigram Jaccard ≥ 0.5 的对子 —— 只说相近，
-        不说冲突：可能记重了，也可能一条改了另一条没改，分诊留给人）。
+        不说冲突：可能记重了，也可能一条改了另一条没改，分诊留给人）；
+        V1.102 再加**只差一处**（首尾极像、中间岔开 —— 改口最可能长这样）。
 
         **只摆不动**：不自动删、不自动 consolidation（3.7.5 纪律在此原样
         成立）。动作只有两个且都由人发起：``/memory review confirm <id>``
@@ -2985,13 +3148,15 @@ class Repl:
             days = int(raw)
         report = self.app.memory.review_candidates(days=days)
         if report.degraded_reason:
-            # 读不出来 ≠ 没有候选。说清楚判断不了，一条候选都不摆 ——
-            # 把故障显示成「整理干净了」比崩溃更糟（用户会以为刚整理过）。
+            # 读不出来 ≠ 没有候选。说清楚**哪一组**判断不了 —— 两组字面关系
+            # 与留痕无关，照摆在下面（V1.102）；一句「判断不了」把它们也
+            # 藏起来，等于故障时二次惩罚。
             self._say(
-                f"（{report.degraded_reason}，判断不了哪些好久没动静）"
+                f"（{report.degraded_reason}，判断不了哪些好久没动静；"
+                "「内容相近」「只差一处」两组只看正文，不受影响）"
             )
-            return
-        if not report.candidates and not report.near_duplicates:
+        elif not report.candidates and not report.near_duplicates \
+                and not report.minimal_pairs:
             # 空也要明说 —— 与 /week 空分区、/memory list 空库同一条纪律。
             if report.total == 0:
                 self._say(
@@ -3008,6 +3173,13 @@ class Repl:
             parts.append(f"{len(report.candidates)} 条好久没动静")
         if report.near_duplicates:
             parts.append(f"{len(report.near_duplicates)} 组内容相近")
+        if report.minimal_pairs:
+            parts.append(f"{len(report.minimal_pairs)} 对只差一处")
+        if not parts:
+            # 走到这里只可能是降级分支（非降级的空集合在上面已早退）：
+            # 原因已经在上一行说过了，再打一行「（共 N 条）」的空摘要
+            # 只是噪音。
+            return
         self._say(
             f"记忆 review（近 {report.days} 天）：{' · '.join(parts)}"
             f"（共 {report.total} 条）"
@@ -3040,6 +3212,21 @@ class Repl:
                     f"    —— 相近度 {pair.similarity:.0%}（bigram 重合），"
                     "留哪条、怎么改，你定"
                 )
+        if report.minimal_pairs:
+            self._say(
+                f"只差一处的（{len(report.minimal_pairs)} 对）—— 同一个框架、"
+                "不同的取值，改口最可能长这样："
+            )
+            for pair in report.minimal_pairs:
+                for e in (pair.left, pair.right):
+                    self._say(
+                        f"  [{e.kind}·{self._memory_scope_name(e.scope)}]"
+                        f" {e.content}  ({e.id})"
+                    )
+                self._say(
+                    f"    —— 只差{self._minimal_diff_label(pair)}，"
+                    f"首尾重合 {pair.overlap:.0%}；哪条算数、要不要合，你定"
+                )
         self._say(
             "确认还留着：/memory review confirm <id>（可一次多条）"
             "；删掉：/memory del <id>。候选只是摆出来 —— 绝不自动删。"
@@ -3063,6 +3250,20 @@ class Repl:
                 f"确认留着：{entry.content}"
                 "（退出本轮候选；窗口过后仍没被用过，它还会再出现）"
             )
+
+    @staticmethod
+    def _minimal_diff_label(pair: MemoryMinimalPair) -> str:
+        """「只差一处」那处差在哪：两边都有就写成对照，一边空就说多出什么。
+
+        一边为空不是数据错误 —— 它正是「一条是另一条的延长 / 截短」那种
+        常见形状（「回复先给结论」vs「回复先给结论，再给细节」），
+        写成「↔」会读成「这里换了个说法」，反而不准。
+        """
+        if pair.left_diff and pair.right_diff:
+            return f"「{pair.left_diff}」↔「{pair.right_diff}」"
+        if pair.right_diff:
+            return f"右边多出「{pair.right_diff}」"
+        return f"左边多出「{pair.left_diff}」"
 
     def _memory_edit(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -3105,6 +3306,29 @@ class Repl:
         )
         self._say(f"已标记重派：{task.title}")
         self._say("执行器下次扫到就会再派一次（它是独立进程，不会立刻跑）。")
+
+    def _cmd_brief(self, args: list[str]) -> None:
+        """``/brief <id>`` —— 看这条委派**实发的那份**简报（V1.103）。
+
+        为什么需要它：简报是执行器唯一收到的输入，而人此前看不到它、
+        也不知道自己「说够没说够」。象限就是那个答案的依据 ——
+        它只说「哪一侧手里有材料」，不评判该不该派。
+
+        预览与实发共用 ``assemble_brief``（外层 delegate 模块）：解析刚拼好
+        的文本去反推象限是拿文案当契约（11.9.12），而各收集一份零件则
+        必然漂移。这里只排版，不收集。
+        """
+        if not args:
+            self._usage("/brief")
+            return
+        # 局部导入：外层 ``freeagent.delegate`` 会拖进 subprocess / 审批链，
+        # 终端启动不该为一条预览付这份加载成本（同 ``_cmd_delegate`` 的写法）。
+        from ..delegate import assemble_brief
+
+        task_id = self._resolve_id(args[0])
+        task = self.app.tasks.get(task_id)
+        assembled = assemble_brief(self.app, task)
+        self._say(render.render_brief(assembled.text, assembled.quadrant, task.id))
 
     def _cmd_pair(self, args: list[str]) -> None:
         """``/pair <配对码>`` —— 核销码，把对方写进飞书白名单。

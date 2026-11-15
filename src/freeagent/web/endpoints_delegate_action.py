@@ -96,7 +96,13 @@ def approval_action(app: App, credential: str, body: dict[str, Any]) -> dict[str
     # decided_by 传空串：本机控制台**没有飞书身份**，而那条判据在
     # ``_require_decidable`` 里已经按 WEB 的口径查过一次了。
     # 这里再传一个假身份反而会让审计记录出现一个不存在的 ou_xxx。
-    wrote = store.resolve(credential, decision)
+    #
+    # 但 ``decided_by`` 空着不等于**什么都不记**：``via`` 必须落 ``"web"``。
+    # 11.9.11 的整张六类分账靠 ``decided_via`` 区分「人点的」与「没人看」，
+    # 而这里此前留的是默认空串（= 未记）—— 于是网页上点的每一下在审计
+    # 视图里都和「历史遗留、不知道从哪来」一样。那不是一个好看的字段，
+    # 它是这张表唯一能指明「这条结论是从哪个界面来的」的东西。
+    wrote = store.resolve(credential, decision, via="web")
     if not wrote:
         # 走到这里说明「查的时候还没决定、写的时候变了」——
         # 另一个界面（飞书）抢先一步。这种竞态不能当成功报回去。
@@ -121,7 +127,10 @@ def approval_stop(app: App, credential: str) -> dict[str, Any]:
     store.request_stop(credential, by="")
     # 先记停止再回掉：反过来的话，中间那一瞬执行器看到「已拒绝」就继续往下走，
     # 而停止请求还没落库 —— 于是「点了停止，agent 还是动了一下」。
-    store.resolve(credential, "deny")
+    #
+    # ``via="stop"`` 与飞书第三个按钮**同一个值**：读侧判「这是叫停还是明确拒绝」
+    # 只看这一个字段（11.9.11 的 `stop` 类），两个界面各记一个值会让它裂成两半。
+    store.resolve(credential, "deny", via="stop")
     return {
         "ok": True,
         "credential": credential,

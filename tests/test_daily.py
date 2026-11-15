@@ -140,4 +140,9 @@ class TestMigration:
         # tool_calls，一列一版，V1.95；v29 = task_records.error_kind，V1.96；
         # v30 = retrieval_log + retrieval_hits，V1.98）—— 它守的是「表建得
         # 出来且版本号对得上」，不是具体哪个数。
-        assert SCHEMA_VERSION == 31
+        # v32（decision_log，V1.112）：拍板当时那板的冻结快照。
+        # v33（workbench_turns，V1.115）：工作台每一轮的落库，让「最近那件事」
+        # 在重启之后还能点回去看（单语句 CREATE TABLE）。
+        # v34（workbench_turns.context_note，V1.115）：这一轮带了什么上下文
+        # （单语句 ADD COLUMN）。
+        assert SCHEMA_VERSION == 34

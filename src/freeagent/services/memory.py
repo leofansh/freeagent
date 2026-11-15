@@ -66,7 +66,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from ..domain import new_id
 from ..storage.repos import RoleRepo
@@ -78,6 +78,7 @@ from .knowledge import (
     RetrievalResult,
     index_text,
 )
+from .online_leg import OnlineLeg, online_search
 from .retrieval_log import record_retrieval, usage_totals
 
 __all__ = [
@@ -89,6 +90,7 @@ __all__ = [
     "MemoryUsageReport",
     "MemoryReviewRow",
     "MemoryNearDuplicate",
+    "MemoryMinimalPair",
     "MemoryReviewReport",
     "CoreBlock",
     "GLOBAL_SCOPE",
@@ -99,6 +101,8 @@ __all__ = [
     "DEFAULT_USAGE_DAYS",
     "DEFAULT_REVIEW_DAYS",
     "NEAR_DUPLICATE_THRESHOLD",
+    "MINIMAL_DIFF_MIN_SHARED",
+    "MINIMAL_DIFF_MIN_OVERLAP",
 ]
 
 #: 全局作用域的 ``scope`` 取值。
@@ -146,7 +150,45 @@ DEFAULT_REVIEW_DAYS = 90
 #: 代价说在明处（3.7.8 登记）：**前缀同、结论反**的对子（「回复先给结论」
 #: vs「回复先给细节」，Jaccard 0.43）会漏 —— 那正是最像矛盾的一类，
 #: 而不引模型轮就分不出「矛盾」与「无关」（3.7.5 的理由在此同样成立）。
+#: **V1.102 起这一类由「只差一处」显影接住**（见下），Jaccard 阈值不动。
 NEAR_DUPLICATE_THRESHOLD = 0.5
+
+#: 「只差一处」的判定：两条内容的**公共前缀 + 公共后缀**至少这么多字。
+#:
+#: 4 这个数不是为了好看：3 个字能套住「我不吃 X」这种通用开头 ——
+#: 「我不吃香菜」与「我不吃辣」共享「我不吃」3 个字，却是两条独立的偏好，
+#: 摆出来只会消耗队列的信誉。4 个字开始才像「同一件事的框架」
+#: （「回复先给 X」共享 4 个字，「周三前给…」共享得更长）。
+MINIMAL_DIFF_MIN_SHARED = 4
+
+#: 而且公共前后缀要占**较短那条**的至少这么多（整数比见 ``_minimal_pairs``）。
+#: 0.6 与 :data:`NEAR_DUPLICATE_THRESHOLD` 同一个量级：都是「一半以上重合」，
+#: 只是这里量的是**首尾**而不是全部二元组 —— 中段换掉一个词（「方案」↔
+#: 「预算」）二元组重合会掉到 0.4 以下，首尾重合却仍在 0.7 以上，
+#: 这正是两条口径分工的地方：Jaccard 抓「整体像」，首尾抓「同一个框架」。
+MINIMAL_DIFF_MIN_OVERLAP = 0.6
+
+
+def _shared_affixes(a: str, b: str) -> tuple[int, int]:
+    """两条内容的**公共前缀**长度与**公共后缀**长度（两者不重叠）。
+
+    不用「最长公共子串」（DP）而用首尾两段，是因为要抓的东西长这样：
+    「先把方案给我看」/「先把预算给我看」—— 差异在**中段**，最长公共子串
+    只有「给我看」3 个字，够不上 4 字的门槛；而首 2 + 尾 3 = 5 个字，
+    正好说明「同一个框架、换了一个词」。首尾各扫一遍是 O(n)，
+    对全部对子跑也不会有可感代价（DP 是 O(n·m)，条目一多就要算利息）。
+    """
+    limit = min(len(a), len(b))
+    prefix = 0
+    while prefix < limit and a[prefix] == b[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < limit - prefix
+        and a[len(a) - 1 - suffix] == b[len(b) - 1 - suffix]
+    ):
+        suffix += 1
+    return prefix, suffix
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -232,12 +274,55 @@ class MemoryNearDuplicate:
     也可能一条改了另一条没改（那是矛盾），还可能一条是另一条的细化。
     不引模型轮就分不出这三种（3.7.5 的自动 consolidation 不做，理由在
     这里同样成立），所以只把「像」和相近度摆出来，判断留给人。
+
+    **整体像**是这一类的判据。整体**不像**、但首尾很像的对子（「回复先给
+    结论」vs「回复先给细节」，Jaccard 0.43）由 V1.102 的
+    :class:`MemoryMinimalPair` 接住 —— 两组互斥，各说各的那一半。
     """
 
     left: MemoryEntry
     right: MemoryEntry
     #: 相近度（0..1）：``search_text`` bigram 集合的 Jaccard。
     similarity: float
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MemoryMinimalPair:
+    """一对**只差一处**的记忆 —— 矛盾最可能藏在这里（V1.102 / 3.7.8）。
+
+    与 :class:`MemoryNearDuplicate` 的分工是**两个视角**，不是两个档位：
+
+    | 对子 | Jaccard | 归谁 |
+    |---|---|---|
+    | 周三前给张总报价单 / 周五前给张总报价单 | 0.60 | 相近组（整体像） |
+    | 回复先给结论 / 回复先给结论，再给细节 | 0.62 | 相近组（一条是另一条的延长） |
+    | 回复先给结论 / 回复先给细节 | 0.43 | **本组** |
+    | 先把方案给我看 / 先把预算给我看 | 0.33 | **本组** |
+
+    后两行的共同点：**整体二元组重合不到一半**（一句话里只有一半的相邻字对
+    相同），可它们其实只差一个词 —— 正是「一条记下旧版本、一条改了口」的
+    典型形状。Jaccard 看不见它们，是因为短句里换一个词就换掉一半的二元组；
+    而首尾看得见，因为**框架没动**。
+
+    反过来说，本组**不**取代相近组：整体重合高的那两类（重复、延长）仍归
+    相近组 —— 两组互斥，见 ``MemoryReviewReport.minimal_pairs``。
+
+    **仍然不宣称「矛盾」**：同一个框架两个取值，可能是①改口（新版本取代
+    旧版本，才是真矛盾）②两件并列的真事（「不喜欢早上开会」「不喜欢晚上
+    开会」都在说）③一条是另一条的特例。三种解释字面上完全同形，分诊留给
+    人（3.7.5 的理由在此原样成立）。所以摆出来的是**差在哪**，不是结论。
+    """
+
+    left: MemoryEntry
+    right: MemoryEntry
+    #: 左边去掉公共前后缀剩下的那一段（可能为空 —— 空表示左边是更长那条
+    #: 的**前缀或后缀**，即「右边多说了些什么」）。
+    left_diff: str
+    #: 右边同上的那一段。两个都为空不会出现（完全相同的对子归相近组）。
+    right_diff: str
+    #: 公共前后缀合起来占**较短那条**的比例（0..1）。摆出来是为了可反驳：
+    #: 「67% 的前后缀一样」是人能自己复算的，一个「相似」形容词不是。
+    overlap: float
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -253,11 +338,19 @@ class MemoryReviewReport:
     candidates: tuple[MemoryReviewRow, ...] = ()
     #: 内容相近的对子（与候选资格无关 —— 刚记的记忆也可能记重了）。
     near_duplicates: tuple[MemoryNearDuplicate, ...] = ()
+    #: 只差一处的对子（V1.102）。两组**互斥**：Jaccard 已达相近阈值的对子
+    #: 只在上面那组出现，不在这里重复第二遍（同一对摆两次，两个标签会让
+    #: 人以为有两件事要处理）。
+    minimal_pairs: tuple[MemoryMinimalPair, ...] = ()
     #: 全部记忆条数（给「共 N 条」用）。
     total: int = 0
     #: 留痕或确认记录**读不出来**时的原因。有值时 ``candidates`` 一定是
     #: 空的 —— 判断不了「好久没动静」就不能摆候选：把故障显示成
     #: 「没有候选」比崩溃更糟（用户会以为刚整理过）。
+    #:
+    #: **两组字面关系不受它影响**（V1.102 起）：条目与「前后缀/二元组像不像」
+    #: 都与留痕无关，所以留痕坏了照样算、照样摆 —— 只让留痕管它唯一管得着
+    #: 的那一组。降级时把这三件事一起说清，比一句「判断不了」更接近事实。
     degraded_reason: str = ""
 
 
@@ -333,10 +426,16 @@ class MemoryService:
         conn: sqlite3.Connection,
         roles: RoleRepo,
         clock: Clock,
+        *,
+        online: Callable[[str], OnlineLeg] | None = None,
     ) -> None:
         self._conn = conn
         self._roles = roles
         self._clock = clock
+        # 在线腿的**注入口**（3.7.9）。默认 ``None`` = 每次检索现读环境变量；
+        # 测试传一个 lambda 就**永不联网**。刻意不做成构造时读一次配置：
+        # 那样「改配置要重启」，而这条腿本来就是给人在试的。
+        self._online = online
 
     # -- 写 ------------------------------------------------------------------ #
     def add(
@@ -549,10 +648,31 @@ class MemoryService:
                 degraded=True,
                 degraded_reason=f"检索不可用（{exc}）",
             )
+        result = self._with_online_leg(query, result)
         self._log_retrieval(
             query=query, scope=scope or "", result=result, consumer=consumer
         )
         return result
+
+    def _with_online_leg(
+        self, query: str, result: RetrievalResult
+    ) -> RetrievalResult:
+        """本地关键词空手时，问一次外部（3.7.9 / V1.105）。
+
+        **只在本地空手时**。判据是 ``bm25_hits == 0`` 这个可观察事实：
+        「本地有、只是没排上前几名」不该出去；「一条都没有」才是真的空手。
+
+        **降级时不出去**：检索本身坏了（表缺失 / FTS 不可用）该修本地，
+        往外问只会把「本地坏了」掩盖成「本地没有、外面也没有」。这是本仓
+        反复避开的静默 —— 用一次外部查询盖住一个本地故障。
+        """
+        if result.degraded or result.bm25_hits:
+            return result
+        leg = (
+            self._online(query) if self._online is not None
+            else online_search(query)
+        )
+        return dataclasses.replace(result, online=leg)
 
     def _log_retrieval(
         self,
@@ -569,6 +689,12 @@ class MemoryService:
             legs, degraded, reason = "none", True, result.degraded_reason
         elif result.bm25_hits:
             legs, degraded, reason = "bm25", False, ""
+        elif result.online.used:
+            # 本地关键词空手、外部补上了（V1.105）。``hit_count`` 里那些条目
+            # 全是 tail 回落的近期条目 —— 不是关键词命中，也不是外部结果
+            # （外部结果没有 id，进不了 retrieval_hits，这是刻意的：3.7.7 的
+            # 命中行只认本地条目）。判「本地什么时候真的不够」看这个取值。
+            legs, degraded, reason = "online", False, ""
         elif result.tail_hits:
             legs, degraded, reason = "tail", False, ""
         else:
@@ -893,6 +1019,12 @@ class MemoryService:
         - **内容相近**：bigram 集合 Jaccard ≥ :data:`NEAR_DUPLICATE_THRESHOLD`
           的对子，不限类别。**只说相近不说冲突**，理由见
           :class:`MemoryNearDuplicate`。
+        - **只差一处**（V1.102）：公共前后缀 ≥ 4 字且占较短那条 ≥ 60%，
+          且**不与上一组重复**。摆的是「同一个框架、不同的取值」——
+          改口最可能长的样子（:class:`MemoryMinimalPair`）。
+
+        后两组只看条目正文，**与留痕无关**：所以留痕读不出来时它们照摆，
+        只有第一组降级（见 ``degraded_reason``）。
 
         动作只有两个且都由人发起：:meth:`confirm`（还留着）与既有的
         :meth:`delete`。3.7.5 的不自动 consolidation 在此原样成立 ——
@@ -908,16 +1040,33 @@ class MemoryService:
             # 留痕读不出来 → 判断不了「好久没动静」。此时**不能**把全部
             # 条目当候选摆出来（那会把故障显示成「全都好久没用」），也不
             # 能显示成「没有候选」（那等于说整理干净了）。只报原因。
+            #
+            # 但两组**字面关系**照样摆（V1.102）：它们只看条目正文，与留痕
+            # 无关 —— 让留痕去管它唯一管得着的那一组。留痕坏的时候把重复与
+            # 「只差一处」也一并藏起来，等于二次惩罚。
+            entries = self.list_all()
+            near, minimal = self._pair_groups(entries)
             return MemoryReviewReport(
-                days=window, degraded_reason=usage.degraded_reason
+                days=window,
+                near_duplicates=near,
+                minimal_pairs=minimal,
+                total=len(entries),
+                degraded_reason=usage.degraded_reason,
             )
         try:
             confirmed = self._last_confirmed_map()
         except sqlite3.Error as exc:
             # 确认记录读不出来 → 「确认过」会被显示成「没确认过」，
             # 候选因此偏大。同一条纪律：读不出来要自报，不硬摆。
+            # 字面关系不受影响，照摆（理由同上）。
+            entries = self.list_all()
+            near, minimal = self._pair_groups(entries)
             return MemoryReviewReport(
-                days=window, degraded_reason=f"确认记录读不出来（{exc}）"
+                days=window,
+                near_duplicates=near,
+                minimal_pairs=minimal,
+                total=len(entries),
+                degraded_reason=f"确认记录读不出来（{exc}）",
             )
         since = self._clock.now() - timedelta(days=window)
         rows = tuple(
@@ -938,10 +1087,12 @@ class MemoryService:
             # 不新增 seq 列。
             key=lambda r: (r.last_attention_at, r.entry.id),
         )
+        near, minimal = self._pair_groups([r.entry for r in rows])
         return MemoryReviewReport(
             days=window,
             candidates=tuple(candidates),
-            near_duplicates=self._near_duplicate_pairs([r.entry for r in rows]),
+            near_duplicates=near,
+            minimal_pairs=minimal,
             total=len(rows),
         )
 
@@ -988,6 +1139,78 @@ class MemoryService:
             " GROUP BY entry_id"
         ).fetchall()
         return {r[0]: datetime.fromisoformat(r[1]) for r in rows if r[1]}
+
+    def _minimal_pairs(
+        self,
+        entries: list[MemoryEntry],
+        near: tuple[MemoryNearDuplicate, ...] = (),
+    ) -> tuple[MemoryMinimalPair, ...]:
+        """「框架相同、只差一处」的对子（V1.102 / 3.7.8）。
+
+        判定（两条同时满足，见 ``MINIMAL_DIFF_*``）：公共前缀 + 公共后缀
+        合起来 ≥ 4 个字，且占**较短那条**的 ≥ 60%。
+
+        ``near`` 里已有的对子**跳过**：两组必须互斥。同一对同时出现在
+        「内容相近」与「只差一处」下面，读的人会以为有两件事要处理 ——
+        而它们本来就是同一件事的两个说法。
+
+        为什么这一组能接住 V1.100 登记在案的漏判：「回复先给结论」与
+        「回复先给细节」整体二元组只有 43% 重合（够不上 Jaccard 0.5），
+        但首 4 个字完全一样、只在末尾分岔 —— 正是「一条旧版本 + 一条改口」
+        的形状。这正是 Jaccard 看不见、而首尾看得见的那部分。
+
+        **仍不判「矛盾」**（见 :class:`MemoryMinimalPair`）：三种解释字面
+        同形，分诊留给人。本方法只负责把「差在哪」算清楚。
+        """
+        taken = {frozenset((p.left.id, p.right.id)) for p in near}
+        pairs: list[MemoryMinimalPair] = []
+        for i, left in enumerate(entries):
+            a = left.content
+            for right in entries[i + 1 :]:
+                b = right.content
+                if a == b:
+                    # 完全一样 → Jaccard 1.0，已归相近组（`taken` 里也会有），
+                    # 这里只是不依赖上一步也说得通。
+                    continue
+                shorter = min(len(a), len(b))
+                if shorter == 0:
+                    continue
+                prefix, suffix = _shared_affixes(a, b)
+                shared = prefix + suffix
+                if shared < MINIMAL_DIFF_MIN_SHARED:
+                    continue
+                overlap = shared / shorter
+                if overlap < MINIMAL_DIFF_MIN_OVERLAP:
+                    continue
+                if frozenset((left.id, right.id)) in taken:
+                    continue
+                left_diff = a[prefix : len(a) - suffix]
+                right_diff = b[prefix : len(b) - suffix]
+                if not left_diff and not right_diff:
+                    continue
+                pairs.append(
+                    MemoryMinimalPair(
+                        left=left,
+                        right=right,
+                        left_diff=left_diff,
+                        right_diff=right_diff,
+                        overlap=overlap,
+                    )
+                )
+        # 越像越先看；同分按 id 兜底（同刻定序的既定纪律）。
+        pairs.sort(key=lambda p: (-p.overlap, p.left.id, p.right.id))
+        return tuple(pairs)
+
+    def _pair_groups(
+        self, entries: list[MemoryEntry]
+    ) -> tuple[tuple[MemoryNearDuplicate, ...], tuple[MemoryMinimalPair, ...]]:
+        """两组字面关系一起算（相近 → 只差一处，后者要避开前者）。
+
+        从 ``entries`` 现算，**与留痕无关** —— 所以留痕读不出来时这两组
+        照样能摆（见 :attr:`MemoryReviewReport.degraded_reason`）。
+        """
+        near = self._near_duplicate_pairs(entries)
+        return near, self._minimal_pairs(entries, near)
 
     def _near_duplicate_pairs(
         self, entries: list[MemoryEntry]

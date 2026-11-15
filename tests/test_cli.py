@@ -744,3 +744,289 @@ class TestMemoryReview:
         finally:
             conn.execute("DROP TABLE IF EXISTS retrieval_log_bak")
             conn.commit()
+
+
+class TestMemoryMinimalPairs:
+    """``/memory review`` 的第三组：只差一处（V1.102）。
+
+    呈现的三件事：**差在哪**（不是「相似」这种形容词）、**多少重合**
+    （可复算）、**出口在哪**（哪条算数由人定，系统不改不删）。
+    """
+
+    def test_group_states_the_diff_and_share(self, repl):
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        r.app.memory.add("回复先给细节", kind="约定")
+        out = _run(r, buf, "/memory review")
+        assert "只差一处的（1 对）" in out
+        assert "同一个框架、不同的取值" in out
+        # 左右按库里的条目顺序（先摆左边、再摆右边），断「差在哪」时不锁顺序 ——
+        # 锁了等于要求「谁先被记下」这件事影响输出，那不是这一组要管的事。
+        assert "只差「结论」↔「细节」" in out or "只差「细节」↔「结论」" in out
+        assert "首尾重合 67%" in out
+        assert "哪条算数、要不要合，你定" in out
+
+    def test_summary_counts_the_third_group(self, repl):
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        r.app.memory.add("回复先给细节", kind="约定")
+        out = _run(r, buf, "/memory review")
+        assert "1 对只差一处" in out
+
+    def test_pairs_alone_are_not_reported_as_clean(self, repl):
+        """两条刚记下、字面只差一处 —— 没有「好久没动静」，但不是没事可看。"""
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        r.app.memory.add("回复先给细节", kind="约定")
+        out = _run(r, buf, "/memory review")
+        assert "没有待整理的候选" not in out
+        assert "只差一处的（1 对）" in out
+
+    def test_one_side_extension_is_written_as_extension(self):
+        """一条是另一条的延长时，写「右边多出」而不是「↔」—— 后者读成换说法。"""
+        from types import SimpleNamespace
+
+        pair = SimpleNamespace(left_diff="", right_diff="，再给细节")
+        assert Repl._minimal_diff_label(pair) == "右边多出「，再给细节」"
+        pair = SimpleNamespace(left_diff="不要", right_diff="")
+        assert Repl._minimal_diff_label(pair) == "左边多出「不要」"
+
+    def test_degraded_log_still_shows_pairs(self, repl):
+        """留痕坏了：说清哪一组判断不了，两组字面关系照摆（V1.102）。"""
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        r.app.memory.add("回复先给细节", kind="约定")
+        conn = r.app.memory._conn
+        conn.execute("ALTER TABLE retrieval_log RENAME TO retrieval_log_bak")
+        conn.commit()
+        try:
+            out = _run(r, buf, "/memory review")
+            assert "判断不了哪些好久没动静" in out
+            assert "「内容相近」「只差一处」两组只看正文" in out
+            assert "只差一处的（1 对）" in out
+        finally:
+            conn.execute("DROP TABLE IF EXISTS retrieval_log_bak")
+            conn.commit()
+
+
+# =============================================================================
+# /brief —— 简报预览与协作象限（12.10.12 / V1.103）
+# =============================================================================
+class TestBriefPreview:
+    """人第一次能看见「执行器到底收到了什么」。
+
+    这一刀的价值全在**预览与实发逐字相同**上：预览说「没给方案」而实发
+    带了方案，比没有预览更坏。所以渲染只做排版，组装走 ``assemble_brief``。
+    """
+
+    def _make(self, r):
+        return r.app.tasks.create(
+            "加个邮箱登录", [r.app.roles.list_roles()[0].id],
+            intent="能登录就行",
+            project_path="D:/proj/app",
+        ).id
+
+    def test_shows_quadrant_and_brief_body(self, repl):
+        r, buf = repl
+        tid = self._make(r)
+        out = _run(r, buf, f"/brief {tid[:8]}")
+        assert "协作象限：双盲" in out
+        assert "本次没有已采纳方案、约定和历史执行记录" in out
+        assert "在当前项目目录里完成：加个邮箱登录" in out
+        # 必须先说清「实发是单行」，否则人会以为执行器收到的是这份带缩进的东西。
+        assert "单行" in out
+
+    def test_says_how_much_and_what_to_add(self, repl):
+        r, buf = repl
+        tid = self._make(r)
+        out = _run(r, buf, f"/brief {tid[:8]}")
+        assert "该说多少" in out
+        assert "可补" in out
+        # 建议里出现的命令必须真实存在，且 id 已被替换成可复制的短 id。
+        assert f"/draft {tid[:8]}" in out
+        assert "<id>" not in out
+
+    def test_teach_quadrant_after_accepting_a_plan(self, repl):
+        """采纳过方案 → 讲授象限，且预览里看得到方案正文。"""
+        r, buf = repl
+        tid = self._make(r)
+        draft = r.app.artifacts.create_draft(tid, "方案", "先做接口再做界面")
+        r.app.artifacts.accept(draft.id)
+        out = _run(r, buf, f"/brief {tid[:8]}")
+        assert "协作象限：讲授" in out
+        assert "先做接口再做界面" in out
+        assert "本次没有" not in out
+
+    def test_no_args_shows_usage(self, repl):
+        r, buf = repl
+        out = _run(r, buf, "/brief")
+        assert "/brief <id>" in out
+
+    def test_unknown_id_is_explained(self, repl):
+        r, buf = repl
+        out = _run(r, buf, "/brief 不存在的id")
+        assert "找不到事务" in out
+
+    def test_suggested_commands_are_real(self):
+        """可补里点名的命令必须都在命令表里（防写一条不存在的下一步）。"""
+        from freeagent.cli.app import _USAGE
+        from freeagent.services.delegate import brief_quadrant
+
+        for q in (brief_quadrant(), brief_quadrant(records=())):
+            if not q.what_to_add:
+                continue
+            for cmd in ("/draft", "/memory"):
+                if cmd in q.what_to_add:
+                    assert cmd in _USAGE
+
+
+# =============================================================================
+# /ask 的凭据档（V1.104 / 11.10.9）
+# =============================================================================
+class TestAskKnowledgeBoundary:
+    """答复之后给档位，说的是「查没查」，不是「对不对」。
+
+    少了那句定性，「确定」会被读成「这句话是对的」—— 那正好是这套标注
+    最坏的误用，比不标注更坏。
+    """
+
+    def _fake(self, monkeypatch, *, evidence=(), text="答", ok=True):
+        from freeagent.services import ask as ask_mod
+
+        def _fake(question, *, context="", **kw):
+            if not ok:
+                return ask_mod.AskOutcome(
+                    ok=False, reason="用尽预算", partial="半截", evidence=evidence
+                )
+            return ask_mod.AskOutcome(ok=True, text=text, evidence=evidence)
+
+        monkeypatch.setattr(ask_mod, "ask_executor", _fake)
+
+    def test_no_tool_calls_reads_as_guessed(self, repl, monkeypatch):
+        self._fake(monkeypatch)
+        r, buf = repl
+        out = _run(r, buf, "/ask 这个项目是干什么的")
+        assert "猜想" in out
+        assert "不是本机查证" in out
+
+    def test_checked_file_reads_as_verified_with_path(self, repl, monkeypatch):
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        self._fake(monkeypatch, evidence=(ToolEvidence("read", "README.md"),))
+        r, buf = repl
+        out = _run(r, buf, "/ask 这个项目是干什么的")
+        assert "确定" in out
+        assert "README.md" in out
+
+    def test_the_line_says_it_is_not_a_verdict(self, repl, monkeypatch):
+        """每个档位都必须带这句 —— 它是这条标注的边界，不是装饰。"""
+        self._fake(monkeypatch)
+        r, buf = repl
+        out = _run(r, buf, "/ask 随便问问")
+        assert "不是「对不对」" in out
+
+    def test_failed_ask_still_shows_the_grade(self, repl, monkeypatch):
+        """答没答完与查没查是两件事 —— 半截答复照样标档。"""
+        from freeagent.services.tool_evidence import ToolEvidence
+
+        self._fake(
+            monkeypatch, ok=False,
+            evidence=(ToolEvidence("read", "README.md"),),
+        )
+        r, buf = repl
+        out = _run(r, buf, "/ask 这个项目是干什么的")
+        assert "没答成：用尽预算" in out
+        assert "确定" in out
+
+
+# =============================================================================
+# 在线检索可选腿（V1.105 / 3.7.9）
+# =============================================================================
+class TestOnlineLegCli:
+    """本地关键词空手时，才问一句外面；问出去就要说清楚发往哪。
+
+    这组的网络全部被替换（monkeypatch 模块里的 ``urllib_transport``），
+    所以断言里出现的「已发往 …」是**我们让它发往**的，不是真的。
+    """
+
+    URL_ENV = "FREEAGENT_ONLINE_SEARCH_URL"
+    URL = "https://searx.example.org/search?q={query}&format=json"
+    BODY = (
+        '{"results": [{"title": "怎么做销售周报", "url": "https://zhihu.com/q/1",'
+        ' "content": "先列数字，再写结论。"}]}'
+    )
+
+    def _enable(self, monkeypatch, body=None, error=None):
+        from freeagent.services import online_leg
+
+        monkeypatch.setenv(self.URL_ENV, self.URL)
+
+        def fake(url: str, timeout: float) -> str:
+            if error is not None:
+                raise OSError(error)
+            return self.BODY if body is None else body
+
+        monkeypatch.setattr(online_leg, "urllib_transport", fake)
+
+    def test_off_by_default_says_nothing_in_search(self, repl):
+        """没开启时检索输出里**不该**出现「在线检索」—— 那是噪声。"""
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory search 销售周报")
+        assert "检索：" in out
+        assert "在线检索" not in out
+
+    def test_enabled_shows_external_block(self, repl, monkeypatch):
+        self._enable(monkeypatch)
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory search 销售周报")
+        assert "在线检索（外部材料，未核实）" in out
+        assert "已发往 searx.example.org（查询原文离开了本机）" in out
+        assert "怎么做销售周报" in out
+
+    def test_external_results_are_not_mixed_with_local(self, repl, monkeypatch):
+        """本地条目与外部材料必须**分块**摆 —— 可信度不同的两类证据。"""
+        self._enable(monkeypatch)
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory search 销售周报")
+        assert out.index("回复先给结论") < out.index("在线检索（外部材料")
+
+    def test_local_hit_does_not_go_outside(self, repl, monkeypatch):
+        self._enable(monkeypatch)
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory search 结论")
+        assert "关键词命中" in out
+        assert "在线检索" not in out
+
+    def test_failure_reason_is_shown_verbatim(self, repl, monkeypatch):
+        self._enable(monkeypatch, error="timed out")
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory search 销售周报")
+        assert "没取到：" in out
+        assert "timed out" in out
+
+    def test_stats_says_whether_the_leg_is_on(self, repl):
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory stats 30")
+        assert "在线检索：未启用" in out
+
+    def test_stats_names_the_endpoint_when_on(self, repl, monkeypatch):
+        self._enable(monkeypatch)
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory stats 30")
+        assert "已启用" in out
+        assert "searx.example.org" in out
+        assert "离开本机" in out
+
+    def test_stats_reports_a_broken_template(self, repl, monkeypatch):
+        monkeypatch.setenv(self.URL_ENV, "https://searx.example.org/search")
+        r, buf = repl
+        r.app.memory.add("回复先给结论", kind="约定")
+        out = _run(r, buf, "/memory stats 30")
+        assert "配置有问题" in out

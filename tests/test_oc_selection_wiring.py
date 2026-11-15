@@ -133,6 +133,13 @@ class _Recorder:
     def create_session(self) -> str:
         return "ses_test"
 
+    def call(self, path, method="GET", body=None, *, timeout=30.0):
+        """收尾的改动账会问一次 ``/api/session/{sid}/message``（12.10.13）。
+
+        这个假服务里没有工具调用，所以回一页空的 = 「零改动」。
+        """
+        return 200, b'{"data": []}'
+
     def prompt_async(self, sid, brief, *, model="", agent="", variant="",
                      directory=None):
         self.seen.append({"sid": sid, "brief": brief, "model": model,

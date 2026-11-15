@@ -27,6 +27,8 @@ from freeagent.services.memory import (
     DEFAULT_USAGE_DAYS,
     GLOBAL_SCOPE,
     MEMORY_KINDS,
+    MINIMAL_DIFF_MIN_OVERLAP,
+    MINIMAL_DIFF_MIN_SHARED,
     NEAR_DUPLICATE_THRESHOLD,
     MemoryService,
     role_scope,
@@ -899,3 +901,265 @@ class TestMemoryReview:
         finally:
             conn.execute("DROP TABLE IF EXISTS memory_reviews_bak")
             conn.commit()
+
+
+# -- 8. 「只差一处」（V1.102 / 3.7.8）---------------------------------------- #
+
+class TestMinimalPairs:
+    """同一个框架、不同的取值 —— 改口最可能长这样。
+
+    为什么单独一组：V1.100 把「前缀同、结论反」的对子登记成已知漏判
+    （Jaccard 0.43 够不上 0.5），而那一类恰恰最像矛盾。本组用**公共前后缀**
+    补上这一块：短句里换一个词就换掉一半的二元组，Jaccard 看不见；
+    但框架（首尾）没动，首尾看得见。
+
+    四条纪律：
+
+    - 两组**互斥**（同一对不摆两遍，否则像两件事）；
+    - **仍不说「矛盾」**：改口 / 两件并列的真事 / 一条是另一条的特例，
+      字面完全同形，分诊留给人；
+    - 首尾至少 4 个字（3 个字能套住「我不吃 X」这种通用开头，摆出来
+      只消耗队列信誉）；
+    - 与留痕**无关**：留痕坏了这两组照摆（只让留痕管它管得着的那一组）。
+    """
+
+    def test_registered_miss_pair_is_caught(self, mem: MemoryService):
+        """V1.100 登记在案的漏判对子 —— 本版必须接住。"""
+        mem.add("回复先给结论", kind="约定")
+        mem.add("回复先给细节", kind="约定")
+        report = mem.review_candidates()
+        assert report.near_duplicates == (), "43% 够不上相近阈值，这是登记过的漏判"
+        assert len(report.minimal_pairs) == 1
+        pair = report.minimal_pairs[0]
+        assert {pair.left_diff, pair.right_diff} == {"结论", "细节"}
+        assert pair.overlap == pytest.approx(4 / 6)
+
+    def test_middle_substitution_is_caught(self, mem: MemoryService):
+        """差异在**中段**也能抓 —— 这正是只取「公共前缀」抓不到的那类。"""
+        mem.add("先把方案给我看", kind="约定")
+        mem.add("先把预算给我看", kind="约定")
+        pair = mem.review_candidates().minimal_pairs[0]
+        assert {pair.left_diff, pair.right_diff} == {"方案", "预算"}
+        assert pair.overlap == pytest.approx(5 / 7)
+
+    def test_three_char_frame_is_not_enough(self, mem: MemoryService):
+        """「我不吃香菜」/「我不吃辣」：共享 3 个字，却是两条独立的偏好。
+
+        首尾门槛 4 个字就是为它们设的 —— 3 个字的通用开头能套住任何一对
+        同类偏好，摆出来的东西多了，队列就没信誉了。
+        """
+        mem.add("我不吃香菜", kind="偏好")
+        mem.add("我不吃辣", kind="偏好")
+        report = mem.review_candidates()
+        assert report.minimal_pairs == ()
+        assert report.near_duplicates == ()
+
+    def test_extension_stays_in_near_duplicates(self, mem: MemoryService):
+        """「一条是另一条的延长」整体重合 62% —— 归相近组，不在这里重复一遍。"""
+        mem.add("回复先给结论", kind="约定")
+        mem.add("回复先给结论，再给细节", kind="约定")
+        report = mem.review_candidates()
+        assert len(report.near_duplicates) == 1
+        assert report.minimal_pairs == ()
+
+    def test_date_swap_stays_in_near_duplicates(self, mem: MemoryService):
+        """「周三/周五」整体重合 60% —— 已经被相近组接住，不该摆两遍。"""
+        mem.add("周三前给张总报价单", kind="约定")
+        mem.add("周五前给张总报价单", kind="约定")
+        report = mem.review_candidates()
+        assert len(report.near_duplicates) == 1
+        assert report.minimal_pairs == ()
+
+    def test_identical_entries_are_not_paired_here(self, mem: MemoryService):
+        mem.add("我不吃香菜", kind="偏好")
+        mem.add("我不吃香菜", kind="约定")
+        report = mem.review_candidates()
+        assert len(report.near_duplicates) == 1, "逐字相同是相近组的极端情形"
+        assert report.minimal_pairs == ()
+
+    def test_unrelated_entries_are_not_paired(self, mem: MemoryService):
+        mem.add("我不喜欢早上开会", kind="偏好")
+        mem.add("本项目禁用 requests", kind="约定")
+        assert mem.review_candidates().minimal_pairs == ()
+
+    def test_single_char_entries_do_not_crash(self, mem: MemoryService):
+        """单字条目：公共前后缀长度天然为 0，不硬判也不崩。"""
+        mem.add("甲", kind="偏好")
+        mem.add("乙", kind="偏好")
+        assert mem.review_candidates().minimal_pairs == ()
+
+    def test_pairs_sorted_by_overlap_desc(self, mem: MemoryService):
+        """越像越先看；同分才轮到 id（同刻定序的既定纪律）。"""
+        mem.add("回复先给结论", kind="约定")     # 与「细节」重合 4/6 ≈ 0.67
+        mem.add("回复先给细节", kind="约定")
+        mem.add("先把方案给我看", kind="约定")    # 与「预算」重合 5/7 ≈ 0.71
+        mem.add("先把预算给我看", kind="约定")
+        pairs = mem.review_candidates().minimal_pairs
+        assert [p.overlap for p in pairs] == sorted(
+            (p.overlap for p in pairs), reverse=True
+        )
+        assert pairs[0].overlap == pytest.approx(5 / 7)
+
+    def test_cross_scope_pair_is_surfaced(self, mem: MemoryService, roles: dict):
+        """全局与角色作用域也可以互相矛盾 —— 判定不限作用域。"""
+        mem.add("回复先给结论", kind="约定")
+        mem.add("回复先给细节", kind="约定", scope=role_scope(roles["work"].id))
+        pairs = mem.review_candidates().minimal_pairs
+        assert len(pairs) == 1
+        assert pairs[0].left.scope != pairs[0].right.scope
+
+    def test_degraded_log_still_yields_pairs(self, mem: MemoryService):
+        """留痕坏了只影响「好久没动静」—— 字面关系与留痕无关，照摆。
+
+        反过来说：故障时把重复与只差一处一起藏起来，等于二次惩罚，
+        而「读不出来要自报」并不要求连算得出来的东西也不说。
+        """
+        mem.add("回复先给结论", kind="约定")
+        mem.add("回复先给细节", kind="约定")
+        conn = mem._conn
+        conn.execute("ALTER TABLE retrieval_log RENAME TO retrieval_log_bak")
+        conn.commit()
+        try:
+            report = mem.review_candidates()
+            assert report.degraded_reason
+            assert report.candidates == ()
+            assert len(report.minimal_pairs) == 1
+            assert report.total == 2
+        finally:
+            conn.execute("DROP TABLE IF EXISTS retrieval_log_bak")
+            conn.commit()
+
+    def test_degraded_confirmations_still_yield_pairs(self, mem: MemoryService):
+        mem.add("回复先给结论", kind="约定")
+        mem.add("回复先给细节", kind="约定")
+        conn = mem._conn
+        conn.execute("ALTER TABLE memory_reviews RENAME TO memory_reviews_bak")
+        conn.commit()
+        try:
+            report = mem.review_candidates()
+            assert "确认记录" in report.degraded_reason
+            assert len(report.minimal_pairs) == 1
+        finally:
+            conn.execute("DROP TABLE IF EXISTS memory_reviews_bak")
+            conn.commit()
+
+    def test_thresholds_are_the_documented_ones(self):
+        """判定线是契约：设计文档 3.7.8 写的就是这两个数。"""
+        assert MINIMAL_DIFF_MIN_SHARED == 4
+        assert MINIMAL_DIFF_MIN_OVERLAP == pytest.approx(0.6)
+
+
+# -- 8. 在线检索可选腿（V1.105 / 3.7.9）--------------------------------------- #
+
+class TestOnlineLeg:
+    """只在**本地关键词空手**时问外面；问不到就说为什么。
+
+    全部用例注入一个 callable —— 于是**永不联网**，而「有没有发出去」成了
+    可断言的事实，不需要看网络。
+    """
+
+    def _service(self, mem: MemoryService, calls: list[str]) -> MemoryService:
+        from freeagent.services.online_leg import OnlineLeg, OnlineSnippet
+
+        def fake(query: str) -> OnlineLeg:
+            calls.append(query)
+            return OnlineLeg(
+                enabled=True,
+                attempted=True,
+                snippets=(OnlineSnippet("外部标题", "https://a/1", "外部摘要"),),
+                reason="",
+                endpoint_host="search.example.com",
+            )
+
+        return MemoryService(mem._conn, mem._roles, mem._clock, online=fake)
+
+    def test_default_is_off(self, mem: MemoryService):
+        """没配端点时，检索结果里明确写着「未启用」，而不是悄无声息。"""
+        from freeagent.services.online_leg import NOT_ENABLED_REASON
+
+        mem.add("回复先给结论", kind="约定")
+        result = mem.retrieve("销售周报")
+        assert result.online.enabled is False
+        assert result.online.reason == NOT_ENABLED_REASON
+
+    def test_local_hit_never_goes_outside(self, mem: MemoryService):
+        """「本地有、只是没排上前几名」不该出去 —— 判据是 bm25 有没有命中。"""
+        calls: list[str] = []
+        service = self._service(mem, calls)
+        mem.add("回复先给结论", kind="约定")
+        result = service.retrieve("结论")
+        assert result.bm25_hits == 1
+        assert calls == []
+        assert result.online.enabled is False
+
+    def test_local_miss_goes_outside(self, mem: MemoryService):
+        calls: list[str] = []
+        service = self._service(mem, calls)
+        mem.add("回复先给结论", kind="约定")
+        result = service.retrieve("销售周报")
+        assert result.bm25_hits == 0
+        assert calls == ["销售周报"]
+        assert result.online.used is True
+        assert result.online.snippets[0].title == "外部标题"
+
+    def test_tail_fallback_does_not_stop_it(self, mem: MemoryService):
+        """回落了近期条目也要问外面 —— 那是「本地只有最近的，没有相关的」。"""
+        calls: list[str] = []
+        service = self._service(mem, calls)
+        mem.add("回复先给结论", kind="约定")
+        result = service.retrieve("销售周报")
+        assert result.tail_hits == 1
+        assert len(calls) == 1
+
+    def test_degraded_never_goes_outside(self, mem: MemoryService):
+        """本地坏了就去外面问，会把「本地坏了」盖成「本地没有」。
+
+        那正是本仓反复避开的那类静默：一个故障被另一次侥幸盖住。
+        """
+        calls: list[str] = []
+
+        def _boom(*a, **kw):
+            raise sqlite3.OperationalError("no such table: memory_fts")
+
+        service = self._service(mem, calls)
+        service._retrieve = _boom  # type: ignore[method-assign]
+        result = service.retrieve("销售周报")
+        assert result.degraded is True
+        assert calls == []
+
+    def test_log_records_online_only_when_it_delivered(self, mem: MemoryService):
+        calls: list[str] = []
+        service = self._service(mem, calls)
+        mem.add("回复先给结论", kind="约定")
+        service.retrieve("销售周报")
+        row = mem._conn.execute(
+            "SELECT legs FROM retrieval_log ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert row["legs"] == "online"
+
+    def test_online_results_are_not_logged_as_hits(self, mem: MemoryService):
+        """外部结果没有 id、不进 retrieval_hits —— 留痕只认本地条目。"""
+        calls: list[str] = []
+        service = self._service(mem, calls)
+        local = mem.add("回复先给结论", kind="约定")
+        service.retrieve("销售周报")
+        ids = [r["entry_id"] for r in mem._conn.execute(
+            "SELECT entry_id FROM retrieval_hits"
+        ).fetchall()]
+        assert ids == [local.id]
+
+    def test_failure_reason_survives_to_the_result(self, mem: MemoryService):
+        """拿不到时原因要留在结果里 —— 呈现层才有话可说。"""
+        from freeagent.services.online_leg import OnlineLeg
+
+        service = MemoryService(
+            mem._conn, mem._roles, mem._clock,
+            online=lambda q: OnlineLeg(
+                enabled=True, attempted=True, endpoint_host="search.example.com",
+                reason="已发往 search.example.com，但没取回：timed out",
+            ),
+        )
+        mem.add("回复先给结论", kind="约定")
+        result = service.retrieve("销售周报")
+        assert result.online.used is False
+        assert "没取回" in result.online.reason

@@ -352,6 +352,40 @@ class CareArea:
 
 
 @dataclass(frozen=True, slots=True)
+class DecisionLog:
+    """一次拍板的**快照**（设计文档 7.6 / 19.5.4 候选 D）。
+
+    **它是什么**：主人从一组取舍里选了一个之后，**当时那一刻的认知快照**
+    —— 当时摆出来的几个选项、当时的对比理由、当时争的是哪一天。
+
+    **为什么存文本快照而不是外键**：19.5.4 要「带时间戳的认知快照 …
+    到期自动拉出来与现况对峙」。**「当时的」是硬要求** —— 若只存
+    ``task_id``，对峙时会用**今天**的库去重算「当时的代价对比」，
+    而那份对比会随事实漂移（承诺兑现了、期限过了，代价就变了）。
+    存逐字冻结的原文，才对得起「当时」两个字。
+
+    **它不是「谁点了同意」**：那是 :class:`PendingApproval` 的
+    ``decision``（授权闸门）。本表记的是**主人自己的选择**，
+    且只被呈现层读 —— 不参与任何权重、排序或倾向推断（11.9.11）。
+    """
+
+    id: str
+    #: 选了第几个（0 基），对应 :attr:`options_json` 里的项序。
+    chosen_index: int
+    #: 冻结的选项清单（JSON 数组文本）。每项含 ``task_id`` / ``title`` /
+    #: ``facets``（``facets`` 里是落那一刻的原文与出处）。
+    options_json: str
+    #: 当时的「为什么是取舍」（逐字冻结）。
+    reason_text: str
+    #: 当时争的是哪一天（人话，如「都要占 2026-11-04 这一天」）。
+    conflict_text: str
+    #: 拍板时刻。
+    decided_at: datetime
+    #: 什么时候拉出来与现况对峙（ISO 日期）。
+    confront_on: date
+
+
+@dataclass(frozen=True, slots=True)
 class Promise:
     """一条**对外承诺**（设计文档 11.19 / 19.5.3）。
 

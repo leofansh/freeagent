@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from datetime import datetime, timedelta
+from collections.abc import Iterable, Sequence
+from datetime import date, datetime, timedelta
 
 from ..domain import (
     CONTACT_KIND_LABELS,
+    DecisionLog,
     RecordType,
     RestoreView,
     Role,
@@ -24,6 +25,8 @@ from ..services.sorting import DISCLAIMER_MARKER
 from ..services.today import TodayView
 from ..services.week import WeekView
 from ..services.care import CareDue
+from ..services.decision import Confrontation
+from ..services.weigh import WeighResult
 
 __all__ = [
     "DISCLAIMER",
@@ -39,6 +42,10 @@ __all__ = [
     "render_suggestion",
     "render_artifact",
     "render_artifact_list",
+    "render_weigh",
+    "render_weigh_picked",
+    "render_decisions",
+    "render_decision_history",
     "to_task_ref",
     "to_signal_refs",
 ]
@@ -223,8 +230,43 @@ def render_week(view: WeekView, names: dict[str, str]) -> str:
         lines.append("成长目标：还没记过 —— 用 /remember 记一条（如「今年把英语练到能开会」）。")
 
     lines.append("")
-    lines.append("这些是**事实**，不是建议 —— 要改什么，由你决定。")
+    lines.append("这些是事实，不是建议 —— 要改什么，由你决定。")
     return "\n".join(lines)
+
+
+def _hour_span_label(peak: tuple[int, int, int]) -> str:
+    """(21, 23, 13) → 「21-23 点」；(21, 21, 3) → 「21 点」。"""
+    start, end, _count = peak
+    if end > start:
+        return f"{start:02d}-{end:02d} 点"
+    return f"{start:02d} 点"
+
+
+def _dow_label(peak: tuple[int, int]) -> str:
+    """(1, 14) → 「周二」。"""
+    return f"周{_WEEKDAY_CN[peak[0]]}"
+
+
+def _peak_lines(peak, done: int, label) -> list[str]:
+    """时段/星期分布下面那一行凝练（V1.101）。
+
+    出峰：**带计数与占比**（「其中 13 次（35%）集中在 21-23 点」）——
+    V1.96「没有计数的规律不可反驳」在呈现层的落地。
+    未达判定线：**说清判定线本身**，不静默跳过 —— 认不出而一声不响，
+    看的人只会以为漏印了一行。
+    """
+    if peak is not None:
+        count = peak[-1]
+        share = count * 100 // done
+        text = label(peak)
+        # 数字与汉字之间留一个空格，汉字之间不留：「集中在 21-23 点」/
+        # 「集中在周三」。同一个模板，靠标签首字符定，不写死两个模板。
+        gap = " " if text[:1].isdigit() else ""
+        return [f"其中 {count} 次（{share}%）集中在{gap}{text}"]
+    return [
+        "（没有达到「集中」的判定线：至少 3 次、且占全部完成的三分之一"
+        " —— 上面是原始分布）"
+    ]
 
 
 def render_model(view, names: dict[str, str]) -> str:
@@ -233,6 +275,10 @@ def render_model(view, names: dict[str, str]) -> str:
     刻意**不排序打分、不给建议**：只把从记录里现推的规律摆出来
     （第七章「摆得更清楚 ≠ 替你决定」）。与 /week、/feedback 同一条纪律。
     ``names`` 保留签名一致，角色名已在服务层翻好。
+
+    V1.101：时段/星期分布下各带一行**凝练结论**（「集中在哪」+
+    计数与占比）。它是统计描述，不是评价 —— 「37 次里 13 次在 21-23 点」
+    可以说，「你总在深夜干活」不可以说。
     """
     days = (view.until - view.since).days + 1
     lines = [f"连续性个人模型 · 近 {days} 天（{DISCLAIMER}）"]
@@ -242,12 +288,17 @@ def render_model(view, names: dict[str, str]) -> str:
 
     lines.append("")
     if view.done_in_window:
-        lines.append(f"完成 {view.done_in_window} 件，按**时段**分布：")
+        lines.append(f"完成 {view.done_in_window} 件，按时段分布：")
         for hour, count in view.completion_by_hour:
             lines.append(f"  {hour:02d}:00  {count:>3}  {'▏' * count}")
-        lines.append("按**星期**分布：")
+        # V1.101 凝练结论：分布摆事实，「集中在哪」也要能一句话说出 ——
+        # 每条都带计数（V1.96：没有计数的规律不可反驳）。判定不出时
+        # 说清判定线，不静默（认不出要自报，同 engine_errors 的 unknown）。
+        lines.extend(_peak_lines(view.hour_peak, view.done_in_window, _hour_span_label))
+        lines.append("按星期分布：")
         for dow, count in view.completion_by_dow:
             lines.append(f"  周{_WEEKDAY_CN[dow]}   {count:>3}  {'▏' * count}")
+        lines.extend(_peak_lines(view.dow_peak, view.done_in_window, _dow_label))
     else:
         lines.append("这段时间没有完成的记录。")
 
@@ -310,7 +361,7 @@ def render_model(view, names: dict[str, str]) -> str:
         lines.append("滋养兴趣：还没记过「偏好」—— 用 /remember 记一条（如「我最近在学赛艇」）。")
 
     lines.append("")
-    lines.append("这些是**从你的记录里现推的事实**，不是评价 —— 要不要顺着它调整，由你决定。")
+    lines.append("这些是从你的记录里现推的事实，不是评价 —— 要不要顺着它调整，由你决定。")
     return "\n".join(lines)
 
 
@@ -581,6 +632,82 @@ def render_artifact_list(artifacts) -> str:
     return "\n".join(lines)
 
 
+def render_brief(text: str, quadrant, task_id: str = "") -> str:
+    """简报预览 + 协作象限（V1.103 / 12.10.12）。
+
+    两个刻意的排版决定：
+
+    * **只按分隔符折行，不改一个字**。简报的硬约束是单行（换行会让
+      opencode 升级到付费模型），所以预览必须先说清「实发的是单行」，
+      否则人会以为执行器收到的是这份带缩进的东西。
+    * **正文放最后**。人打开这个命令是为了判「我还该说什么」，那答案在
+      象限三行里，不在几百字的正文里。
+    """
+    human = "、".join(quadrant.human_side) or "无"
+    machine = "、".join(quadrant.machine_side) or "无"
+    lines = [
+        "简报预览 —— 执行器实际收到的原文（单行；下面只按「；」折行，内容一字未改）",
+        "",
+        f"  协作象限：{quadrant.label}",
+        f"  你给过的：{human}",
+        f"  机器记下的：{machine}",
+        f"  该说多少：{quadrant.says_how_much}",
+    ]
+    if quadrant.what_to_add:
+        add = quadrant.what_to_add
+        if task_id:
+            add = add.replace("<id>", task_id[:8])
+        lines.append(f"  可补：{add}")
+    lines.append("")
+    lines.append("  正文：")
+    for part in text.split("；"):
+        if part.strip():
+            lines.append(f"    · {part.strip()}")
+    return "\n".join(lines)
+
+
+def render_boundary(boundary) -> str:
+    """一条答复的凭据档位（V1.104 / 11.10.9）。
+
+    抬头那句**不是客套**：分档说的是「查没查」，不是「对不对」。少了它，
+    「确定」会被读成「这句话是对的」—— 那正好是这套标注最坏的误用，
+    比不标注更坏（人会把一个读错文件的结论当成已核事实）。
+    """
+    return "\n".join([
+        "—— 凭据（说的是「查没查」，不是「对不对」）——",
+        f"  {boundary.label} · {boundary.basis}",
+    ])
+
+
+def render_online_leg(leg) -> str:
+    """在线腿的一块展示（V1.105 / 3.7.9）。**没启用时返回空串**。
+
+    三条纪律都在这个函数里：
+
+    1. **提交原文去哪了**：真发出去就写明主机 —— 查询离开本机是一次不可
+       撤回的披露，人有权在结果旁边看到这件事。
+    2. **单列，不混排**：抬头写「外部材料，未核实」，与本地条目分开摆。
+       本地条目是「你记过的」，外部材料是「网上有个人这么说」。
+    3. **没拿到就说为什么**：`reason` 原样呈现，不翻译成「未找到」——
+       「端点配错了」与「网上也没有」要人做的事完全不同。
+    """
+    if not leg.enabled:
+        return ""
+    lines = ["—— 在线检索（外部材料，未核实）——"]
+    if not leg.snippets:
+        lines.append(f"  没取到：{leg.reason}")
+        return "\n".join(lines)
+    if leg.endpoint_host:
+        lines.append(f"  已发往 {leg.endpoint_host}（查询原文离开了本机）")
+    for index, item in enumerate(leg.snippets, start=1):
+        lines.append(f"  {index}. {item.headline}")
+        if item.url and item.url != item.headline:
+            lines.append(f"     {item.url}")
+        if item.snippet:
+            lines.append(f"     {item.snippet}")
+    return "\n".join(lines)
+
+
 def render_roles(roles: list[Role], names: dict[str, str] | None = None) -> str:
     lines = ["角色脉络："]
     if not roles:
@@ -731,6 +858,148 @@ def render_cares(items: Iterable[CareDue], now: datetime | None = None) -> str:
 
 def render_suggestion(text: str) -> str:
     return f"排期参考（{DISCLAIMER}）：{text}"
+
+
+def render_weigh(result: WeighResult | None) -> str:
+    """代价对照（设计文档 7.5 / 20.1.14）。
+
+    **只摆，不建议** —— 三条纪律都在措辞里：
+
+    * **陈述句**：不出现「你应该」「建议」「最好」。方案是「一件事 + 它的代价」，
+      不是「推荐你做 X」（``delegate.py:551``：指令类语句是自动决策的前一步）。
+    * **代价带出处**：每项代价后面标它的来源列，主人可以自己核对
+      （``engine_errors.py:39``：宁可给不出，也不给错）。
+    * **不给排序**：两件事并列，**不标哪个更该做** —— 那是筛选层（决定
+      看不看得到），有损。摆出来的两件都还在队列里。
+
+    ``result`` 为 ``None`` = 没有真取舍。这**必须如实说**，
+    不能降格成「那就先做 X」（那是把没有取舍说成有建议）。
+    """
+    if result is None:
+        return (
+            "现在没有需要你拍板的取舍 —— "
+            "没有两件事落在同一天（一天只有一份力气，争用才成立）。"
+        )
+
+    lines = [
+        "需要你拍板（只摆代价，不替你决定）：",
+        "",
+        f"争的是同一件事：{result.conflict_text}。",
+        f"代价的性质：{result.because}。",
+        "",
+    ]
+    for i, opt in enumerate(result.options, 1):
+        lines.append(f"{i}. {opt.task.title}")
+        for facet in opt.facets:
+            lines.append(f"   · {facet.text}（来源：{facet.source}）")
+        lines.append("")
+    lines.append("这几件都还在队列里 —— 先动哪件由你定。")
+    lines.append(f"选定了就记下来：{_WEIGH_PICK_HINT}")
+    return "\n".join(lines)
+
+
+#: ``/weigh`` 之后怎么拍板的提示语。
+#:
+#: **刻意用「记下来」而不是「选 X」** —— 它要表达的是「这一板会被记住，
+#: 到期会拿出来跟现在对质」，而不只是「标记一下做过了」。
+#: 后者听起来像归档，而归档没人回看。
+_WEIGH_PICK_HINT = "/weigh <序号> 把这一板记下来（7 天后会拿出来跟现在对质）"
+
+
+def render_weigh_picked(
+    result: WeighResult, chosen_index: int, *, is_new: bool = True
+) -> str:
+    """记完一板之后的回执（设计文档 7.6）。
+
+    **只报事实**：选了哪个、当时为什么是取舍、什么时候会拿出来对质。
+    **不说「好选择」也不说「记下了，以后会更有针对性」** ——
+    那是评价与承诺，本仓的呈现层不做这两件事。
+
+    ``chosen_index`` 是 **0 基**（与 :meth:`DecisionService.record` 一致）。
+
+    ``is_new=False`` 表示**今天已经拍过同一块板、选了同一个** ——
+    库里没有多出一行（幂等规则见 7.6.6）。
+
+    **回执必须把这两种情况说成不同的话**：都说成「记下了」，
+    就把「今天已经记过，还是那一条」说成了「刚记了一条」——
+    库里其实没有新行，人却以为多了一条。那是把事实说错。
+    """
+    if is_new:
+        header = "这一板记下了（只摆事实，不评价）："
+    else:
+        header = "这一板今天已经记过 —— 还是那一条，日志里没有多出一行："
+    lines = [
+        header,
+        "",
+        f"争的是同一件事：{result.conflict_text}。",
+        f"代价的性质：{result.because}。",
+        "",
+    ]
+    for i, opt in enumerate(result.options, 1):
+        mark = " ← 你选的" if i == chosen_index + 1 else ""
+        lines.append(f"{i}. {opt.task.title}{mark}")
+        for facet in opt.facets:
+            lines.append(f"   · {facet.text}（来源：{facet.source}）")
+        lines.append("")
+    lines.append("记的是当时那一板 —— 7 天后会拿出来，跟这几件事现在的状态并排摆给你看。")
+    return "\n".join(lines)
+
+
+def render_decisions(
+    confrontations: Sequence[Confrontation],
+    *,
+    today: date,
+) -> str:
+    """到期对峙：当时的快照 + 现在的状态，并排（设计文档 7.6）。
+
+    **只摆事实，不评价** —— 它**不**说「你选对了」也不说「你选错了」。
+    判断留给主人自己：系统能摆清「当时怎么想的、现在各自什么状态」，
+    但「这个判断好不好」是人的事（7.1 / 〇.8.4）。
+
+    空列表时如实说「没有到期的取舍记录」，**不降格成「那先做 X」**。
+    """
+    if not confrontations:
+        return (
+            "没有到期的取舍记录 —— "
+            "拍过板、且到对质日的那几条才会出现在这里。"
+        )
+
+    lines = [f"到期的取舍 · {today}（当时那板 vs 现在）", ""]
+    for c in confrontations:
+        decided = c.decision.decided_at
+        lines.append(
+            f"· {decided:%Y-%m-%d} 拍板：{c.decision.conflict_text}"
+        )
+        lines.append(f"  当时的理由：{c.decision.reason_text}")
+        if c.chosen is not None:
+            lines.append(f"  当时你选的是：{c.chosen.title}")
+            for text, source in c.chosen.facets:
+                lines.append(f"    · {text}（来源：{source}）")
+        lines.append("  现在：")
+        for line in c.current_lines:
+            lines.append(f"    {line}")
+        for title in c.vanished_titles:
+            lines.append(f"    {title} —— 已经不在库里了")
+        lines.append("")
+    lines.append("只摆事实 —— 当初怎么想的、现在各自什么状态。你自己看。")
+    return "\n".join(lines)
+
+
+def render_decision_history(decisions: Sequence[DecisionLog]) -> str:
+    """决策日志一览（只列，不展开对峙）。
+
+    **刻意只列一行一条** —— 这是「我拍过哪些板」的索引，
+    展开对峙是 :func:`render_decisions` 的活。
+    """
+    if not decisions:
+        return "还没有拍过板 —— /weigh 摆出取舍后，用 /weigh <序号> 记下来。"
+    lines = [f"拍过板 {len(decisions)} 次", ""]
+    for d in decisions:
+        lines.append(
+            f"· {d.decided_at:%Y-%m-%d %H:%M} —— {d.conflict_text}"
+            f"（{d.reason_text}）"
+        )
+    return "\n".join(lines)
 
 
 def to_task_ref(task: Task) -> TaskRef:

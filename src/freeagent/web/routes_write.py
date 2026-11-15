@@ -24,6 +24,7 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_agent,
     endpoints_artifact,
     endpoints_delegate_action,
     endpoints_delegate_projects,
@@ -242,4 +243,8 @@ def dispatch_post(
                 app, parts[2], action
             )
 
+    if parts[:2] == ["api", "agent"] and len(parts) == 3:
+        # 工作台（21.4 / V1.114）：起一轮 / 答卡 / 停止。必须 POST —— 这是
+        # 第一个「一次请求就启动一个会改文件的进程」的入口。
+        return HTTPStatus.OK, endpoints_agent.agent_post(app, parts[2], read_body)
     return None

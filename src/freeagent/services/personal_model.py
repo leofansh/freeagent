@@ -13,6 +13,13 @@ V1.59 起再并入**关系账**（``contacts`` 表的「我欠 / 我等」）与
 打分、不给建议**—— 关系账与承诺只摆事实（逾期标「已逾期」，不写「违约」；
 判断仍是用户的事），记忆只原样列出「约定 / 目标」原文。
 
+V1.101 起，节奏面的时段分布多带一句**凝练结论**：「37 次完成里 12 次
+（32%）集中在 21-23 点」—— 原始分布照旧全列，凝练句只是把「集中在哪」
+从「自己数」变成「直接说」。它是**对已发生事实的统计描述**，不是
+「你总在深夜干活，建议调整」那种评价；判定线（一段至少 3 次、且占全部
+的三分之一）是常数，样本不够时**不出结论并说清为什么**（V1.96：宁可
+漏判，不错判）。
+
 它是 **Personal 与通用助手的真正分水岭**（20.1.1 原文）：无状态即每次从零，
 等于不是 personal；而这里跨会话积累的，是对「你自己」的理解。
 
@@ -22,7 +29,7 @@ V1.59 起再并入**关系账**（``contacts`` 表的「我欠 / 我等」）与
 |---|---|
 | **不写库** | 纯只读聚合。模型是「从记录现推」的视图，不是一份要维护的状态；写一份就等于又多一个真源要和它保持同步 |
 | **不排序打分** | 打分用的是「此刻的精力与紧迫度」（7.2）。拿它给已经过去的一段时间贴「高效 / 低效」标签，是替用户做判断 |
-| **不给结论、不提建议** | 「你总在深夜完成」「这件又顺延了，下周别拖」是评价。视图只摆规律（第七章「摆得更清楚 ≠ 替你决定」），与 /week、/feedback 同一条纪律 |
+| **不做评价、不提建议** | 「你总在深夜完成」「这件又顺延了，下周别拖」是评价。视图只摆规律（第七章「摆得更清楚 ≠ 替你决定」），与 /week、/feedback 同一条纪律。**界线在「可数」与否**（V1.101）：「37 次里 13 次在 21-23 点」是统计描述（每一项都能在原始分布里对账），「你总在深夜干活」是给这件事贴意义 —— 前者说，后者不说 |
 | **不解析记录正文** | 顺延次数数的是 ``ROLLOVER`` 记录的**条数**；完成时段读的是 ``Task.completed_at``。一旦去解析正文「原定 X 顺延到 Y」，改文案就等于改数据 |
 | **不引入向量 / RAG** | 规则统计即可，零新依赖；也避免「自动 consolidation」带来的静默改写风险 |
 """
@@ -46,6 +53,19 @@ __all__ = ["PersonalModelService", "PersonalModelView", "build_personal_model"]
 _STUCK_WAITING_DAYS = 7
 #: 顺延次数达到这么多，才进「反复顺延」清单（偶发一次不算规律）。
 _MIN_ROLLOVERS = 2
+#: 一段时段里的完成数达到这么多，才够资格谈「集中」。
+#: 与 ``_MIN_ROLLOVERS`` 同一条精神：偶发一两次是巧合，不是规律。
+#: 时段是连续量、随机性比「同一条事务顺延几次」高，所以线不能更低。
+_MIN_PEAK_COUNT = 3
+#: 「集中」还要求这一段占全部完成的至少三分之一（``count * 3 >= done``，
+#: 用整数比而不是浮点）。24 个小时里最高的一段只占 8%，那是「分布平坦」，
+#: 不是「集中」—— 把最高的一段说成「集中」会误导（V1.96：宁可漏判）。
+#: 同数并列时取起始早的一段（稳定、可预期，不引入随机兜底）。
+_PEAK_SHARE_NUM = 3
+#: 成段的键至少要有这么多次完成。**孤例不定义段的边界** —— 21-23 点
+#: 各完成 4/5/3 次是峰，旁边 20 点只完成过 1 次，把它并进来会把
+#: 「21-23 点」撑成「20-23 点」，而那句话就不再是原话要说的事。
+_MIN_RUN_COUNT = 2
 #: 默认回看窗口（天）。个人模型是长周期规律，太短没有意义。
 _DEFAULT_SINCE_DAYS = 90
 
@@ -57,6 +77,8 @@ class PersonalModelView:
     全部字段都是**事实统计**，没有一项是评价：
 
     * ``completion_by_hour`` / ``completion_by_dow``：完成时段分布；
+    * ``hour_peak`` / ``dow_peak``：分布的**凝练结论**（V1.101）—— 集中在
+      哪一段 / 哪一天，未达判定线时为 ``None``（判定不出，不是「没有峰」）；
     * ``rollover_total`` / ``tasks_rolled_over``：顺延次数与反复顺延的事务；
     * ``stuck_waiting``：悬在别人手里超过阈值的等候；
     * ``role_activity``：各角色挂接的事务数（活跃度代理）。
@@ -80,6 +102,11 @@ class PersonalModelView:
     #: 刻意与 ``commitments`` 分开：偏好是「我是谁」，约定/目标是「我在追什么」，
     #: 混在「承诺与目标」里会把它读成该兑现的义务（〇.8.4 只记录不催促）。
     preferences: tuple[tuple[str, str], ...]              # (kind, text)　kind 恒为「偏好」
+    #: 完成最集中的一段**连续小时**（起、止、计数）；判定不出为 None。
+    #: 凝练结论带计数（V1.96「没有计数的规律不可反驳」在框架层的落地）。
+    hour_peak: tuple[int, int, int] | None = None
+    #: 完成最集中的**星期几**（weekday、计数）；判定不出为 None。
+    dow_peak: tuple[int, int] | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -97,6 +124,57 @@ class PersonalModelView:
             and not self.commitments
             and not self.preferences
         )
+
+
+def _merge_runs(counts: Mapping[int, int]) -> list[tuple[int, int, int]]:
+    """把键相邻（差 1）、且**各自至少** ``_MIN_RUN_COUNT`` 次的计数并成段。
+
+    返回 ``[(start, end, count), ...]``，按计数降序、同数起始早在前。
+    21/22/23 点各几次完成会并成一段「21-23 点」—— 人说的「集中在
+    21-23 点」本来就是这种形态。**只完成过 1 次的键先滤掉**：孤例不定义
+    段的边界（否则旁边的散点会把峰撑大，见 ``_MIN_RUN_COUNT`` 的注释）。
+    **不做环形合并**（23 点与 0 点不相邻）：环上有歧义（「周日+周一」
+    算不算一段没有天然答案），第一版不猜，记在文档里。
+    """
+    dense = {k: v for k, v in counts.items() if v >= _MIN_RUN_COUNT}
+    segments: list[tuple[int, int, int]] = []
+    run_start: int | None = None
+    run_end: int | None = None
+    run_count = 0
+    for key in sorted(dense):
+        if run_end is not None and key == run_end + 1:
+            run_end = key
+            run_count += dense[key]
+        else:
+            if run_start is not None:
+                segments.append((run_start, run_end, run_count))
+            run_start = run_end = key
+            run_count = dense[key]
+    if run_start is not None and run_end is not None:
+        segments.append((run_start, run_end, run_count))
+    segments.sort(key=lambda seg: (-seg[2], seg[0]))
+    return segments
+
+
+def _peak(counts: Mapping[int, int], total: int) -> tuple[int, int, int] | None:
+    """最集中的一段连续区间；达不到判定线返回 ``None``（判定不出）。
+
+    判定线两条同时满足：段内计数 ≥ ``_MIN_PEAK_COUNT``、且段内计数占
+    全部至少三分之一。段已按计数降序，所以第一个过线的就是「计数最高
+    的过线段」；最高段都过不了线时，次高段更过不了（计数更小而总数不变）。
+    """
+    for start, end, count in _merge_runs(counts):
+        if count >= _MIN_PEAK_COUNT and count * _PEAK_SHARE_NUM >= total:
+            return (start, end, count)
+    return None
+
+
+def _dow_peak(counts: Mapping[int, int], total: int) -> tuple[int, int] | None:
+    """最集中的星期几（离散维度，不合并）；判定不出返回 ``None``。"""
+    for dow, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if count >= _MIN_PEAK_COUNT and count * _PEAK_SHARE_NUM >= total:
+            return (dow, count)
+    return None
 
 
 def build_personal_model(
@@ -133,6 +211,12 @@ def build_personal_model(
         done_in_window += 1
         by_hour[ca.hour] += 1
         by_dow[ca.weekday()] += 1
+
+    # -- 时段凝练（V1.101）：分布在上面摆着，「集中在哪」要能一句话说出 ----
+    # 每条凝练结论都带计数（V1.96：没有计数的规律不可反驳），且判定不出
+    # 时是 None 而不是「分布平坦」四个字 —— 后者是把判定结果说成结论。
+    hour_peak = _peak(by_hour, done_in_window)
+    dow_peak = _dow_peak(by_dow, done_in_window)
 
     rollover_by_task: Counter[str] = Counter()
     for record in records:
@@ -229,6 +313,8 @@ def build_personal_model(
         done_in_window=done_in_window,
         completion_by_hour=tuple(sorted(by_hour.items())),
         completion_by_dow=tuple(sorted(by_dow.items())),
+        hour_peak=hour_peak,
+        dow_peak=dow_peak,
         rollover_total=rollover_total,
         tasks_rolled_over=tasks_rolled_over,
         stuck_waiting=tuple(stuck),

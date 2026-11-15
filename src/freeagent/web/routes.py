@@ -16,6 +16,8 @@ from typing import Any
 
 from ..app import App
 from . import (
+    endpoints_agent,
+    endpoints_agent_workspace,
     endpoints_delegate_browse,
     endpoints_delegate_live,
     endpoints_delegate_projects,
@@ -96,6 +98,14 @@ def _reminders(app: App, _q: dict[str, list[str]]) -> dict[str, Any]:
 #: GET 路由表。加接口在这里加一行，不碰 handler。
 READ_ROUTES: dict[str, Callable[..., Any]] = {
     "/api/health": endpoints_read.health,
+    # 工作台（21.4 / V1.114）：引擎状态、一轮快照、目录列表。
+    # **只读**：起引擎、开一轮、答授权都在 POST（真起子进程的动作不能挂在
+    # 「顺手 GET 一下」的路径上）。
+    "/api/agent/state": lambda app, q: endpoints_agent.agent_state(app),
+    "/api/agent/turn": endpoints_agent.agent_turn_get,
+    # 最近的活（21.4 / V1.115）。同样只读：列一张表不该起引擎。
+    "/api/agent/turns": endpoints_agent.agent_turns_list,
+    "/api/agent/dirs": endpoints_agent_workspace.agent_dirs,
     "/api/today": lambda app, q: serialize.today_payload(
         app.today.view(),
         endpoints_read.role_names(app),

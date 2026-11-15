@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -30,6 +31,8 @@ from freeagent.services.approval import ApprovalStore
 from freeagent.services.clock import FrozenClock
 from freeagent.web import endpoints_delegate_action as act
 from freeagent.web import endpoints_delegate_live as live
+from freeagent.web.js_delegate_live import JS_DELEGATE_LIVE
+from freeagent.web.js_delegate_live_poll import JS_DELEGATE_LIVE_POLL
 from freeagent.web.routes import READ_ROUTES
 from freeagent.web.routes_write import dispatch_post
 from freeagent.web.server import create_server
@@ -282,6 +285,19 @@ class TestApprovalAction:
         assert got["ok"] is True
         assert _store(app, clock).decide(p.credential) == "allow"
 
+    def test_web_decision_records_its_via(self, env):
+        """网页点的结论必须记 ``via='web'``。
+
+        11.9.11 的六类分账靠 ``decided_via`` 把「人点的」与「没人看」分开，
+        而默认值是空串（= 未记）。WEB 此前走的就是默认值 —— 于是网页上批的
+        每一下，在审计视图里都与「历史遗留、不知道从哪来」同形。
+        **一个空串让整条通道在治理信号里消失**，这比记错更难发现。
+        """
+        app, _task, clock = env
+        p = self._pending(env)
+        act.approval_action(app, p.credential, {"decision": "allow"})
+        assert _store(app, clock).get(p.credential).decided_via == "web"
+
     def test_deny_writes_the_row(self, env):
         app, _task, clock = env
         p = self._pending(env)
@@ -347,6 +363,8 @@ class TestApprovalStop:
         act.approval_stop(app, p.credential)
         assert store.is_stop_requested(p.credential) is True
         assert store.decide(p.credential) == "deny"
+        # 与飞书第三个按钮同一个值：读侧判「叫停 vs 明确拒绝」只看这个字段。
+        assert store.get(p.credential).decided_via == "stop"
 
     def test_stop_twice_says_it_is_already_answered(self, env):
         """第二次点停止会**报错**而不是静默成功 —— 如实说清比假装又做了一次好。
@@ -597,3 +615,99 @@ class TestOverHttp:
         assert status == 400
         assert "已经答复过" in body["error"]
         assert store.decide(p.credential) == "allow", "结论被翻掉了"
+
+
+def _fn(src: str, name: str) -> str:
+    """取出某个 JS 函数的源码块（按大括号配平，与 ``test_chat_js`` 同一手法）。"""
+    start = src.index("function " + name + "(")
+    depth, i = 0, start
+    while i < len(src):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+        i += 1
+    raise AssertionError(f"{name} 的花括号没闭合")
+
+
+class TestLivePollRecovery:
+    """面板**读不到之后**不许静默停（V1.106）。
+
+    ## 为什么是静态守卫而不是真跑
+
+    这段 JS 要跑起来需要 DOM + fetch + 计时器，pytest 里跑不了（``js_chat``
+    那条同样的理由）。而这条 bug 的形状恰好是「失败回调里**少了一句**」——
+    少一句是源码能钉住的，跑不跑得起来反而不重要。
+
+    ## 它守的是什么后果
+
+    旧实现失败一次就不再装计时器，兜底是「用户切一次页签」——而正盯着面板
+    等授权的人不会切页签。于是：**授权还在库里、界面停在旧快照**，
+    那张卡看起来像没有了（lenses L2「闸门是状态不是约定」）。
+    """
+
+    @staticmethod
+    def _failure_branch() -> str:
+        body = _fn(JS_DELEGATE_LIVE_POLL, "pollLive")
+        assert "}, () => {" in body, (
+            "pollLive 的失败回调没了 —— 先看清这次改了什么再动断言"
+        )
+        return body.split("}, () => {", 1)[1]
+
+    def test_failure_arms_another_round(self):
+        """失败分支必须**再装一次**。没有这一句就是回到「读不到即永久停」，
+        而症状是「界面上没有卡了」—— 看起来像没人在等你批。"""
+        assert "armLive(" in self._failure_branch()
+
+    def test_backoff_is_bounded_and_ordered(self):
+        """退避**有界且递增**：无限重试在服务没起来时等于刷日志，
+        而「几秒就回」是本地服务的常态，所以档位短、次数少。"""
+        m = re.search(r"const LIVE_RETRY_SECS = \[([^\]]*)\]", JS_DELEGATE_LIVE_POLL)
+        assert m, "退避档位不见了"
+        waits = [int(x.strip()) for x in m.group(1).split(",") if x.strip()]
+        assert waits and waits == sorted(waits), f"退避档位不是递增的：{waits}"
+        assert "liveRetryIdx < LIVE_RETRY_SECS.length" in self._failure_branch(), (
+            "退避没有上界 —— 就成了无限重试"
+        )
+
+    def test_giving_up_is_said_out_loud_with_a_way_back(self):
+        """停可以，但**必须说出来**，并给一条回去的路。
+
+        悄悄停比报错更坏：人会把过期快照当成现状，于是「这张卡还等着我点」
+        变成一句错话。所以三件事都得在：说明不再重试、说明卡可能过期、给按钮。
+        """
+        fail = self._failure_branch()
+        assert "不再自动重试" in fail
+        assert "可能已经过期" in fail, "不说过期，人就会把旧快照当现状"
+        assert "点「重试」" in fail, "文案指了按钮，按钮本身在下面这条断言里"
+        assert 'el("button", "chip", "重试")' in JS_DELEGATE_LIVE_POLL
+
+    def test_foreground_wakes_the_panel(self):
+        """回前台立刻探一次：后台页签的计时器被节流到分钟级，
+        而「离开时在跑、回来才有卡」正是最该看一眼的时刻。"""
+        assert "visibilitychange" in JS_DELEGATE_LIVE_POLL
+        assert "pageshow" in JS_DELEGATE_LIVE_POLL, "bfcache 回来不触发 visibilitychange"
+        wake = _fn(JS_DELEGATE_LIVE_POLL, "liveWake")
+        assert "pollLive(" in wake, "唤醒了却没读一次"
+        assert "liveSecs === 0" in wake, (
+            "poll_seconds=0 是服务端明说「别轮询」，唤醒不能自己发明一次请求"
+        )
+
+    def test_visibility_listener_is_bound_once(self):
+        """监听只买一次：切页签会反复调 mountLivePanel，而 DOM 监听不随盒子
+        被摘掉而失效 —— 每挂载一次加一个，回来一趟就是 N 个并发请求。"""
+        bind = _fn(JS_DELEGATE_LIVE_POLL, "bindLiveVisibility")
+        assert "liveVisibilityBound" in bind and "return" in bind
+        assert "bindLiveVisibility();" in _fn(JS_DELEGATE_LIVE_POLL, "mountLivePanel"), (
+            "写了绑定函数却没在挂载时调用 —— 等于没有"
+        )
+
+    def test_next_round_is_a_chain_not_an_interval(self):
+        """自装下一次用 ``setTimeout``：一条链上只有一个在飞的请求。
+        ``setInterval`` + 请求在飞 = 重叠，两次响应会各自再装一次计时器。"""
+        arm = _fn(JS_DELEGATE_LIVE_POLL, "armLive")
+        assert "setTimeout" in arm and "setInterval" not in arm
+        # 句柄现在会装 timeout，停的时候必须两清（不依赖「共用 id 池」这条细节）。
+        assert "clearTimeout" in _fn(JS_DELEGATE_LIVE, "stopLivePoll")

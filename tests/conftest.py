@@ -30,6 +30,24 @@ from freeagent.services.executors import adapter_for
 from freeagent.services.sorting import EnergyWindows
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """注册 ``--run-mutants``。
+
+    **为什么要有这个开关**：变异探针会**改源码文件**（改完立刻还原）。
+    它证明守卫真的会咬，但代价是「跑全量的时候源码在变」——
+    而本仓有一条硬纪律：``test_doc_contract.py`` 用
+    ``inspect.getsource()`` **从磁盘现读**，一边改一边跑会读到别的函数
+    （实测报出 ``_cmd_llm`` 的源码是 ``_cmd_role``）。
+    所以默认跳过，要跑得显式开。
+    """
+    parser.addoption(
+        "--run-mutants",
+        action="store_true",
+        default=False,
+        help="跑变异探针（会临时改源码，跑完还原）",
+    )
+
+
 def _free_port() -> int:
     """借操作系统给一个当前没人用的端口。
 
@@ -94,6 +112,27 @@ def _pin_opencode_adapter_to_factory_default():
         opencode_server.set_current_adapter(factory)
 
 
+@pytest.fixture(autouse=True)
+def _no_online_search_leg(monkeypatch: pytest.MonkeyPatch):
+    """默认把在线检索腿关掉（V1.105 / 3.7.9）。
+
+    这条腿读**进程环境变量**（每次检索现读，故意不缓存）。于是开发者本机
+    一旦配了 ``FREEAGENT_ONLINE_SEARCH_URL``，所有走 ``/memory search`` 的
+    测试都会真的往外发一次查询 —— 症状是测试变慢、依赖网络，而在没配的
+    机器上（CI）**永远看不出来**。与 ``FREEAGENT_HOME`` 那条同一个理由：
+    要等真的配过才发作的坑，就该在默认状态里堵掉。
+
+    要测这条腿的用例自己 ``setenv`` 并注入 transport（永不联网）。
+    """
+    for name in (
+        "FREEAGENT_ONLINE_SEARCH_URL",
+        "FREEAGENT_ONLINE_SEARCH_TIMEOUT",
+        "FREEAGENT_ONLINE_SEARCH_MAX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    yield
+
+
 @pytest.fixture()
 def clock() -> FrozenClock:
     # 2026-09-26 是周六
@@ -126,3 +165,42 @@ def roles(app: App) -> dict:
 @pytest.fixture()
 def today(clock: FrozenClock) -> date:
     return clock.today()
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """跑完把「有多少条没验证」单独写一段，别让人把末行当全绿。
+
+    为什么需要它（V1.106）：本仓的跳过**全部是环境缺失**（没装 node 或
+    opencode），而 ``test_web_js_syntax.py`` 是唯一守 web 包 JS 语法的地方。
+    这类跳过在输出里只有 ``N passed, M skipped`` 里的一个小 M ——
+    人读到「passed」就收工，于是「这一路从没验证过」被记成了「通过」。
+
+    不改退出码：缺 node 的机器本来就跑不了，判红只会让人关掉这个守卫。
+    按 ``postmortem/lenses.md``「漏判代价远小于错判」——只让它看得见。
+
+    放在 conftest 而不是某个测试文件里：它要覆盖**每一次**运行。单文件跑时
+    也会打印，那时它说的是「这次只验证了这些」，仍然是事实。
+    """
+    skipped = list(terminalreporter.stats.get("skipped") or [])
+    if not skipped:
+        return
+
+    reasons: dict[str, int] = {}
+    for report in skipped:
+        raw = report.longrepr
+        if isinstance(raw, tuple) and len(raw) >= 3:
+            text = str(raw[2])
+        elif raw is not None:
+            text = str(raw).strip().splitlines()[-1]
+        else:
+            text = ""
+        text = text.removeprefix("Skipped: ").strip() or "（没有写明原因）"
+        reasons[text] = reasons.get(text, 0) + 1
+
+    terminalreporter.write_sep("!", f"本次有 {len(skipped)} 条测试没有验证")
+    for reason, count in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])):
+        terminalreporter.write_line(f"  {count} 条 · {reason}")
+    terminalreporter.write_line(
+        "  这些条件说的是「这台机器上缺什么」，不是「这条不重要」。"
+        "装上那个依赖再跑一次，才算验证过。"
+    )

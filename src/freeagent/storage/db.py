@@ -59,7 +59,13 @@ __all__ = [
 #: 29 → task_records.error_kind（引擎错误的结构化类别，V1.96）。
 #: 30 → retrieval_log + retrieval_hits（检索与注入的留痕，V1.98）。
 #: 31 → memory_reviews（记忆 review 队列的「确认」记录，V1.100）。
-SCHEMA_VERSION = 31
+#: 32 → decision_log（拍板当时的**快照**，V1.112）。
+#: 33 → workbench_turns（工作台的每一轮（21.4 / V1.115）：让「刚才那件事」
+#:      在重启之后还能点回去看 —— V1.114 只活在进程内存里）。
+#: 34 → workbench_turns.context_note（这一轮带了什么上下文（21.5 / V1.115）。
+#:      单独一版而不是塞进 v33：v33 的建表语句已经有人在盘上重放过一次的话，
+#:      改它的历史会让「同一个版本号两种形状」，而那种漂移查不出来。
+SCHEMA_VERSION = 34
 
 #: 按版本递增的迁移。**这里是「库的形状」唯一的写入口**：
 #: 新库也是从 v1 基线开始、逐版本重放这一串（见 :data:`_SCHEMA` 的注释），
@@ -528,6 +534,121 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
             created_at TEXT NOT NULL
         )
         """,
+    ),
+    (
+        "31 → 32：decision_log（拍板当时的快照，V1.112）",
+        # 单语句通道（``CREATE TABLE IF NOT EXISTS`` 自身幂等）—— 先例是
+        # v26 的 dispatch_leases、v31 的 memory_reviews，同一种「一张小表
+        # 记一件事」。
+        #
+        # ## 为什么这张表存的是**快照**而不是 task_id
+        #
+        # 19.5.4 要的是「带时间戳的认知快照：为什么买、当时什么价、
+        # 当时的判断依据，到期自动拉出来与现况对峙」。**「当时的」是硬要求** ——
+        # 若只存 task_id，对峙时会用**今天**的库去算「当时的代价对比」，
+        # 那份快照就会随事实变化而漂移（承诺兑现了、期限过了，代价就变了）。
+        # 快照必须是**落那一刻摆出来的原文**。
+        #
+        # 因此 ``options_json`` 存的是**结构化的冻结快照**，一个数组，
+        # 每项 ``{"task_id": ..., "title": ..., "facets": [{"text":..., "source":...}]}``：
+        # * ``facets`` 里的文本与出处是**落那一刻的原文**（逐字冻结）；
+        # * ``task_id`` 也在里面 —— 「现在」那一侧要靠它去查现况，
+        #   而**不能靠它重建当时的文本**（那会漂移）。
+        #
+        # **为什么是 JSON 而不是多张表 / 多列**：一个快照里的选项数是
+        # 1~3（``MAX_OPTIONS``），facet 数每项 2~4 —— 形状不定。
+        # 拆成子表会让「冻结一组选项」变成三次写入，而快照必须**一次写成**
+        # （半写进去的快照不是快照）。
+        #
+        # 刻意**不设外键、不做 ON DELETE CASCADE**：主人把事务删了，
+        # 这条决策**仍然成立**（他当时确实拍过那个板）—— 与
+        # ``memory_reviews`` 的孤儿先例同源。快照里的 ``task_id``
+        # 只用于**查现况**，查不到就如实说「已经不在库里了」。
+        """
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id            TEXT PRIMARY KEY NOT NULL,
+            chosen_index  INTEGER NOT NULL,   -- 选了第几个（0 基）
+            options_json  TEXT NOT NULL,      -- 冻结的选项清单（JSON 数组）
+            reason_text   TEXT NOT NULL,      -- 当时的对比理由（逐字冻结）
+            conflict_text TEXT NOT NULL,      -- 当时争的是哪一天
+            decided_at    TEXT NOT NULL,      -- 拍板时刻
+            confront_on   TEXT NOT NULL       -- 什么时候拉出来与现况对峙
+        )
+        """,
+    ),
+    (
+        "32 → 33：workbench_turns（工作台的每一轮，V1.115）",
+        # 单语句通道（``CREATE TABLE IF NOT EXISTS`` 自身幂等）—— 先例是
+        # v26 的 dispatch_leases、v31 的 memory_reviews、v32 的 decision_log。
+        #
+        # ## 为什么这一轮要落库
+        #
+        # V1.114 把每一轮只放在 ``AgentTurnService._turns`` 里（进程内存）。
+        # 后果是「关掉网页再打开，刚才那件事就没了」—— 而「能做过的活能点
+        # 回去看」正是工作台与「一次性对话框」的分界。审计（引擎侧执行细节）
+        # 仍然在 opencode 自己的会话里，这里记的是**人看得见的那一面**：
+        # 我说了什么、它回了什么、什么时候、在哪、用了哪个模型、停在哪一步。
+        #
+        # ## 为什么 ``status`` 里允许存 ``running``
+        #
+        # 写入是「先落一行 running，结束再 UPDATE」—— 因为一轮可能跑十分钟，
+        # 只在结束时写会让列表里长时间看不到它。代价是**进程被杀时库里会
+        # 剩一行 running**：那不是数据错误，是事实（那一轮确实没跑完）。
+        # 所以启动时由 ``WorkbenchTurnRepo.reap`` 把它们落成 ``failed`` 并写明
+        # 「FreeAgent 重启了」。不这么做的话，界面上会一直转着一个永远不会
+        # 结束的圈 —— 「看起来在工作」正是本仓最坏的失效形态。
+        #
+        # ## 为什么不设外键 / 不级联
+        #
+        # 这里没有「父表」：一轮不是事务的附属物（工作台刻意不建
+        # ``task_records``）。删目录也不会删记录 —— 记录的价值恰恰是
+        # 「我当时在那个目录里干了什么」。
+        #
+        # ## 为什么不带索引
+        #
+        # 读侧只有「最近 N 条」（一次 ``ORDER BY rowid DESC LIMIT``）与
+        # 「按 id 取一条」（主键）。量级由人的点击决定（一天几轮），
+        # 同 memory_reviews 的判断：一张小表不值得为它付索引维护。
+        #
+        # **定序用 rowid 而不是 ``started_at``**：两轮可能落在同一秒
+        # （连点两次「交给它」），而 ``started_at`` 是 ISO 秒级文本 ——
+        # 同刻用它定序等于随机排序（V1.113 修过两处同样的违规）。
+        """
+        CREATE TABLE IF NOT EXISTS workbench_turns (
+            id          TEXT PRIMARY KEY NOT NULL,
+            brief       TEXT NOT NULL,            -- 发出去的那一句（已折单行）
+            directory   TEXT NOT NULL,
+            model       TEXT NOT NULL DEFAULT '',
+            agent       TEXT NOT NULL DEFAULT '',
+            variant     TEXT NOT NULL DEFAULT '',
+            mode        TEXT NOT NULL,
+            status      TEXT NOT NULL,            -- 五态；重启前可能是 running
+            text        TEXT NOT NULL DEFAULT '', -- 引擎回的话（不含我的提问）
+            reason      TEXT NOT NULL DEFAULT '',
+            notes_json  TEXT NOT NULL DEFAULT '[]',
+            tools_json  TEXT NOT NULL DEFAULT '[]',
+            steps_json  TEXT NOT NULL DEFAULT '[]',
+            tool_calls  INTEGER NOT NULL DEFAULT 0,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT NOT NULL DEFAULT '',
+            elapsed     REAL NOT NULL DEFAULT 0,
+            ok          INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+    ),
+    (
+        "33 → 34：workbench_turns.context_note（这一轮带了什么上下文，V1.115）",
+        # 单独一版而不是并进 v33 的建表语句：v33 可能已经在某台机器上重放
+        # 过一次，改它的历史会让「同一个版本号两种形状」—— 这种漂移在
+        # 界面上看不出来，只会在用到那一列时炸（或更糟：静默缺值）。
+        #
+        # 存的是**给人看的一句说明**（「附带：今天的活 3 条、承诺 2 条」），
+        # 不是上下文原文：原文就在发给引擎的那一行里，存两份必然有一份过期。
+        #
+        # 空串 = 这一轮没带上下文（或那一版还没这个能力）—— 两者在界面上
+        # 说的是不同的话（见 agent_turn 的 ``context_note``）。
+        "ALTER TABLE workbench_turns ADD COLUMN context_note TEXT NOT NULL"
+        " DEFAULT ''",
     ),
 )
 

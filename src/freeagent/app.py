@@ -18,6 +18,7 @@ from .services.capability import CapabilityRouter, CapabilityView
 from .services.care import CareService
 from .services.chat import ChatService
 from .services.clock import Clock, SystemClock
+from .services.decision import DecisionService
 from .services.knowledge import KnowledgeService
 from .services.memory import MemoryService
 from .services.nudge import NudgeService
@@ -40,11 +41,13 @@ from .storage.repos import (
     CareRepo,
     ContactRepo,
     DailyDigestRepo,
+    DecisionLogRepo,
     LeaseRepo,
     PromiseRepo,
     RecordRepo,
     RoleRepo,
     TaskRepo,
+    WorkbenchTurnRepo,
 )
 
 __all__ = ["App", "build_app"]
@@ -79,6 +82,9 @@ class App:
     #: 人生角色关注面（11.24）。给角色定义「该周期性关心的东西」，
     #: 到点并进每日总览提醒 —— 持续责任，不是待办。
     care: CareService
+    #: 决策日志（7.6 / V1.112）。记一次拍板当时的快照，到期与现况对峙。
+    #: **只被呈现层读** —— 不参与任何权重、排序或倾向推断。
+    decision: DecisionService
     restore: RestoreService
     reminders: ReminderEngine
 
@@ -119,6 +125,18 @@ class App:
     #: （``check_same_thread=False`` 只解除了线程归属检查，不提供并发安全）。
     #: CLI 单线程用不到它；Web UI 的每个请求都必须持有它。
     lock: threading.RLock = field(default_factory=threading.RLock)
+    #: 常驻 OpenCode 宿主（21.1 / V1.114）。**懒建**：没打开工作台就不起引擎，
+    #: 打开网页不等于同意起一个会改文件的子进程。
+    #:
+    #: 声明成 ``Any`` 与 ``web_repl`` 同一个理由：``services`` 层不该为某个
+    #: 通道的会话对象付导入代价，实际类型由使用方（``web.endpoints_agent``）
+    #: 保证。
+    engine: Any = None
+    #: 工作台的一轮执行（21.3）。与 ``engine`` 同生 —— 它只驱动那个宿主。
+    agent_turns: Any = None
+    #: 工作台每一轮的行（21.4 / V1.115）。传给 ``agent_turns`` 做落库与回读；
+    #: 也是「重启之后还能点回去看」的唯一来源。声明成 ``Any`` 同 ``engine``。
+    turn_repo: Any = None
 
     @property
     def llm_name(self) -> str:
@@ -138,6 +156,18 @@ class App:
         self.reminders.set_quiet_hours(config.quiet_hours)
 
     def close(self) -> None:
+        # 引擎是**子进程 + 项目级配置覆盖层**两件都要收口的东西（21.1）。
+        # 放在这里而不是让调用方记得：漏一次，用户的项目里就留下一份
+        # ``opencode.jsonc`` 覆盖层，他自己在那个目录里跑 opencode 会莫名
+        # 被问授权 —— 而且没人会想到是 FreeAgent 留下的。
+        engine = self.engine
+        if engine is not None:
+            try:
+                engine.close()
+            except Exception:  # noqa: BLE001 - 收口失败不该挡住关库
+                pass
+            self.engine = None
+            self.agent_turns = None
         self.conn.close()
 
 
@@ -267,6 +297,10 @@ def build_app(
     promise_repo = PromiseRepo(conn)
     daily_digest_repo = DailyDigestRepo(conn)
     care_repo = CareRepo(conn)
+    decision_repo = DecisionLogRepo(conn)
+    #: 工作台每一轮（21.4 / V1.115）。它**只在这里建一次**：服务层拿它
+    #: 落库与回读，重启后的「收口」（残留 running → failed）也由它做。
+    turn_repo = WorkbenchTurnRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
     # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
@@ -306,6 +340,10 @@ def build_app(
     # 人生角色关注面（11.24 / V1.68）。拿角色仓储（校验角色存在 + 翻名字），
     # 不碰任务 —— 关注面不是事务。care_repo 只做存储，到期现算在服务里。
     care_service = CareService(care_repo, role_repo, the_clock)
+    # 决策日志（7.6 / V1.112）。拿任务仓储只是为了「现在」那一侧查现况 ——
+    # 「当时」那一侧是冻结快照，不查库。刻意不接审批服务：
+    # 本模块不读人的审批决策（11.9.11 第 ② 条）。
+    decision_service = DecisionService(decision_repo, task_repo, the_clock)
     # 今天视图**排在**承诺服务之后建：它要用承诺算「逾期未兑现」的权重
     # （11.19），所以得先有承诺服务才能给出那个查找回调。
     # 回调而不是直接依赖仓储 —— 见 TodayService.__init__ 的注释。
@@ -383,6 +421,7 @@ def build_app(
         promise=promise_service,
         nudge=nudge_service,
         care=care_service,
+        decision=decision_service,
         restore=restore_service,
         reminders=reminder_engine,
         chat=chat_service,
@@ -393,6 +432,7 @@ def build_app(
         record_repo=record_repo,
         artifact_repo=artifact_repo,
         daily_digests=daily_digest_repo,
+        turn_repo=turn_repo,
         energy_windows=energy_windows,
         quiet_hours=quiet_hours,
         config=the_config,

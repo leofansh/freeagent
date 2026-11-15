@@ -105,6 +105,13 @@ from freeagent.feishu.config import (  # noqa: E402
     ENV_DOMAIN,
     ENV_POLL,
 )
+#: 在线检索腿的三个变量（V1.105），同样从代码导入 —— 手册必须写，
+#: 因为「配了这个变量才生效」这件事只有手册能告诉用户。
+from freeagent.services.online_leg import (  # noqa: E402
+    ONLINE_MAX_ENV,
+    ONLINE_TIMEOUT_ENV,
+    ONLINE_URL_ENV,
+)
 
 EXPECTED_ENV_VARS = {
     cfg.API_KEY_ENV,
@@ -121,6 +128,11 @@ EXPECTED_ENV_VARS = {
     ENV_ALLOWED,
     ENV_DOMAIN,
     ENV_POLL,
+    # 在线检索可选腿（默认关闭，配了才生效）——不写进手册，
+    # 用户就永远不知道有这条路。
+    ONLINE_URL_ENV,
+    ONLINE_TIMEOUT_ENV,
+    ONLINE_MAX_ENV,
     # 各服务商的 Key 变量名**从注册表推导**，不逐个抄。
     # 抄的那份会漂 —— 加了 provider 忘了同步这里，手册就漏写一个变量名，
     # 用户照着设了却毫无效果。推导的来源和 llm.env 白名单是同一个函数，

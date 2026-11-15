@@ -38,7 +38,14 @@ let liveSig = "";
 let liveDrafts = {};
 
 function stopLivePoll() {
-  if (liveTimer !== null) { clearInterval(liveTimer); liveTimer = null; }
+  // V1.106 起这个句柄也装 ``setTimeout``（退避重试与自装下一次都走它）。
+  // 两者在浏览器里共用 id 池、互相能清，但**显式两清**不依赖那条实现细节 ——
+  // 依赖它的代码在别的宿主（老 Safari、node 里的假 DOM）上会静默不生效。
+  if (liveTimer !== null) {
+    clearTimeout(liveTimer);
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
 }
 
 // 面板元素还在文档里吗？切走页签时它被 replaceChildren 摘掉了，
