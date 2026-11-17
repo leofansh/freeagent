@@ -219,10 +219,28 @@ async function loadChat() {
   renderChatShell(null);
   try {
     const menu = await api("/api/chat");
+    if (view !== "chat") return;  // 切走了：旧 load 的回包不许盖新视图
     if (!history_.length) renderChatShell(menu);
   } catch (e) {
     addMsg("bot", "载入开场白失败：" + e.message, "kind-cannot", null, false);
   }
+  // 规则层降级要在首屏可见，不藏到设置页才说。判据用实现名而不是
+  // key_configured：Ollama 这类本机服务不需要 Key，凭据判据为真，
+  // 不该被误报成「未配置」。
+  try {
+    const h = await api("/api/health");
+    if (h.llm === "RuleBasedProvider") {
+      const bar = el("div", "note");
+      bar.style.marginBottom = "10px";
+      bar.appendChild(el("span", null,
+        "当前是规则层（离线）：能记事、排期、提醒；角色判断和草稿是模板。配置模型后启用智能回复。"));
+      const go = el("button", "btn", "去配置模型");
+      go.style.marginLeft = "10px";
+      go.onclick = () => load("settings");
+      bar.appendChild(go);
+      $("#chatlog").prepend(bar);
+    }
+  } catch (e) { /* 状态读不到不挡住对话 */ }
   loadVisionBar();
   chatPickPaint();  // 多选删除模式挂复选框；非选择模式时 no-op
 }

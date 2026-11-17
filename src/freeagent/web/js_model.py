@@ -104,5 +104,5 @@ async function renderModel(root) {
   }
 
   root.appendChild(el("div", "note",
-    "以上是从你的记录里现推的**事实**，不是评价 —— 要不要顺着它调整，由你决定。"));
+    "以上是从你的记录里现推的事实，不是评价 —— 要不要顺着它调整，由你决定。"));
 }"""

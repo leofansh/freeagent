@@ -34,12 +34,12 @@ function feishuVerdict(s) {
     const age = s.age_seconds == null ? "" :
       "（最后一次心跳在 " + Math.round(s.age_seconds) + " 秒前）";
     return ["状态已陈旧" + age,
-      "**这不等于它活着。** 进程被强杀时状态文件会留在盘上，" +
+      "这不等于它活着。进程被强杀时状态文件会留在盘上，" +
       "所以这里显示的是一份遗留记录，不是实时状态。重新起桥接即可。"];
   }
   if (s.state === "degraded") {
     return ["部分不可用",
-      "桥接在跑，但 bot 身份没探到 → **群里 @ 它不会回**（失败关闭）。" +
+      "桥接在跑，但 bot 身份没探到 → 群里 @ 它不会回（失败关闭）。" +
       "私聊不受影响。跑 doctor 看这一项：" +
       "python -m freeagent.feishu.doctor --live"];
   }
@@ -95,7 +95,7 @@ function feishuSeenSenders(s) {
   return box;
 }
 
-function renderFeishu(s, log, cfg, ctl) {
+function renderFeishu(s, log, cfg) {
   const root = $("#root");
   root.innerHTML = "";
 
@@ -150,10 +150,10 @@ function renderFeishu(s, log, cfg, ctl) {
   if (cfg) {
     const banner = feishuRestartBanner(cfg);
     if (banner) root.appendChild(banner);
-    // 用闭包把 s / log / ctl 绑上：保存回调只回传新配置，直接传 renderFeishu
+    // 用闭包把 s / log 绑上：保存回调只回传新配置，直接传 renderFeishu
     // 会让它把配置当成「状态」传进第一个参数，重绘出一团乱码。
     root.appendChild(feishuConfigForm(
-      cfg, (next) => renderFeishu(s, log, next, ctl)));
+      cfg, (next) => renderFeishu(s, log, next)));
   } else {
     root.appendChild(el("div", "note",
       "配置读不出来，所以改不了。下面是状态和日志。"));

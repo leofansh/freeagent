@@ -354,3 +354,14 @@ class RuleBasedProvider:
         ordered = sorted(signals, key=lambda s: -s.weight)
         parts = "、".join(f"{s.reason}（权重 {s.weight}）" for s in ordered[:3])
         return f"命中 {len(signals)} 条提示信号：{parts}。是否今天做由你决定。"
+
+    # -- 表达层 ------------------------------------------------------------- #
+    def phrase(
+        self, facts: Sequence[str], *, tone: str = ""
+    ) -> str | None:
+        """规则实现不组织措辞，返回 ``None`` 让上层回退模板。
+
+        与 :meth:`select_view` 同一条理由：离线 / 降级时行为退回到既有
+        规则模板，而不是在规则层另写一套会漂移的话术。
+        """
+        return None

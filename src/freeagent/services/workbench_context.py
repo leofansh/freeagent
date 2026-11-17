@@ -54,16 +54,26 @@ class ContextBrief:
     ok: bool = True
 
 
-def build_context(app: Any, query: str, *, limit_chars: int = MAX_CHARS) -> ContextBrief:
-    """把今天的事 / 未结清的承诺 / 相关记忆折成一行。
+def build_context(app: Any, query: str, *, limit_chars: int = MAX_CHARS,
+                  project_note: str = "") -> ContextBrief:
+    """把项目备注 / 今天的事 / 未结清的承诺 / 相关记忆折成一行。
 
     ``query`` 是用户那句话 —— 记忆按它检索（相关度，不是最近）。
+    ``project_note`` 是当前选中项目的备注（站立偏好，不是今天的事实），由
+    端点层从档案里读出来传入；服务层不直接碰档案表，保持一份读取入口。
     任何一段读不出来：其余段照常带，``note`` 里写明哪一段没读到、
     为什么（fail-soft 但**说出来**，不静默降级）。
     """
     parts: list[str] = []
     counts: list[str] = []
     problems: list[str] = []
+
+    # 备注可能带换行 / 多段空格：折进上下文前压成单行（多行 prompt 会被
+    # opencode 升级成复杂任务，与下面「只出一行」同一条纪律）。
+    note_text = " ".join(str(project_note or "").split())
+    if note_text:
+        parts.append("项目备注：" + note_text)
+        counts.append("项目备注 1 段")
 
     tasks, task_problem = _today_tasks(app)
     if task_problem:

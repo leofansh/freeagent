@@ -65,7 +65,9 @@ __all__ = [
 #: 34 → workbench_turns.context_note（这一轮带了什么上下文（21.5 / V1.115）。
 #:      单独一版而不是塞进 v33：v33 的建表语句已经有人在盘上重放过一次的话，
 #:      改它的历史会让「同一个版本号两种形状」，而那种漂移查不出来。
-SCHEMA_VERSION = 34
+#: 35 → workbench_projects（工作台项目档案：命名目录 + 可选备注，V1.124）。
+#:      目录唯一约束：同一个本地文件夹不重复建档；删项目只删档案，不碰磁盘。
+SCHEMA_VERSION = 35
 
 #: 按版本递增的迁移。**这里是「库的形状」唯一的写入口**：
 #: 新库也是从 v1 基线开始、逐版本重放这一串（见 :data:`_SCHEMA` 的注释），
@@ -649,6 +651,38 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         # 说的是不同的话（见 agent_turn 的 ``context_note``）。
         "ALTER TABLE workbench_turns ADD COLUMN context_note TEXT NOT NULL"
         " DEFAULT ''",
+    ),
+    (
+        "34 → 35：workbench_projects（工作台项目档案，V1.124）",
+        # 单语句通道（``CREATE TABLE IF NOT EXISTS`` 自身幂等）—— 先例是
+        # v33 的 workbench_turns。
+        #
+        # ## 项目是什么
+        #
+        # 项目是「一个被命名的工作目录 + 一句可选备注」，是工作台的上下文归属
+        # 单位，不是聊天归档。`directory` 存**解析后的绝对路径**，入库前由
+        # `engine_host.resolve_workdir()` 现校验；表里登记不等于免校验 ——
+        # 每次开一轮仍重新解析（目录可能被移动或删除）。
+        #
+        # ## 为什么目录唯一
+        #
+        # 同一个本地文件夹建两个项目，界面上会出现两行指向同一处，授权边界
+        # 说不清；建档按目录幂等，重复选用只是刷新 `last_used_at`。
+        #
+        # ## 为什么不带外键、不级联
+        #
+        # 与 workbench_turns 同一条纪律：删项目只删这份档案，磁盘目录与历史
+        # 轮次都不动 —— 历史的价值恰恰是「我当时在那个目录里干了什么」。
+        """
+        CREATE TABLE IF NOT EXISTS workbench_projects (
+            id           TEXT PRIMARY KEY NOT NULL,
+            name         TEXT NOT NULL,
+            directory    TEXT NOT NULL UNIQUE,
+            note         TEXT NOT NULL DEFAULT '',
+            created_at   TEXT NOT NULL,
+            last_used_at TEXT NOT NULL
+        )
+        """,
     ),
 )
 

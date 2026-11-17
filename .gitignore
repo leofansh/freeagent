@@ -42,5 +42,8 @@ config.json
 # 与上面 .omo/ 同理：存的是会话与时间戳，对项目没有价值。
 .workbuddy/
 
-# tests/manual/e2e_browser_smoke.py 每次冒烟都会重新生成的截图。
+# tests/manual/ 冒烟脚本每次重新生成的截图与临时运行目录。
 e2e_final.png
+wb_smoke.png
+tests/manual/shots/
+.smoke/

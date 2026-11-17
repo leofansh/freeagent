@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -125,6 +126,26 @@ def _scan() -> dict[str, list[tuple[int, str]]]:
     )
 
 
+def _powershell_argv() -> list[str]:
+    """解析可用的 PowerShell 可执行文件。
+
+    起 Web 的进程 PATH 可能被裁掉 ``System32\\WindowsPowerShell\\v1.0``，
+    直接 ``["powershell", …]`` 会抛 ``WinError 2``（进程扫描失败的环境类
+    红点）。所以先拼系统盘绝对路径，再退回 PATH 上的 ``powershell`` /
+    ``pwsh``；三个都不可用才退回名字本身 —— 起不起来仍由调用方拦成
+    ``ServiceRefused``，扫描方向保持 fail-closed。
+    """
+    sys_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    absolute = Path(sys_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if absolute.is_file():
+        return [str(absolute)]
+    for name in ("powershell", "pwsh"):
+        found = shutil.which(name)
+        if found:
+            return [found]
+    return ["powershell"]
+
+
 def _scan_windows() -> dict[str, list[tuple[int, str]]]:
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
@@ -132,7 +153,7 @@ def _scan_windows() -> dict[str, list[tuple[int, str]]]:
     )
     try:
         proc = subprocess.run(  # noqa: S603 - argv 固定，无用户输入
-            ["powershell", "-NoProfile", "-Command", script],
+            [*_powershell_argv(), "-NoProfile", "-Command", script],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=30, shell=False,
         )

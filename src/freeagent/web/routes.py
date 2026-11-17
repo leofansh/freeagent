@@ -106,6 +106,7 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     # 最近的活（21.4 / V1.115）。同样只读：列一张表不该起引擎。
     "/api/agent/turns": endpoints_agent.agent_turns_list,
     "/api/agent/dirs": endpoints_agent_workspace.agent_dirs,
+    "/api/agent/projects": endpoints_agent_workspace.agent_projects,
     "/api/today": lambda app, q: serialize.today_payload(
         app.today.view(),
         endpoints_read.role_names(app),

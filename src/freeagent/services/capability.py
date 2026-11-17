@@ -34,6 +34,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from .chat import ChatReply, ChatReplyKind
 
 __all__ = [
@@ -83,6 +85,16 @@ _MENU_HINT = (
     "（这句话我得问模型才懂，而模型现在没连上 —— 所以不猜。"
     "命令清单在 /help，网页那边有按钮）"
 )
+
+#: 寒暄的封闭说法集合。这是能力话题里**唯一**允许规则层直接接的一类：
+#: 招呼词本身是闭合的（不需要模型理解语义），其余能力话题一旦用规则猜，
+#: 就会退回第一版「自信的错误答案」老路（见模块 docstring）。
+#: 变体只认「招呼词 + 语气词 / 标点」，夹带正事的句子不在这里接 ——
+#: 否则「你好，下周二交周报」会被一句招呼抢走，记事被丢掉。
+_GREETING_PHRASES = frozenset({
+    "你好", "您好", "哈喽", "嗨", "在吗", "在不在", "你好吗", "hi", "hello",
+})
+_GREETING_TRIM = " 　，。！？!?~～、,.啊啊呀呢哦吧嘛"
 
 
 class CapabilityView:
@@ -158,12 +170,26 @@ class CapabilityRouter:
     def try_route(self, text: str, view: CapabilityView) -> ChatReply | None:
         """这句话在问能力吗？是就答，不是就闭嘴（返回 ``None``）。"""
         stripped = text.strip()
-        if not stripped or view is None or not self.llm_available:
+        if not stripped or view is None:
+            return None
+        # 寒暄先走规则封闭集：离线 / 规则层也能回一句招呼，不至于把
+        # 「你好」落进澄清卡。除招呼外的话题仍要过下面的 ``llm_available`` 闸。
+        if self._is_greeting(stripped):
+            return self._greeting(view)
+        if not self.llm_available:
             return None
         picked = self._ask_llm(stripped)
         if picked is not None:
             return self._render(picked, view)
         return self._fallback_route(stripped, view)
+
+    @staticmethod
+    def _is_greeting(text: str) -> bool:
+        """这句话是不是纯粹的招呼（封闭词 + 语气 / 标点变体）。"""
+        low = text.casefold()
+        if low in _GREETING_PHRASES:
+            return True
+        return low.strip(_GREETING_TRIM) in _GREETING_PHRASES
 
     def _fallback_route(self, text: str, view: CapabilityView) -> ChatReply | None:
         """能力话题没命中时的兜底 —— **不是猜，是换一个问题问**。
@@ -314,15 +340,41 @@ class CapabilityRouter:
             "can_do": self._can_do,
         }.get(topic, self._can_do)(view)
 
+    def _phrase(self, facts: Sequence[str], *, tone: str = "") -> str | None:
+        """表达层：让模型把规则算死的事实卡片说成人话。
+
+        模型给不出（离线 / 出错 / 没这个方法 / 空串）一律回 ``None``，
+        上层回退模板 —— 不猜、不编。替身 provider 可能没实现 ``phrase``，
+        所以用 ``getattr`` 探测，不假定协议方法都在。
+        """
+        llm = self._llm
+        if llm is None:
+            return None
+        phrase = getattr(llm, "phrase", None)
+        if phrase is None:
+            return None
+        try:
+            out = phrase(facts, tone=tone)
+        except Exception:
+            return None
+        return out if isinstance(out, str) and out.strip() else None
+
     def _greeting(self, view: CapabilityView) -> ChatReply:
-        lines = ["我在。"]
-        if view.enabled:
-            names = view.labels()
-            lines.append(f"现在能改这 {len(names)} 个：{'、'.join(names)}")
-        else:
-            lines.append("（还没授权任何项目，所以改代码那条路暂时不可用）")
-        lines.append("说一件事我就记下来；问「今天」我给你清单。")
-        return ChatReply(ChatReplyKind.ANSWER, "\n".join(lines))
+        """招呼只承接 + 给出路，不摆工程清单。
+
+        事实卡片由规则给死，表达层只负责把它说自然。授权项目是
+        「有哪些项目」话题的明细，寒暄时摆出来既和当下这句话无关，
+        又把内部目录名直接上屏；清单留在 ``_projects`` / ``_can_do``。
+        模型给不出合格措辞时回退下面这句模板。
+        """
+        facts = (
+            "可以直接说一件事，我帮你记下来",
+            "问「今天」，我给你今天的清单",
+        )
+        text = self._phrase(facts, tone="招呼") or (
+            "你好！说一件事我就记下来；问「今天」我给你清单。"
+        )
+        return ChatReply(ChatReplyKind.ANSWER, text)
 
     def _projects(self, view: CapabilityView) -> ChatReply:
         if not view.projects:

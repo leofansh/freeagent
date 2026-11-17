@@ -89,6 +89,10 @@ function wbPaint(st) {
   const eng = st.engine || null;
   const turn = st.turn;
   wbTurn = turn;
+  // 按钮可用态随状态走：没在跑就停不掉，上一轮没完再发只会吃到「还在跑」。
+  const live = !!(turn && (turn.status === "running" || turn.status === "waiting"));
+  const stopBtn = $("#wb-stop"); if (stopBtn) stopBtn.disabled = !live;
+  const sendBtn = $("#wb-send"); if (sendBtn) sendBtn.disabled = live;
 
   const engBox = $("#wb-engine");
   // 只画「现在这台引擎」：点开一条历史时 st.engine 是空的，
@@ -116,7 +120,7 @@ function wbPaint(st) {
   }
   if (!turn) {
     stream.appendChild(el("div", "note",
-      "还没有跑过。选好目录和模型，说一句话 —— 要不要交给引擎由它自己判断。"));
+      "还没有跑过。选好项目和模型，说一句话 —— 要不要交给引擎由它自己判断。"));
     return;
   }
   stream.appendChild(el("div", "note",
@@ -153,19 +157,19 @@ function wbPaint(st) {
   }
   // 「它碰过哪些文件 / 跑了哪些命令」（V1.116）。**命令这一列是安全项**：
   // 自动档下命令不弹卡，界面上再不说，人只能翻引擎自己的日志才能知道
-  // 刚刚发生了什么。全部走 textContent —— 命令与路径都是模型给的原文。
+  // 刚刚发生了什么。命令与路径都是模型给的原文，先过 esc 再渲染（V1.117）。
   const files = turn.files || [];
   const cmds = turn.commands || [];
   if (files.length) {
     const box = el("div", "card");
     box.appendChild(el("div", "row1", "碰过的文件（" + files.length + "）"));
-    files.forEach((f) => box.appendChild(el("div", "note", f)));
+    files.forEach((f) => box.appendChild(el("div", "note", esc(f))));
     stream.appendChild(box);
   }
   if (cmds.length) {
     const box = el("div", "card");
     box.appendChild(el("div", "row1", "它跑过的命令（" + cmds.length + "）"));
-    cmds.forEach((c) => box.appendChild(el("div", "note", "$ " + c)));
+    cmds.forEach((c) => box.appendChild(el("div", "note", "$ " + esc(c))));
     stream.appendChild(box);
   }
   // 失败 / 被叫停之后给一条「下一步」：**填回输入框而不是替人重发** ——

@@ -38,7 +38,7 @@ from .opencode_server import OpenCodeServer, ServerError, auto_dir_permission_co
 log = logging.getLogger(__name__)
 
 __all__ = ["EngineHost", "EngineState", "ENGINE_ASK", "ENGINE_AUTO_DIR", "STOPPED",
-           "STARTING", "READY", "ERROR"]
+           "STARTING", "READY", "ERROR", "resolve_workdir"]
 
 #: 逐次授权（默认）。写文件、跑命令都要人点一下。
 ENGINE_ASK = "ask"
@@ -47,6 +47,31 @@ ENGINE_ASK = "ask"
 ENGINE_AUTO_DIR = "auto_dir"
 
 _MODES = (ENGINE_ASK, ENGINE_AUTO_DIR)
+
+
+def resolve_workdir(directory: str) -> str:
+    """校验并解析工作目录，返回**绝对**路径；不合规抛 :class:`ValueError`。
+
+    这是「工作目录」唯一的判定点（21.1）：相对路径的解析基准随通道而变
+    （终端在仓库根、Web 在服务进程 cwd），闸门按服务启动时的 cwd 判，
+    「以为在 A、其实在 B」等于闸门判错了地方。只收绝对路径，最坏是一句
+    能读懂的错误。前台端点在起线程之前调它 —— 不让一个坏目录先落库、
+    再起一轮后台失败。
+    """
+    path = pathlib.Path(directory).expanduser()
+    if not path.is_absolute():
+        raise ValueError(
+            f"工作目录必须是绝对路径（收到 {directory!r}）—— "
+            "相对路径在不同通道下会指到不同地方，闸门就判错了目录"
+        )
+    try:
+        resolved = str(path.resolve())
+    except OSError as exc:  # pragma: no cover - 平台差异兜底
+        raise ValueError(f"工作目录解析失败：{path}（{exc}）") from exc
+    if not pathlib.Path(resolved).is_dir():
+        raise ValueError(f"工作目录不存在或不是目录：{resolved}")
+    return resolved
+
 
 STOPPED = "stopped"
 STARTING = "starting"
@@ -138,18 +163,7 @@ class EngineHost:
                 f"未知的授权档 {mode!r}（可选：{' / '.join(_MODES)}）"
                 "—— 不猜，也不悄悄退回逐次授权"
             )
-        path = pathlib.Path(directory).expanduser()
-        if not path.is_absolute():
-            raise ValueError(
-                f"工作目录必须是绝对路径（收到 {directory!r}）—— "
-                "相对路径在不同通道下会指到不同地方，闸门就判错了目录"
-            )
-        try:
-            resolved = str(path.resolve())
-        except OSError as exc:  # pragma: no cover - 平台差异兜底
-            raise ValueError(f"工作目录解析失败：{path}（{exc}）") from exc
-        if not pathlib.Path(resolved).is_dir():
-            raise ValueError(f"工作目录不存在或不是目录：{resolved}")
+        resolved = resolve_workdir(directory)
 
         with self._lock:
             if (

@@ -111,15 +111,16 @@ class TestReplyActuallyClarifies:
         assert len(app.tasks.list_all()) == before, (
             "「你好」不该建事务 —— 这正是真库 0277e93d/0fbbdb13 的成因"
         )
-        assert reply.kind is ChatReplyKind.CLARIFY, (
-            f"应当反问，实际 {reply.kind}"
-        )
+        # V1.122 起纯招呼由规则层平行入口接住，回问候答复；不再落澄清卡。
+        assert reply.kind is ChatReplyKind.ANSWER
+        assert "记下来" in reply.text
         app.close()
 
     def test_clarify_offers_both_read_and_write(self, svc):
         """分不清他要读还是要记，就**两个都给**，别替他决定。"""
         app, chat = svc
-        reply = chat.respond("你好")
+        # 用非招呼的短句「收到」走澄清卡 —— 「你好」已由问候入口接走。
+        reply = chat.respond("收到")
         joined = " ".join(reply.suggestions or ())
         assert "记一件事" in joined, reply.suggestions
         assert any(k in joined for k in ("今天", "全部未结束")), reply.suggestions

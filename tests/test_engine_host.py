@@ -79,6 +79,23 @@ def _effects(cfg: dict) -> dict[str, str]:
     return {r["action"]: r["effect"] for r in cfg.get("permissions", [])}
 
 
+class TestResolveWorkdir:
+    """目录校验的唯一入口（21.1）：端点与宿主都过它，规则不抄第二份。"""
+
+    def test_existing_dir_resolves_to_absolute(self, tmp_path) -> None:
+        out = host_mod.resolve_workdir(str(tmp_path))
+        assert pathlib.Path(out).is_absolute()
+        assert pathlib.Path(out).is_dir()
+
+    def test_relative_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="绝对路径"):
+            host_mod.resolve_workdir("src")
+
+    def test_missing_is_refused(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="不存在或不是目录"):
+            host_mod.resolve_workdir(str(tmp_path / "nope"))
+
+
 class TestEnsure:
     def test_first_ensure_spawns_one_server(self, host, tmp_path) -> None:
         session = host.ensure(directory=str(tmp_path))

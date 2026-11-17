@@ -23,6 +23,7 @@ from .js_chat import JS_CHAT
 from .js_chat_select import JS_CHAT_SELECT
 from .js_chat_store import JS_CHAT_STORE
 from .js_core import JS_CORE
+from .js_nav import JS_NAV
 from .js_detail import JS_DETAIL
 from .js_contacts import JS_CONTACTS
 from .js_promises import JS_PROMISES
@@ -43,20 +44,26 @@ from .js_settings_llm import JS_SETTINGS_LLM
 from .js_vision import JS_VISION
 from .js_workbench import JS_WORKBENCH
 from .js_workbench_card import JS_WORKBENCH_CARD
+from .js_workbench_dirs import JS_WORKBENCH_DIRS
+from .js_workbench_projects import JS_WORKBENCH_PROJECTS
 from .js_workbench_page import JS_WORKBENCH_PAGE
 from .markup import PAGE_MARKUP
 from .style import STYLE_CSS
+from .style_nav import STYLE_NAV_CSS
 
 __all__ = ["INDEX_HTML"]
 
 INDEX_HTML = (
     PAGE_MARKUP
-    + "<style>\n" + STYLE_CSS + "\n</style>\n"
+    + "<style>\n" + STYLE_CSS + "\n" + STYLE_NAV_CSS + "\n</style>\n"
     + "<script>\n"
     # 顺序要紧：core 提供 helper，vision/chat 依赖它，boot 最后接线并启动。
     + "\n\n".join(
         (
             JS_CORE,
+            # nav 提供「更多」下拉开合与 MENU_VIEWS；boot 的 load() 引用
+            # closeMore / MENU_VIEWS，所以排在 boot 之前（同一块脚本内运行期调用）。
+            JS_NAV,
             JS_VISION,
             # chat_store 提供 chatDay/chatLoad/chatSave/clearHistory 与
             # lastItemIds —— JS_CHAT 与 JS_CHAT_SELECT 都直接用它们，
@@ -124,6 +131,8 @@ INDEX_HTML = (
             # （boot 会调 wbStopPoll / loadWorkbench）。
             JS_WORKBENCH,
             JS_WORKBENCH_CARD,
+            JS_WORKBENCH_DIRS,
+            JS_WORKBENCH_PROJECTS,
             JS_WORKBENCH_PAGE,
             JS_BOOT,
         )

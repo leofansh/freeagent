@@ -1,59 +1,20 @@
-"""工作台前端（三）：页面装配、目录与模型选择（设计文档 21.4 / V1.114）。
+"""工作台前端（三）：页面装配与模型清单（设计文档 21.4 / V1.114）。
 
-## 目录浏览为什么只到「点」为止
-
-列目录的端点在服务端也守着同一条纪律（只列目录、最多 300 项）。这里再守
-一次是因为**人**会连点：`node_modules` 一个目录展开就上千项，而它真正需要
-的只是「往上两层、进 src」。
+目录浏览独立在 ``js_workbench_dirs``（250 行体积守卫逼出来的拆块）；本文件
+只装配卡片、模型清单与发送区。
 
 ## 反斜杠不写成字面量
 
-路径分隔符用 ``String.fromCharCode(92)`` 拼 —— 这段 JS 活在一个
-``r\"\"\"...\"\"\"`` 里，字面反斜杠紧贴引号会变成 ``\\"``，浏览器侧直接语法错误
-（``test_web_js_syntax`` 的 ``test_no_escaped_quotes_leaked_into_js`` 咬的
-就是这个）。
+路径分隔符相关的拼法在 ``js_workbench_dirs``；这段文件里不拼路径，注释留
+在这里是提醒后来者：JS 活在 ``r\"\"\"...\"\"\"`` 里，字面反斜杠紧贴引号会
+变成 ``\\"``，浏览器侧直接语法错误。
 """
 
 from __future__ import annotations
 
 __all__ = ["JS_WORKBENCH_PAGE"]
 
-JS_WORKBENCH_PAGE = r"""async function wbBrowse(path) {
-  const box = $("#wb-dirs");
-  if (!box) return;
-  box.textContent = "读目录…";
-  let data;
-  try {
-    data = await api("/api/agent/dirs?path=" + encodeURIComponent(path || ""));
-  } catch (e) {
-    box.textContent = "读不出来：" + e.message;
-    return;
-  }
-  box.innerHTML = "";
-  box.appendChild(el("div", "note", esc(data.path) +
-    (data.truncated ? "（只列前 " + data.items.length + " 个，共 " + data.total + "）" : "")));
-  const sel = el("select");
-  sel.id = "wb-dir-pick";
-  if (data.parent) {
-    const up = el("option", null, ".. 上一级");
-    up.value = data.parent;
-    sel.appendChild(up);
-  }
-  const seg = data.path.indexOf(String.fromCharCode(92)) >= 0
-    ? String.fromCharCode(92) : "/";
-  data.items.forEach((name) => {
-    const o = el("option", null, name);
-    o.value = (data.path.endsWith(seg) ? data.path : data.path + seg) + name;
-    sel.appendChild(o);
-  });
-  sel.onchange = () => {
-    $("#wb-dir").value = sel.value;
-    wbBrowse(sel.value);
-  };
-  box.appendChild(sel);
-}
-
-async function wbModels() {
+JS_WORKBENCH_PAGE = r"""async function wbModels() {
   const list = $("#wb-models");
   if (!list) return;
   list.textContent = "读模型清单…";
@@ -73,7 +34,7 @@ async function wbModels() {
   });
   if (!opts.length) {
     list.appendChild(el("div", "note",
-      "清单是空的" + (data.model && data.model.note ? "：" + data.model.note : "") +
+      "清单是空的" + (data.model && data.model.note ? "：" + esc(data.model.note) : "") +
       "。可以手填模型名，或留空用引擎默认。"));
   }
 }
@@ -92,16 +53,72 @@ async function loadWorkbench() {
   const prefs = st.prefs || {};
 
   const bar = el("div", "card");
-  bar.appendChild(el("div", "row1", "工作目录"));
+
+  // 项目选择器（21.6 / V1.124）：触发芯片 + 下拉（搜索 / 已有项目 / 三个动作）。
+  // 文件系统浏览退到二级，由「选择本地文件夹」与新建表单里的浏览按钮打开。
+  const pmenu = el("div", "menu");
+  const pbtn = el("button", "btn", "项目：未选择");
+  pbtn.id = "wb-project-btn";
+  pbtn.onclick = () => wbToggleMenu();
+  const pop = el("div", "menu-pop");
+  pop.id = "wb-project-menu";
+  pop.hidden = true;
+  const search = el("input");
+  search.id = "wb-project-filter";
+  search.placeholder = "搜索项目…";
+  search.oninput = wbRenderProjectMenu;
+  pop.appendChild(search);
+  const list = el("div");
+  list.id = "wb-project-list";
+  pop.appendChild(list);
+  const clearBtn = el("button", "btn", "不使用项目");
+  clearBtn.onclick = () => wbSelectProject("");
+  const newBtn = el("button", "btn", "新建项目");
+  newBtn.onclick = wbShowForm;
+  const folderBtn = el("button", "btn", "选择本地文件夹");
+  folderBtn.onclick = wbBrowseImport;
+  pop.appendChild(clearBtn);
+  pop.appendChild(newBtn);
+  pop.appendChild(folderBtn);
+  pmenu.appendChild(pbtn);
+  pmenu.appendChild(pop);
+  bar.appendChild(pmenu);
+
+  // 新建项目表单：名称 / 备注 / 目录。目录仍走二级浏览面板，选定回填。
+  const form = el("div", "card");
+  form.id = "wb-project-form";
+  form.hidden = true;
+  const name = el("input");
+  name.id = "wb-form-name";
+  name.placeholder = "项目名（留空取目录末段）";
+  form.appendChild(name);
+  const note = el("input");
+  note.id = "wb-form-note";
+  note.placeholder = "备注（可选）";
+  form.appendChild(note);
+  const dline = el("div", "note");
+  dline.id = "wb-form-dir";
+  form.appendChild(dline);
+  const formBrowse = el("button", "btn", "浏览选目录");
+  formBrowse.onclick = wbBrowseFormDir;
+  const submit = el("button", "btn primary", "创建");
+  submit.onclick = wbSubmitProject;
+  const cancel = el("button", "btn", "取消");
+  cancel.onclick = () => { form.hidden = true; };
+  const formRow = el("div", "row1");
+  formRow.appendChild(formBrowse);
+  formRow.appendChild(submit);
+  formRow.appendChild(cancel);
+  form.appendChild(formRow);
+  bar.appendChild(form);
+
+  // 隐藏目录框：wbSend 仍读它取当前项目目录，发送链路不改。
   const dir = el("input");
+  dir.type = "hidden";
   dir.id = "wb-dir";
   dir.value = prefs.directory || "";
-  dir.placeholder = "绝对路径，例如 D:/projects/my-app";
-  dir.style.width = "60%";
   bar.appendChild(dir);
-  const browse = el("button", "btn", "浏览");
-  browse.onclick = () => wbBrowse(dir.value.trim());
-  bar.appendChild(browse);
+  wbInitProjects(st);
 
   bar.appendChild(el("div", "row1", "模型"));
   const model = el("input");
@@ -131,11 +148,12 @@ async function loadWorkbench() {
   // 留下原文。不写这句，人会以为「自动档 = 它做了什么都有人点过头」。
   bar.appendChild(el("div", "note",
     "自动档下跑命令不会弹卡，但每一条都会列在「它跑过的命令」里；" +
-    "换档只对**下一轮**生效，这一轮仍按开始时的那一档。"));
+    "换档只对下一轮生效，这一轮仍按开始时的那一档。"));
   root.appendChild(bar);
 
   const dirs = el("div", "note");
   dirs.id = "wb-dirs";
+  dirs.hidden = true;
   root.appendChild(dirs);
   const models = el("div", "row1");
   models.id = "wb-models";
@@ -147,6 +165,11 @@ async function loadWorkbench() {
   ta.rows = 3;
   ta.placeholder = "一句话：改哪个文件、修什么、跑什么。别换行 —— 含换行会让引擎升级它自己的模型。";
   ta.style.width = "100%";
+  // 回车直接发出（Shift+回车才换行）：占位文案已经说「别换行」，再让人
+  // 去摸鼠标点按钮是多一步。与对话页同一个键位惯例（js_chat）。
+  ta.onkeydown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); wbSend(false); }
+  };
   ask.appendChild(ta);
   // 带上「今天的事 / 承诺 / 相关记忆」（21.5 / V1.115）。默认开 —— 但
   // 开关必须看得见：它把这台机器上的私人记录送进模型，人有权当场关掉，
@@ -161,9 +184,11 @@ async function loadWorkbench() {
     " 带上今天的事、未结清的承诺与相关记忆（会显示它带了什么）"));
   ask.appendChild(injectRow);
   const send = el("button", "btn primary", "交给它");
+  send.id = "wb-send";
   send.onclick = () => wbSend(false);
   ask.appendChild(send);
   const stop = el("button", "btn danger", "停止");
+  stop.id = "wb-stop";
   stop.onclick = async () => {
     const t = wbTurn;
     if (!t) return;

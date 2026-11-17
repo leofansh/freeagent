@@ -113,6 +113,20 @@ class TestDirs:
         with pytest.raises(FreeAgentError, match="绝对路径"):
             endpoints_agent_workspace.agent_dirs(_app(tmp_path), {"path": ["src"]})
 
+    def test_places_and_drives_are_browsing_starts(self, tmp_path):
+        """快捷位置与盘符只是浏览起点：路径必须真实存在，不是白名单。"""
+        import pathlib
+
+        data = endpoints_agent_workspace.agent_dirs(
+            _app(tmp_path), {"path": [str(tmp_path)]})
+        assert data["places"][0]["label"] == "家目录"
+        assert data["places"][0]["path"] == str(pathlib.Path.home())
+        for place in data["places"]:
+            assert pathlib.Path(place["path"]).is_dir()
+        assert data["drives"], "至少要有一个可浏览的根"
+        for root in data["drives"]:
+            assert pathlib.Path(root).is_dir()
+
 
 class TestStart:
     def test_no_directory_is_refused(self, tmp_path):
@@ -152,6 +166,26 @@ class TestStart:
              "force": True}, turns)
         assert data["routed"] is True
         assert "强制" in data["decision"]["reason"], "推翻规则必须留痕"
+
+    def test_relative_directory_is_refused_before_a_turn(self, tmp_path):
+        """相对路径在起线程前就挡下 —— 不先落库、不起一轮后台失败。"""
+        turns = _FakeTurns()
+        app = _app(tmp_path, turns)
+        with pytest.raises(FreeAgentError, match="绝对路径"):
+            endpoints_agent_workspace.agent_start(
+                app, {"text": "把 src/app.py 改一下", "directory": "src"}, turns)
+        assert turns.started == []
+        assert endpoints_agent_workspace.load_prefs(app) == {}
+
+    def test_nonexistent_directory_is_refused_before_a_turn(self, tmp_path):
+        missing = str(tmp_path / "no-such-dir")
+        turns = _FakeTurns()
+        app = _app(tmp_path, turns)
+        with pytest.raises(FreeAgentError, match="不存在或不是目录"):
+            endpoints_agent_workspace.agent_start(
+                app, {"text": "改一下里面的代码", "directory": missing}, turns)
+        assert turns.started == []
+        assert endpoints_agent_workspace.load_prefs(app) == {}
 
 
 class TestContextInjection:
@@ -196,6 +230,35 @@ class TestContextInjection:
                   "directory": str(tmp_path)}, turns)
         assert "写周报" in turns.started[0]["context"]
         assert "今天的活 1 条" in turns.started[0]["context_note"]
+
+
+class TestProjectNoteInjection:
+    """选中项目的备注折进上下文（21.5.2 / V1.125）。"""
+
+    def test_selected_project_note_is_carried(self, app, tmp_path):
+        turns = _FakeTurns()
+        directory = str(tmp_path)
+        row = app.project_repo.register(
+            directory=directory, name="demo", note="先跑通再美化",
+            now=app.clock.now())
+        endpoints_agent_workspace.save_prefs(
+            app, {"directory": directory, "project_id": row["id"], "mode": "ask"})
+        endpoints_agent_workspace.agent_start(
+            app, {"text": "改一下里面的代码", "directory": directory}, turns)
+        call = turns.started[0]
+        assert "先跑通再美化" in call["context"]
+        assert "项目备注 1 段" in call["context_note"]
+
+    def test_archive_gone_note_is_absent(self, app, tmp_path):
+        # 偏好指向已删档案：不带备注，也不许把「读不到」说成「没有备注」。
+        turns = _FakeTurns()
+        directory = str(tmp_path)
+        endpoints_agent_workspace.save_prefs(
+            app, {"directory": directory, "project_id": "missing",
+                  "mode": "ask"})
+        endpoints_agent_workspace.agent_start(
+            app, {"text": "改一下里面的代码", "directory": directory}, turns)
+        assert "项目备注" not in turns.started[0]["context"]
 
 
 class TestPost:

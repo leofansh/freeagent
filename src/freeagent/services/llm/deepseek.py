@@ -395,6 +395,43 @@ class DeepSeekProvider(LLMProvider):
             LLMError("模型返回了空建议", provider=PROVIDER_NAME)
         ).suggest_schedule(task, signals)
 
+    # -- 6. phrase（表达层） ------------------------------------------------- #
+    def phrase(
+        self, facts: Sequence[str], *, tone: str = ""
+    ) -> str | None:
+        """把规则算死的事实卡片组织成一句人话。**只润色，不补事实。**
+
+        表达层与判断层的分界：facts 是规则从库里算出的条目，模型负责
+        把它说自然；facts 之外的经历、承诺、项目、评价一律不许添。
+        输出为空 / 调用失败时降级到规则层，规则层返回 ``None``，上层
+        再回退既有模板 —— 三层都给不出才用模板，每一层失败都显性。
+        """
+        if not facts:
+            return None
+        system = (
+            "你在给一个个人事务助手组织一句给用户看的自然中文回复。\n"
+            "硬规则：\n"
+            "1. 只能使用下面事实卡片里的信息；事实之外的经历、承诺、"
+            "项目、评价一律不许补充。\n"
+            "2. 事实条目里的名称、数字、时间原样保留，不要改写。\n"
+            "3. 简短友好，一两句话；不要列表、代码块、markdown 符号，"
+            "也不要解释你是模型。\n"
+            "4. 输出就是那句话本身：不带引号、不加前后缀解说。"
+        )
+        user = "事实卡片：\n" + "\n".join(f"- {f}" for f in facts)
+        if tone:
+            user += f"\n语境：{tone}"
+        try:
+            text = self._chat(system, user, max_tokens=160)
+        except LLMError as exc:
+            return self._degrade(exc).phrase(facts, tone=tone)
+        cleaned = _clean_phrase(text)
+        if not cleaned:
+            return self._degrade(
+                LLMError("模型返回了空措辞", provider=PROVIDER_NAME)
+            ).phrase(facts, tone=tone)
+        return cleaned
+
 
 # --------------------------------------------------------------------------- #
 # 响应解析
@@ -506,6 +543,23 @@ def _validate_classification(payload: object, known: Sequence[str]) -> Classific
         need_clarification=need,
         clarifying_question=question,
     )
+
+
+_PHRASE_MAX = 200
+_PHRASE_QUOTES = "\"'“”‘’「」『』"
+
+
+def _clean_phrase(text: str) -> str:
+    """表达层输出收口：去围栏 / 引号，压空白，兜住长度。
+
+    提示词里的「不带引号、一两句话」对模型只是建议，代码层必须再拦
+    一道 —— 否则上屏的会是带 ``` 围栏或引号的半成品。
+    """
+    body = _FENCE_RE.sub("", text).strip().strip(_PHRASE_QUOTES)
+    body = _WS_RE.sub(" ", body).strip()
+    if len(body) > _PHRASE_MAX:
+        body = body[: _PHRASE_MAX - 1].rstrip("，,、；; ") + "…"
+    return body
 
 
 def _cap_title(title: str) -> str:

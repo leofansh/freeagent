@@ -132,7 +132,9 @@ class TestMigration:
         # v34（workbench_turns.context_note，V1.115）：这一轮带了什么上下文；
         # 独立一版是因为 v33 可能已被重放，改它的建表语句会让同一版本号
         # 出现两种形状。
-        assert SCHEMA_VERSION == 34
+        # v35（workbench_projects，V1.124）：项目档案，单语句 CREATE TABLE，
+        # 目录唯一。
+        assert SCHEMA_VERSION == 35
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

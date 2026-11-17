@@ -48,6 +48,7 @@ __all__ = [
     "CapturedRepo",
     "ContactRepo",
     "PromiseRepo",
+    "WorkbenchProjectRepo",
 ]
 
 _TERMINAL_VALUES = (TaskState.DONE.value, TaskState.DROPPED.value)
@@ -1790,6 +1791,88 @@ class WorkbenchTurnRepo(_RepoBase):
                 (reason, _dt_out(now)),
             )
         return int(cursor.rowcount or 0)
+
+
+class WorkbenchProjectRepo(_RepoBase):
+    """工作台项目档案的存取（V1.124 / 设计文档 21.6）。**只存取，不判断。**
+
+    项目 = 命名目录 + 可选备注；目录校验、名称兜底这些判断在端点层，仓储只
+    负责把行写对、读对。删项目只删这份档案，不碰磁盘目录与历史轮次。
+    """
+
+    def list_all(self) -> list[dict[str, object]]:
+        """项目按最近使用倒序。同刻定序用 ``rowid``（同 V1.115 的纪律：
+        秒级时间戳会撞车，用它定序等于随机排序）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM workbench_projects"
+            " ORDER BY last_used_at DESC, rowid DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get(self, project_id: str) -> dict[str, object] | None:
+        row = self._conn.execute(
+            "SELECT * FROM workbench_projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_by_directory(self, directory: str) -> dict[str, object] | None:
+        row = self._conn.execute(
+            "SELECT * FROM workbench_projects WHERE directory = ?", (directory,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def register(
+        self,
+        *,
+        directory: str,
+        name: str,
+        note: str,
+        now: datetime,
+    ) -> dict[str, object]:
+        """按目录幂等建档：已存在就刷新 ``last_used_at``，不存在才插入。
+
+        重复选用同一个目录不该长出第二行 —— 唯一约束在库里，幂等在这里。
+        """
+        existing = self.find_by_directory(directory)
+        if existing is not None:
+            self.touch(str(existing["id"]), now)
+            return self.get(str(existing["id"])) or existing
+        project_id = new_id()
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO workbench_projects"
+                " (id, name, directory, note, created_at, last_used_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (project_id, name, directory, note,
+                 _dt_out(now), _dt_out(now)),
+            )
+        return self.get(project_id) or {}
+
+    def touch(self, project_id: str, now: datetime) -> None:
+        with self._tx():
+            self._conn.execute(
+                "UPDATE workbench_projects SET last_used_at = ? WHERE id = ?",
+                (_dt_out(now), project_id),
+            )
+
+    def rename(
+        self, project_id: str, name: str, note: str,
+    ) -> dict[str, object] | None:
+        with self._tx():
+            cursor = self._conn.execute(
+                "UPDATE workbench_projects SET name = ?, note = ?"
+                " WHERE id = ?",
+                (name, note, project_id),
+            )
+        if cursor.rowcount == 0:
+            return None
+        return self.get(project_id)
+
+    def delete(self, project_id: str) -> None:
+        with self._tx():
+            self._conn.execute(
+                "DELETE FROM workbench_projects WHERE id = ?", (project_id,)
+            )
 
 
 def _replace(obj: _T, **changes: object) -> _T:

@@ -20,7 +20,7 @@ JS_PROMISES = r"""async function renderPromises(root) {
     return;
   }
   if (!data.count) {
-    root.appendChild(el("div", "empty", "没有未兑现的承诺。记一条：/promise 记 <事务id> <承诺> 关系=名字。"));
+    root.appendChild(el("div", "empty", "还没有未兑现的承诺。在对话里记下「答应了谁做什么」，会自动挂到关系账。"));
     return;
   }
   root.appendChild(el("h2", null, "我欠谁的（未兑现承诺 · " + data.count + " 条）"));

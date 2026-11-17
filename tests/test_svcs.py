@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -124,6 +125,15 @@ class TestRealMachineScan:
         finally:
             proc.kill()
             proc.wait(timeout=10)
+
+
+class TestPowerShellResolve:
+    def test_windows_resolves_to_a_real_executable(self) -> None:
+        """PATH 被裁掉时也能从系统盘绝对路径找到 powershell，不再 WinError 2。"""
+        if os.name != "nt":
+            pytest.skip("仅 Windows 走 powershell 扫描")
+        argv = svcs._powershell_argv()
+        assert argv and Path(argv[0]).is_file(), f"解析不到可用的 PowerShell：{argv}"
 
 
 class TestExecutorSpawnPaths:

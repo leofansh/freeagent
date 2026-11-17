@@ -27,6 +27,12 @@ JS_WORKBENCH_CARD = r"""function wbAsk(turn) {
     const input = el("input");
     input.id = "wb-answer";
     input.placeholder = "你的回答";
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        wbDecide(turn.id, true, (input.value || "").trim());
+      }
+    };
     bar.appendChild(input);
     const send = el("button", "btn primary", "答复");
     send.onclick = () => wbDecide(turn.id, true, (input.value || "").trim());
@@ -70,7 +76,7 @@ async function wbSend(force) {
   const injectBox = $("#wb-inject");
   const inject = injectBox ? injectBox.checked : true;
   if (!text.trim()) { toast("先写一句话"); return; }
-  if (!dir.trim()) { toast("先选工作目录"); return; }
+  if (!dir.trim()) { toast("先选项目（本地文件夹）"); return; }
   wbBusy = true;
   let res;
   try {

@@ -84,6 +84,18 @@ class TestShape:
         assert "今天的活 1 条" in brief.note
         assert "记忆 1 条" in brief.note
 
+    def test_project_note_carried_first_and_counted(self) -> None:
+        # 备注是站立偏好，排在今天的活前面；换行 / 多段空格压成单行。
+        brief = build_context(_fake(tasks=("写周报",)), "做点事",
+                              project_note="先给结论\n再展开　不写废话")
+        assert brief.text.startswith("项目备注：先给结论 再展开 不写废话")
+        assert "项目备注 1 段" in brief.note
+
+    def test_empty_project_note_is_absent(self) -> None:
+        brief = build_context(_fake(), "做点事", project_note="   ")
+        assert brief.text == ""
+        assert "项目备注" not in brief.note
+
     def test_limits_are_respected(self) -> None:
         brief = build_context(
             _fake(tasks=tuple(f"事{i}" for i in range(6)),

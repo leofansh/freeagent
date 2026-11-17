@@ -110,12 +110,15 @@ def turn_dict(view: agent_turn.TurnView | None) -> dict[str, Any] | None:
 def agent_state(app: App) -> dict[str, Any]:
     """``GET /api/agent/state`` —— 引擎状态 + 最近一轮 + 上次的选择。"""
     prefs = workspace.load_prefs(app)
+    projects = workspace.agent_projects(app)
     return {
         "kind": "agent_state",
         "engine": engine_dict(_host(app).state()),
         "turn": turn_dict(_turns(app).latest()),
+        "projects": projects["projects"],
         "prefs": {
             "directory": prefs.get("directory", ""),
+            "project_id": prefs.get("project_id", ""),
             "model": prefs.get("model", ""),
             "agent": prefs.get("agent", ""),
             "variant": prefs.get("variant", ""),
@@ -205,6 +208,10 @@ _ACTIONS: dict[str, Callable[[App, dict[str, Any]], dict[str, Any]]] = {
     "start": lambda app, body: workspace.agent_start(app, body, _turns(app)),
     "decide": agent_decide,
     "stop": agent_stop,
+    "project_save": lambda app, body: workspace.agent_project_save(app, body),
+    "project_select": lambda app, body: workspace.agent_project_select(app, body),
+    "project_update": lambda app, body: workspace.agent_project_update(app, body),
+    "project_delete": lambda app, body: workspace.agent_project_delete(app, body),
 }
 
 
@@ -213,5 +220,8 @@ def agent_post(app: App, action: str, read_body: Callable[..., dict[str, Any]]
     """``POST /api/agent/<action>`` 的唯一入口。"""
     handler = _ACTIONS.get(action)
     if handler is None:
-        raise FreeAgentError(f"不认识的动作：{action!r}（可选：start/decide/stop）")
+        raise FreeAgentError(
+            f"不认识的动作：{action!r}"
+            "（可选：start/decide/stop/project_save/project_select/"
+            "project_update/project_delete）")
     return handler(app, read_body())

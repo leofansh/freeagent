@@ -47,6 +47,7 @@ from .storage.repos import (
     RecordRepo,
     RoleRepo,
     TaskRepo,
+    WorkbenchProjectRepo,
     WorkbenchTurnRepo,
 )
 
@@ -137,6 +138,8 @@ class App:
     #: 工作台每一轮的行（21.4 / V1.115）。传给 ``agent_turns`` 做落库与回读；
     #: 也是「重启之后还能点回去看」的唯一来源。声明成 ``Any`` 同 ``engine``。
     turn_repo: Any = None
+    #: 工作台项目档案（V1.124）：命名目录 + 备注。声明成 ``Any`` 同 ``turn_repo``。
+    project_repo: Any = None
 
     @property
     def llm_name(self) -> str:
@@ -301,6 +304,7 @@ def build_app(
     #: 工作台每一轮（21.4 / V1.115）。它**只在这里建一次**：服务层拿它
     #: 落库与回读，重启后的「收口」（残留 running → failed）也由它做。
     turn_repo = WorkbenchTurnRepo(conn)
+    project_repo = WorkbenchProjectRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
     # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
@@ -433,6 +437,7 @@ def build_app(
         artifact_repo=artifact_repo,
         daily_digests=daily_digest_repo,
         turn_repo=turn_repo,
+        project_repo=project_repo,
         energy_windows=energy_windows,
         quiet_hours=quiet_hours,
         config=the_config,

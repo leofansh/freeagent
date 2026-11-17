@@ -20,7 +20,7 @@ JS_CONTACTS = r"""async function renderContacts(root) {
     return;
   }
   if (!data.count) {
-    root.appendChild(el("div", "empty", "还没有关系对象。记一条带 关系=名字 的承诺或等候，就会在这里按人聚合。"));
+    root.appendChild(el("div", "empty", "还没有关系对象。在对话里记下提到某个人的承诺或等候，会在这里按人聚合。"));
     return;
   }
   root.appendChild(el("h2", null, "关系对象 · " + data.count + " 个"));
@@ -39,7 +39,7 @@ JS_CONTACTS = r"""async function renderContacts(root) {
     card.onclick = () => openContact(c.id);
     root.appendChild(card);
   });
-  $("#foot").textContent = "关系可在飞书/终端用 /contact 管理，在对话里敲 /contact <名字> 直接看一页账。";
+  $("#foot").textContent = "点名字看一页账；承诺与等候都在对话里记下。";
 }
 
 async function openContact(id) {
@@ -81,5 +81,5 @@ async function openContact(id) {
     line += " → " + esc(w.task_title);
     root.appendChild(el("div", "meta", line));
   });
-  root.appendChild(el("div", "note", "结账：/promise keep|break|withdraw（见 /promise 列表）。记新的：/promise 记 <事务id> <承诺> 关系=" + esc(ledger.contact.name)));
+  root.appendChild(el("div", "note", "结账在「承诺」页操作；新的承诺在对话里记下。"));
 }"""

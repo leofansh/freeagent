@@ -20,7 +20,16 @@ Python 侧一直是对的（``test_capability_route`` 只断言子串），所�
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from freeagent.web.js_core import JS_CORE
+
+_WEB_JS_DIR = Path(__file__).resolve().parent.parent / "src" / "freeagent" / "web"
+
+#: 委派面板是唯一有意渲染 markdown 子集的前端（``mdish`` 解析 ``**加粗**``），
+#: 源码里有 ``/\*\*/`` 正则 —— 它不适用「上屏串不许有 **」这条判。
+_MDISH_MODULES = {"js_delegate_live.py"}
 
 #: 顺序即 esc() 里 replace 链的顺序 —— ``&`` 必须最先，否则后面注入的
 #: 实体（如 ``&gt;``）会被再转一次成 ``&amp;gt;``。
@@ -47,4 +56,81 @@ class TestEscMapsTheRightEntities:
         idx = [JS_CORE.index(s) for s, _ in MAPPINGS]
         assert idx == sorted(idx), (
             "转义顺序必须是 & 最先 —— 否则先注入的 &gt; 会被 & 规则二次转义"
+        )
+
+
+class TestWorkbenchRenderEscapes:
+    """工作台清单里的原文（引擎输出 / 本机目录名）不许进 ``innerHTML``。
+
+    V1.116 把「碰过的文件 / 跑过的命令」摆到界面上，注释写着「全部走
+    textContent」，实现却把原文塞进 ``el()`` 的第三参（那是 innerHTML）。
+    命令与路径来自引擎、目录名来自本机文件系统 —— 任一带尖括号的串都会被
+    当成 HTML 解析。这里按源码钉死这几处必须过 :func:`esc`。
+    """
+
+    def test_file_paths_are_escaped(self):
+        from freeagent.web.js_workbench import JS_WORKBENCH
+
+        assert 'el("div", "note", esc(f))' in JS_WORKBENCH
+        assert 'el("div", "note", f)' not in JS_WORKBENCH
+
+    def test_commands_are_escaped(self):
+        from freeagent.web.js_workbench import JS_WORKBENCH
+
+        assert '"$ " + esc(c)' in JS_WORKBENCH
+        assert '"$ " + c' not in JS_WORKBENCH
+
+    def test_directory_names_are_escaped(self):
+        from freeagent.web.js_workbench_dirs import JS_WORKBENCH_DIRS
+
+        assert 'el("option", null, esc(name))' in JS_WORKBENCH_DIRS
+
+    def test_model_note_is_escaped(self):
+        from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
+
+        assert "esc(data.model.note)" in JS_WORKBENCH_PAGE
+
+    def test_enter_submits_textarea_and_answer(self):
+        from freeagent.web.js_workbench_card import JS_WORKBENCH_CARD
+        from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
+
+        assert "wbSend(false)" in JS_WORKBENCH_PAGE
+        assert "wbDecide(turn.id" in JS_WORKBENCH_CARD
+
+    def test_stop_and_send_buttons_carry_ids(self):
+        from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
+
+        assert 'stop.id = "wb-stop"' in JS_WORKBENCH_PAGE
+        assert 'send.id = "wb-send"' in JS_WORKBENCH_PAGE
+
+
+def _js_body(path: Path) -> str:
+    """取模块里 ``r\"\"\"...\"\"\"`` 包住的那段 JS；纯 Python 模块返回空串。"""
+    raw = path.read_text(encoding="utf-8")
+    if 'r"""' not in raw:
+        return ""
+    return raw.split('r"""', 1)[1].rsplit('"""', 1)[0]
+
+
+class TestNoMarkdownEmphasisInJs:
+    """上屏 JS 串里不许留 ``**`` —— 前端不解析 markdown，星号会原样印出。
+
+    与 ``test_web_oc_selection.py`` 里那条同义守卫同根，但那条只覆盖两个
+    oc 模块；这里扫整个 web 包，免得新页面再犯一次。注释里用 ``**`` 强调
+    是合理的，所以先剥 ``//`` 与 ``/* */`` 再断言。
+    """
+
+    def test_all_onscreen_js_has_no_literal_asterisks(self):
+        offenders: list[str] = []
+        for path in sorted(_WEB_JS_DIR.glob("js_*.py")):
+            if path.name in _MDISH_MODULES:
+                continue
+            body = _js_body(path)
+            body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+            body = re.sub(r"(?<!:)//[^\n]*", "", body)
+            if "**" in body:
+                offenders.append(path.name)
+        assert not offenders, (
+            "这些 JS 上屏串里出现了 **（界面不解析 markdown，会印出字面星号）："
+            + ", ".join(offenders)
         )

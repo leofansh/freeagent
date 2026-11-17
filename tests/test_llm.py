@@ -170,6 +170,12 @@ def test_suggest_schedule_without_signals(p):
     assert "由你决定" in text
 
 
+# ------------------------------------------------------------------- phrase
+def test_rule_phrase_is_none(p):
+    """规则实现不组织措辞：返回 None 让上层回退模板，不另写一套话术。"""
+    assert p.phrase(["可以记事"], tone="招呼") is None
+
+
 # ------------------------------------------------------------------- determinism
 def test_classify_is_deterministic(p):
     a = p.classify("帮我盯一下下周五要交的销售周报初稿", HINTS)

@@ -48,13 +48,19 @@ def view() -> CapabilityView:
 class StubLLM:
     """按话题**声明**结果的替身 —— 测试只说期望，不列关键词。"""
 
-    def __init__(self, topic: str | None) -> None:
+    def __init__(self, topic: str | None, phrase_text: str | None = None) -> None:
         self.topic = topic
+        self.phrase_text = phrase_text
         self.calls: list[tuple[str, tuple]] = []
+        self.phrase_calls: list[tuple[tuple[str, ...], str]] = []
 
     def select_view(self, text, views):
         self.calls.append((text, tuple(views)))
         return self.topic
+
+    def phrase(self, facts, *, tone=""):
+        self.phrase_calls.append((tuple(facts), tone))
+        return self.phrase_text
 
 
 class ExplodingLLM:
@@ -76,8 +82,34 @@ def test_在吗被当招呼_不是待办(view: CapabilityView) -> None:
     """「在吗?」曾拿到一张 /delegate 模板。"""
     reply = CapabilityRouter(StubLLM("greeting")).try_route("在吗?", view)
     assert reply is not None
-    assert "我在" in reply.text
+    assert "你好" in reply.text
+    # 问候不摆授权项目：项目名/目录名上屏既无关又暴露内部路径
+    for label in (*view.labels(), *view.projects):
+        assert label not in reply.text
     assert "/delegate" not in reply.text
+
+
+def test_招呼走表达层_模型措辞优先(view: CapabilityView) -> None:
+    """表达层给得出措辞时，上屏用模型那句；事实卡片由规则喂进去。"""
+    llm = StubLLM("greeting", phrase_text="你好，今天想记点什么？")
+    reply = CapabilityRouter(llm).try_route("你好", view)
+    assert reply is not None
+    assert reply.text == "你好，今天想记点什么？"
+    assert llm.phrase_calls, "问候没走表达层"
+    facts, _tone = llm.phrase_calls[0]
+    # 事实卡片里也不许带授权项目名 —— 清单留在能力话题里
+    assert not any(label in " ".join(facts) for label in view.labels())
+
+
+def test_表达层给不出_回退规则模板(view: CapabilityView) -> None:
+    """模型返回 None（离线/降级/空串）时回退模板，不编一句出来。"""
+    reply = CapabilityRouter(
+        StubLLM("greeting", phrase_text=None)
+    ).try_route("在吗?", view)
+    assert reply is not None
+    assert "你好" in reply.text
+    for label in (*view.labels(), *view.projects):
+        assert label not in reply.text
 
 
 def test_执行器那一句(view: CapabilityView) -> None:
@@ -125,6 +157,37 @@ def test_没有_llm_就闭嘴_但有诚实兜底(view: CapabilityView) -> None:
     fb = router.fallback()
     assert "不猜" in fb.text
     assert "OpenMOS" not in fb.text, "兜底不能列项目 —— 那会让人以为它真能改"
+
+
+class TestRuleLayerGreeting:
+    """离线规则层的平行问候入口（关闭速读 #18）。
+
+    招呼是唯一允许规则层接的话题：说法封闭，回退模板即可；其余话题
+    离线仍闭嘴，不猜。
+    """
+
+    @pytest.mark.parametrize("text", ["你好", "在吗？", "您好呀", "Hello!", "哈喽"])
+    def test_纯招呼离线也回问候(self, text: str, view: CapabilityView) -> None:
+        llm = StubLLM(None)
+        reply = CapabilityRouter(llm).try_route(text, view)
+        assert reply is not None
+        assert "记下来" in reply.text or "清单" in reply.text
+        for label in (*view.labels(), *view.projects):
+            assert label not in reply.text
+
+    def test_离线招呼不白问模型(self, view: CapabilityView) -> None:
+        llm = StubLLM(None)
+        CapabilityRouter(llm).try_route("你好", view)
+        assert not llm.calls, "封闭招呼不该再问 select_view"
+
+    def test_夹带正事的句子不算招呼(self, view: CapabilityView) -> None:
+        """「你好，下周二交周报」是记事请求，不能被一句问候抢走。"""
+        llm = StubLLM(None)
+        reply = CapabilityRouter(llm).try_route("你好，下周二交周报", view)
+        assert reply is None
+
+    def test_离线非招呼话题仍闭嘴(self, view: CapabilityView) -> None:
+        assert CapabilityRouter(None).try_route("这个项目能改吗", view) is None
 
 
 # ── 事实渲染：数据说话 ──────────────────────────────────────────────────── #

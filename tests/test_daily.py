@@ -145,4 +145,6 @@ class TestMigration:
         # 在重启之后还能点回去看（单语句 CREATE TABLE）。
         # v34（workbench_turns.context_note，V1.115）：这一轮带了什么上下文
         # （单语句 ADD COLUMN）。
-        assert SCHEMA_VERSION == 34
+        # v35（workbench_projects，V1.124）：工作台项目档案（命名目录 + 备注），
+        # 单语句 CREATE TABLE，目录唯一约束。
+        assert SCHEMA_VERSION == 35

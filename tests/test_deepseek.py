@@ -196,6 +196,19 @@ class TestHappyPath:
         assert t.calls[0]["url"] == "https://h/v1/chat/completions"
         assert t.calls[0]["payload"]["model"] == "m"
 
+    def test_phrase_organizes_facts(self):
+        p, t = _p(_reply("你好，想记点什么直接说就行。"))
+        out = p.phrase(["可以直接说一件事，我帮你记下来"], tone="招呼")
+        assert out == "你好，想记点什么直接说就行。"
+        # 事实卡片进了 user 消息，语境提示单独带上
+        assert "可以直接说一件事" in t.calls[0]["payload"]["messages"][1]["content"]
+        assert "招呼" in t.calls[0]["payload"]["messages"][1]["content"]
+
+    def test_phrase_empty_facts_skips_call(self):
+        p, t = _p()
+        assert p.phrase([]) is None
+        assert t.calls == []
+
 
 # =============================================================================
 # 2. 输出校验：拦住模型编造
@@ -413,6 +426,15 @@ class TestDegradation:
     def test_empty_suggestion_degrades(self):
         p, _ = _p(_reply("  "), fallback=RuleBasedProvider())
         assert "由你决定" in p.suggest_schedule(TaskRef(id="x", title="t"), [])
+
+    def test_empty_phrase_degrades_to_none(self):
+        p, _ = _p(_reply("   "), fallback=RuleBasedProvider())
+        assert p.phrase(["一件事实"]) is None
+        assert p.degraded_reason is not None
+
+    def test_phrase_strips_fences_and_quotes(self):
+        p, _ = _p(_reply("```\n“你好。”\n```"))
+        assert p.phrase(["事实卡片"]) == "你好。"
 
 
 # =============================================================================

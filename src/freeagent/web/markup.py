@@ -21,23 +21,36 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
     <span class="meta" id="hdr"></span>
   </header>
   <nav id="nav" hidden>
+    <!-- 一级入口只放日常高频视图；其余低频视图收进「更多」下拉（V1.119）。
+         视图本身一个不删，只是入口下沉 —— 下拉项仍带 data-view，接线同走 boot。 -->
     <button data-view="chat" aria-selected="true">对话</button>
     <button data-view="workbench">工作台</button>
     <button data-view="today">今天<span class="badge" id="b-today" hidden></span></button>
-    <button data-view="all">全部未结束</button>
-    <button data-view="closed">已结束</button>
-    <button data-view="roles">角色</button>
-    <button data-view="model">画像</button>
-    <button data-view="contacts">关系</button>
-    <button data-view="promises">承诺<span class="badge" id="b-promises" hidden></span></button>
-    <button data-view="pending">待处理<span class="badge" id="b-pending" hidden></span></button>
-    <button data-view="nudge">催办<span class="badge" id="b-nudge" hidden></span></button>
-    <button data-view="oc">编程</button>
+    <button data-view="all">事务</button>
+    <div class="menu" id="more-menu">
+      <button id="more-btn" aria-haspopup="true" aria-expanded="false">更多<span class="badge" id="b-more" hidden></span></button>
+      <div class="menu-pop" id="more-pop" hidden>
+        <!-- 三层分组（V1.121）：我的事 = 个人事务脉络；执行与通道 = 委派/后台/飞书；系统 = 设置。
+             分组只是入口排布，视图与 data-view 接线一个不删。 -->
+        <div class="menu-group">我的事</div>
+        <button data-view="closed">已结束</button>
+        <button data-view="roles">角色</button>
+        <button data-view="model">画像</button>
+        <button data-view="contacts">关系</button>
+        <button data-view="promises">承诺<span class="badge" id="b-promises" hidden></span></button>
+        <button data-view="pending">待处理<span class="badge" id="b-pending" hidden></span></button>
+        <button data-view="nudge">催办<span class="badge" id="b-nudge" hidden></span></button>
+        <div class="menu-group">执行与通道</div>
+        <button data-view="oc">编程</button>
+        <button data-view="services">后台服务</button>
+        <button data-view="feishu">飞书通道</button>
+        <div class="menu-group">系统</div>
+        <button data-view="settings">设置</button>
+      </div>
+    </div>
     <span class="spacer"></span>
-    <button data-view="services">后台服务</button>
-<button data-view="feishu">飞书通道</button>
-    <button data-view="settings">设置</button>
-    <button id="refresh" title="重新读取">刷新</button>
+    <!-- 刷新是动作按钮，不是视图：不挂 data-view，样式弱化（.ghost）。 -->
+    <button id="refresh" title="重新读取" class="ghost">刷新</button>
   </nav>
   <div id="root"></div>
   <p class="disclaimer" id="foot">启发式提示，不是评分 —— 助手不替你决定先做哪个。</p>
