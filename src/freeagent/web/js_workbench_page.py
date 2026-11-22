@@ -155,26 +155,13 @@ async function loadWorkbench() {
     "换档只对下一轮生效，这一轮仍按开始时的那一档。"));
   view.appendChild(bar);
 
-  const dirs = el("div", "note");
-  dirs.id = "wb-dirs";
-  dirs.hidden = true;
+  const dirs = el("div", "note"); dirs.id = "wb-dirs"; dirs.hidden = true;
   view.appendChild(dirs);
-  const models = el("div", "row1");
-  models.id = "wb-models";
-  view.appendChild(models); view.appendChild(wbIntakeMount());  // 一句话起手（V1.141）：认项目 + 要做的事，人确认后再交给它
-
+  const models = el("div", "row1"); models.id = "wb-models";
+  view.appendChild(models);
+  // V1.157：第二个输入框彻底收掉；这页只管本轮（停止 / 注入 / 进度 / 授权）。
   const ask = el("div", "card");
-  const ta = el("textarea");
-  ta.id = "wb-text";
-  ta.rows = 3;
-  ta.placeholder = "一句话：改哪个文件、修什么、跑什么。别换行 —— 含换行会让引擎升级它自己的模型。";
-  ta.style.width = "100%";
-  // 回车直接发出（Shift+回车才换行）：占位文案已经说「别换行」，再让人
-  // 去摸鼠标点按钮是多一步。与对话页同一个键位惯例（js_chat）。
-  ta.onkeydown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); wbSend(false); }
-  };
-  ask.appendChild(ta);
+  ask.appendChild(el("div", "hint", "派活请到「对话」写一句话，点「… → 交给它执行」。这里只管本轮。"));
   // 带上「今天的事 / 承诺 / 相关记忆」（21.5 / V1.115）。默认开 —— 但
   // 开关必须看得见：它把这台机器上的私人记录送进模型，人有权当场关掉，
   // 而不是只能改配置文件。
@@ -190,10 +177,6 @@ async function loadWorkbench() {
   injectRow.appendChild(el("span", null,
     " 带上今天的事、未结清的承诺与相关记忆（会显示它带了什么）"));
   ask.appendChild(injectRow);
-  const send = el("button", "btn primary", "交给它");
-  send.id = "wb-send";
-  send.onclick = () => wbSend(false);
-  ask.appendChild(send);
   const stop = el("button", "btn danger", "停止");
   stop.id = "wb-stop";
   stop.onclick = async () => {

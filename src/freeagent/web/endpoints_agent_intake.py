@@ -12,7 +12,27 @@ from typing import Any
 from ..domain import FreeAgentError
 from ..services import delegate_intake
 
-__all__ = ["agent_intake"]
+__all__ = ["agent_intake", "agent_intake_ready"]
+
+
+def agent_intake_ready(app: Any) -> dict[str, Any]:
+    """``GET /api/agent/intake/ready`` —— 这张卡现在能不能用（只读、不花模型）。
+
+    为什么要有这个端点：V1.141 的卡原先永远可输入，前提没满足时人白输一句
+    才被告知「没授权项目 / 没连模型」。最佳实践是把前提摆在输入之前 ——
+    读出来的判断与 :func:`plan` 共用同一份服务层，不另写一套。
+    """
+    r = delegate_intake.readiness(
+        getattr(app.chat, "capabilities", None), getattr(app, "llm", None)
+    )
+    return {
+        "kind": "agent_intake_ready",
+        "ready": r.ready,
+        "projects": r.projects,
+        "model": r.model,
+        "reason": r.reason,
+        "question": r.question,
+    }
 
 
 def agent_intake(app: Any, body: dict[str, Any]) -> dict[str, Any]:

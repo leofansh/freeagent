@@ -18,6 +18,7 @@ from ..app import App
 from . import (
     endpoints_agent,
     endpoints_agent_files,
+    endpoints_agent_intake,
     endpoints_agent_workspace,
     endpoints_delegate_browse,
     endpoints_delegate_live,
@@ -113,6 +114,9 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     # 不读内容。根由工作区档案取（不收绝对路径），越界 fail-closed。
     "/api/agent/files": endpoints_agent_files.agent_files,
     "/api/agent/projects": endpoints_agent_workspace.agent_projects,
+    # 一句话起手的前提探测（V1.147）：纯只读、不花模型。前端据此在打字之前
+    # 就把「没授权项目 / 没连模型」说出来，不让人白输一句才被拒。
+    "/api/agent/intake/ready": endpoints_agent_intake.agent_intake_ready,
     "/api/today": lambda app, q: serialize.today_payload(
         app.today.view(),
         endpoints_read.role_names(app),

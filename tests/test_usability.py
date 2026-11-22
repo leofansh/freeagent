@@ -15,14 +15,18 @@ import re
 from pathlib import Path
 
 from freeagent.web.js_chat import JS_CHAT
+from freeagent.web.markup import PAGE_MARKUP
 from freeagent.web.js_chat_search import JS_CHAT_SEARCH
+from freeagent.web.js_chat_shell import JS_CHAT_SHELL
 from freeagent.web.js_compact import JS_COMPACT
 from freeagent.web.js_settings import JS_SETTINGS
+from freeagent.web.js_vision import JS_VISION
 from freeagent.web.js_settings_groups import JS_SETTINGS_GROUPS
 from freeagent.web.js_workbench import JS_WORKBENCH
 from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
 from freeagent.web.js_workbench_side import JS_WORKBENCH_SIDE
 from freeagent.web.page import INDEX_HTML
+from freeagent.web.style_nav import STYLE_NAV_CSS
 from freeagent.web.style_usability import STYLE_USABILITY_CSS
 from freeagent.web.style_workbench import STYLE_WORKBENCH_CSS
 
@@ -105,15 +109,99 @@ class TestChatSearch:
         assert "m.textContent = raw.slice" in run
         assert "innerHTML" not in run, "命中词来自人的输入，不能进 innerHTML"
 
-    def test_search_button_wired(self):
+    def test_delegate_from_chat_is_a_confirmed_explicit_action(self):
+        """V1.152：一句话从对话直接派出，目录/档位先给人看一眼。"""
+        fn = _body(JS_CHAT_SEARCH, "chatDelegate")
+        assert "window.confirm" in fn and "档位" in fn
+        assert '"/api/agent/state"' in fn and '"/api/agent/start"' in fn
+        assert "force: true" in fn, "人点了交给它就是显式推翻规则"
+        tools = _body(JS_CHAT_SEARCH, "chatToolsMount")
+        assert 'add("交给它执行", chatDelegate)' in tools
+
+    def test_search_lives_in_the_chat_tools_menu(self):
+        tools = _body(JS_CHAT_SEARCH, "chatToolsMount")
+        assert "chatSearchOpen" in tools, "搜索必须接上搜索面板"
+        assert "查找对话内容" in tools
         bar = _body(JS_CHAT, "buildBar")
-        assert "chatSearchOpen()" in bar, "搜索按钮必须接上搜索面板"
-        assert 'el("button", null, "搜索")' in bar
+        assert "搜索" not in bar, "搜索不再是输入栏上的独立按钮"
 
     def test_scripts_assembled_in_order(self):
         assert JS_CHAT_SEARCH in INDEX_HTML
         # 搜索依赖 chat 建立的 #chatlog / .msg .bubble 结构，必须排在 chat 之后。
         assert INDEX_HTML.index(JS_CHAT) < INDEX_HTML.index(JS_CHAT_SEARCH)
+
+
+class TestChatShell:
+    """对话页三栏外壳（V1.154）：左工作区 / 中对话 / 右产物，两侧可收。"""
+
+    def test_shell_wraps_center_and_is_wired(self):
+        shell = _body(JS_CHAT_SHELL, "chatShellMount")
+        assert 'el("div", "chat-shell")' in shell
+        assert "chat-rail" in shell and "chat-side" in shell
+        assert "chatRailPaint()" in shell and "chatSidePaint()" in shell
+        bar = _body(JS_CHAT, "renderChatShell")
+        assert "chatShellMount()" in bar
+
+    def test_panels_use_read_only_endpoints(self):
+        rail = _body(JS_CHAT_SHELL, "chatRailPaint")
+        side = _body(JS_CHAT_SHELL, "chatSidePaint")
+        assert '"/api/agent/projects"' in rail and '"/api/agent/project_select"' in rail
+        assert '"/api/agent/state"' in side
+
+    def test_bar_has_project_model_mode_selectors(self):
+        fn = _body(JS_CHAT_SHELL, "chatBarControls")
+        for sel in ("chat-ctrl-project", "chat-ctrl-model", "chat-ctrl-mode"):
+            assert f'"{sel}"' in fn
+        assert '"/api/agent/prefs_save"' in fn and '"/api/oc/options"' in fn
+        assert '"/api/agent/project_select"' in fn
+        shell = _body(JS_CHAT_SHELL, "chatShellMount")
+        assert "chatBarControls()" in shell
+
+    def test_toggle_buttons_hide_panels(self):
+        shell = _body(JS_CHAT_SHELL, "chatShellMount")
+        assert "left.hidden = !left.hidden" in shell
+        assert "right.hidden = !right.hidden" in shell
+
+
+class TestButtonHierarchy:
+    """按钮层级（V1.148）：主动作 / 工具 / 开关三种角色，样式必须成套。"""
+
+    def test_chat_bar_has_send_arrow_and_paste(self):
+        """V1.150：左 + 右 ↑（OpenCode 骨架）；回车仍是主路径，图片可直接粘。"""
+        bar = _body(JS_CHAT, "buildBar")
+        assert 'el("button", "btn primary send-arrow", "↑")' in bar
+        assert "chatsend" in bar and "sendChat()" in bar
+        assert "ta.onpaste" in bar and 'it.type.indexOf("image/")' in bar
+        assert "doVision(blob)" in bar, "粘贴的图片走同一条识别链路"
+        assert 'e.key === "Enter" && !e.shiftKey' in bar
+
+    def test_attachment_is_plus_and_bar_has_no_tool_buttons(self):
+        bar = _body(JS_CHAT, "buildBar")
+        for tool in ("搜索", "清空", "多选删除"):
+            assert f'el("button", "btn ghost", "{tool}")' not in bar, (
+                f"{tool} 已收进右上角 … 菜单，不该占输入栏"
+            )
+        assert 'vbar.id = "visionbar"' in bar, "附件入口要挂在输入框左侧"
+
+    def test_nav_uses_the_same_button_language(self):
+        assert 'class="btn ghost">刷新' in PAGE_MARKUP
+        assert 'el("button", "btn ghost", "简洁")' in JS_COMPACT
+
+    def test_ghost_css_is_global_and_shows_toggle_state(self):
+        assert ".btn.ghost {" in STYLE_NAV_CSS, "ghost 不能只认 nav，要跨区域一致"
+        assert '.btn.ghost[aria-pressed="true"]' in STYLE_NAV_CSS
+
+    def test_attachment_plus_replaces_the_lone_vision_pill(self):
+        load = _body(JS_VISION, "loadVisionBar")
+        assert 'el("button", "btn ghost attach", "+")' in load
+        assert "attach-menu" in load and "attach-image" in load
+        assert 'el("button", "chip", "📷 拍照识物")' not in load, "独立的拍照胶囊已收进 + 菜单"
+        assert "visionOutsideBound" in load, "点外面/esc 关闭的监听只绑一次"
+        # V1.150/151：快捷键与分组入口都必须是真能用的，不摆没有的能力。
+        assert "Ctrl+U" in load and 'e.key.toLowerCase() === "u"' in load
+        assert "attach-paste" in load and "Ctrl+V" in load
+        for view in ("roles", "services", "feishu"):
+            assert f'"{view}"' in load, f"+ 菜单要能直达 {view}"
 
 
 class TestSettingsGroups:

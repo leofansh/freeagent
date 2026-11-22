@@ -25,7 +25,39 @@ from dataclasses import dataclass
 
 from .capability import CapabilityView
 
-__all__ = ["IntakePlan", "plan"]
+__all__ = ["IntakePlan", "IntakeReadiness", "plan", "readiness"]
+
+# 两处共用的前提文案：probe 卡与真正解析必须说同一句话，否则会出现
+# 「卡上说没授权、点识别又说没模型」这种自相矛盾。
+_NO_PROJECTS_Q = "还没授权项目 —— 先在「项目」里选一个本地文件夹。"
+_NO_MODEL_Q = "没连模型，认不出这句话 —— 请手动选项目并写要做的事。"
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReadiness:
+    """一句话起手的前提是否齐了。只读，不调模型、不读盘。"""
+
+    ready: bool
+    projects: bool
+    model: bool
+    reason: str
+    question: str
+
+
+def readiness(view: CapabilityView | None, llm: object | None) -> IntakeReadiness:
+    """``plan()`` 的两道前置检查的只读版本。
+
+    为什么单独一份而不是在前端照抄 ``plan`` 的返回：前端要在人打字**之前**
+    就知道这张卡现在能不能用；而判断必须和真正解析同一套，否则卡面与实际
+    行为会对不上（「看着能用、点下去被拒」正是授权界面最忌讳的形态）。
+    """
+    projects = bool(view and view.enabled)
+    model = llm is not None and type(llm).__name__ != "RuleBasedProvider"
+    if not projects:
+        return IntakeReadiness(False, projects, model, "no_projects", _NO_PROJECTS_Q)
+    if not model:
+        return IntakeReadiness(False, projects, model, "no_model", _NO_MODEL_Q)
+    return IntakeReadiness(True, projects, model, "", "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,11 +151,11 @@ def plan(
 
     # 首次解析：下面是唯一会花模型一次请求的地方。
     if view is None or not view.enabled:
-        return IntakePlan(reason="no_projects",
-                          question="还没授权项目 —— 先在「项目」里选一个本地文件夹。")
-    if llm is None:
-        return IntakePlan(reason="no_model",
-                          question="没连模型，认不出这句话 —— 请手动选项目并写要做的事。")
+        return IntakePlan(reason="no_projects", question=_NO_PROJECTS_Q)
+    # 规则层连 parse_delegation 都是空意图，等同于没模型 —— 明说没连模型，
+    # 比让人输入一句后收到「这句话不像是让我改代码」诚实。
+    if llm is None or type(llm).__name__ == "RuleBasedProvider":
+        return IntakePlan(reason="no_model", question=_NO_MODEL_Q)
     try:
         intent = llm.parse_delegation(text, view.labels())
     except Exception:

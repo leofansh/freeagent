@@ -16,7 +16,7 @@ JS_NAV = r"""// 收进「更多」下拉的视图清单。选中其中任一视�
 // 否则高亮停在空的一级导航上，人不知道自己在哪页。
 const MENU_VIEWS = new Set([
   "closed", "roles", "model", "week", "contacts", "promises", "pending",
-  "nudge", "oc", "services", "feishu", "settings", "harness",
+  "nudge", "oc", "services", "feishu", "settings", "harness", "workbench",
 ]);
 
 const moreBtn = $("#more-btn");

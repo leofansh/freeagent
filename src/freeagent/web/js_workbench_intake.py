@@ -10,26 +10,70 @@ from __future__ import annotations
 __all__ = ["JS_WORKBENCH_INTAKE"]
 
 JS_WORKBENCH_INTAKE = r"""let wbIntakeCarry = null;
+// 探测结果留在模块级：工作台重绘会整块换掉卡片，状态跟着 DOM 走会表现成
+// 「每次重绘都回到正在检查」（V1.142 文件清单踩过同一个坑）。
+let wbIntakeReady = null;
+
+function wbIntakeApply(res) {
+  const state = $("#wb-intake-state");
+  const input = $("#wb-intake-text");
+  const go = $("#wb-intake-go");
+  if (!state || !input || !go) return;
+  if (!res) { state.textContent = "正在检查前提…"; return; }
+  if (res.ready) {
+    state.hidden = true;
+    input.disabled = false;
+    go.disabled = false;
+    return;
+  }
+  state.textContent = res.question || "这句话起手还没准备好。";
+  const jump = el("button", "btn", res.reason === "no_model" ? "去设置" : "去授权项目");
+  jump.onclick = () => load(res.reason === "no_model" ? "settings" : "feishu");
+  state.appendChild(jump);
+}
 
 function wbIntakeMount() {
   const box = el("div", "card");
   box.id = "wb-intake";
   box.appendChild(el("div", "row1", "一句话起手（自动认出项目，再确认）"));
+  // 前提摆在输入之前（V1.147）：没授权项目 / 没连模型时先说清楚并给入口，
+  // 不让人白输一句才被拒。默认禁用，探测到就绪再放开。
+  const state = el("div", "hint");
+  state.id = "wb-intake-state";
+  state.textContent = "正在检查前提…";
+  box.appendChild(state);
   const input = el("input");
   input.id = "wb-intake-text";
   input.placeholder = "例如：让它改 X 项目 把登录页按钮改成蓝色";
+  input.disabled = true;
   input.onkeydown = (e) => {
     if (e.key === "Enter") { e.preventDefault(); wbIntake(); }
   };
   box.appendChild(input);
   const go = el("button", "btn", "识别");
   go.id = "wb-intake-go";
+  go.disabled = true;
   go.onclick = () => wbIntake();
   box.appendChild(go);
   const result = el("div");
   result.id = "wb-intake-result";
   box.appendChild(result);
+  wbIntakeApply(wbIntakeReady);
+  if (!wbIntakeReady) wbIntakeProbe();
   return box;
+}
+
+async function wbIntakeProbe() {
+  let res;
+  try {
+    res = await api("/api/agent/intake/ready");
+  } catch (e) {
+    // 探测失败不能让卡片假装可用：保守禁用，说清原因（fail-closed）。
+    res = { ready: false, reason: "probe_error",
+            question: "前提检查失败：" + e.message + " 请刷新页面重试。" };
+  }
+  wbIntakeReady = res;
+  wbIntakeApply(res);
 }
 
 async function wbIntake(preset) {

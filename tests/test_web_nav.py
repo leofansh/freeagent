@@ -15,16 +15,16 @@ from freeagent.web.page import INDEX_HTML
 from freeagent.web.style_nav import STYLE_NAV_CSS
 
 # 一级日常入口；其余视图全部进「更多」下拉。
-PRIMARY_VIEWS = {"chat", "workbench", "today", "all"}
+PRIMARY_VIEWS = {"chat", "today", "all"}
 MENU_VIEWS = {
     "closed", "roles", "model", "contacts", "promises", "pending",
-    "nudge", "week", "oc", "services", "feishu", "settings", "harness",
+    "nudge", "week", "oc", "services", "feishu", "settings", "harness", "workbench",
 }
 # 下拉内的三层分组（V1.121）：标签只做视线分组，不是可点视图。
 MENU_GROUPS = {
     "我的事": {"harness", "closed", "roles", "model", "contacts", "promises",
                "pending", "nudge", "week"},
-    "执行与通道": {"oc", "services", "feishu"},
+    "执行与通道": {"workbench", "oc", "services", "feishu"},
     "系统": {"settings"},
 }
 

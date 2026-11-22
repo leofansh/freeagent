@@ -14,6 +14,8 @@ JS_VISION = r'''
 
 let visionBusy = false;
 
+let visionOutsideBound = false;
+
 function loadVisionBar() {
   const bar = $("#visionbar");
   if (!bar) return;
@@ -23,22 +25,80 @@ function loadVisionBar() {
   file.accept = "image/jpeg,image/png,image/gif,image/webp";
   file.id = "visionfile";
   file.style.display = "none";
-  const btn = el("button", "chip", "📷 拍照识物");
+  // V1.149：不再单独摆一颗"📷 拍照识物"胶囊，收进输入框左侧的"+"。
+  const btn = el("button", "btn ghost attach", "+");
   btn.id = "visionbtn";
-  const note = el("span", "hint");
+  btn.title = "添加图片（拍照识物）";
+  btn.setAttribute("aria-haspopup", "true");
+  btn.setAttribute("aria-expanded", "false");
+  const menu = el("div", "attach-menu");
+  menu.id = "attach-menu";
+  menu.hidden = true;
+  menu.appendChild(el("div", "menu-group", "添加"));
+  // 借鉴 OpenCode 的 + 菜单：只列本仓真有的入口，不摆 / @ ! 这些没有的。
+  const item = el("button", "attach-item", "🖼 图片和文件");
+  item.id = "attach-image";
+  item.appendChild(el("span", "attach-hint", "Ctrl+U"));
+  item.onclick = () => { file.click(); };
+  menu.appendChild(item);
+  const paste = el("button", "attach-item", "📋 粘贴图片");
+  paste.id = "attach-paste";
+  paste.appendChild(el("span", "attach-hint", "Ctrl+V"));
+  paste.onclick = () => {
+    close();
+    const ta = $("#chatinput"); if (ta) ta.focus();
+    toast("直接按 Ctrl+V 把图片粘进输入框");
+  };
+  menu.appendChild(paste);
+  // 借鉴豆包 / WorkBuddy 的分组，但只列本仓真有的入口 —— 不摆没有的技能 / 云盘。
+  menu.appendChild(el("div", "menu-group", "已有能力"));
+  const nav = (label, view) => {
+    const b = el("button", "attach-item", label);
+    b.onclick = () => { close(); load(view); };
+    menu.appendChild(b);
+  };
+  nav("角色与专家", "roles");
+  nav("后台服务", "services");
+  nav("飞书通道", "feishu");
+  const note = el("div", "hint attach-note");
   note.id = "visionnote";
-  btn.onclick = () => file.click();
+  menu.appendChild(note);
+  const close = () => {
+    menu.hidden = true;
+    btn.setAttribute("aria-expanded", "false");
+  };
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    menu.hidden = !menu.hidden;
+    btn.setAttribute("aria-expanded", String(!menu.hidden));
+  };
+  // 监听只绑一次：loadVisionBar 每次切回对话页都会跑，重复绑会攒一堆闭包。
+  if (!visionOutsideBound) {
+    visionOutsideBound = true;
+    document.addEventListener("click", (e) => {
+      const b = $("#visionbar");
+      if (b && !b.contains(e.target)) close();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") close();
+      // Ctrl+U = 菜单上写的快捷键，必须真能按（写了不认比不写更坏）。
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "u" && view === "chat") {
+        e.preventDefault(); file.click();
+      }
+    });
+  }
   file.onchange = () => {
+    close();
     if (file.files && file.files[0]) doVision(file.files[0]);
   };
   bar.appendChild(btn);
+  bar.appendChild(menu);
   bar.appendChild(file);
-  bar.appendChild(note);
 
   api("/api/vision")
     .then((s) => {
-      // 没配 Key 就把按钮禁用并说清原因 —— 点了才报错等于骗人
-      if (!s.available) btn.disabled = true;
+      // 没配 Key 就把入口禁用并说清理由 —— 点了才报错等于骗人。
+      if (!s.available) { btn.disabled = true; item.disabled = true; }
       note.textContent = s.notice;
     })
     .catch(() => { note.textContent = "（识别状态未知）"; });
@@ -55,6 +115,7 @@ function doVision(blob) {
   const note = $("#visionnote");
   btn.disabled = true;
   note.textContent = "正在读图（约 3–10 秒）…";
+  toast("正在读图（约 3–10 秒）…");  // 菜单已收起，进度要在看得见的地方说
   const reader = new FileReader();
   reader.onload = async () => {
     try {

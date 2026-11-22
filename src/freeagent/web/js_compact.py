@@ -57,7 +57,7 @@ function compactInit() {
   if ($("#compact-btn")) { compactApply(); return; }  // 幂等：重复调用不重复挂
   const nav = $("#nav");
   if (!nav) return;
-  const b = el("button", "ghost", "简洁");
+  const b = el("button", "btn ghost", "简洁");
   b.id = "compact-btn";
   b.type = "button";
   b.title = "折叠工作台的工具过程；点这里切换简洁 / 详细";

@@ -213,7 +213,15 @@ def agent_stop(app: App, body: dict[str, Any]) -> dict[str, Any]:
 
 #: ``POST /api/agent/<动作>`` 的派发表。做成表而不是三段 if：动作会继续加
 #: （将来还要「接着上一句说」），而 ``routes_write.py`` 已经贴着行数上限。
+def _prefs_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
+    """输入框下方那排选择器写偏好（V1.156）：只认白名单键，不接收任意字段。"""
+    keys = ("directory", "project_id", "model", "agent", "variant", "mode")
+    workspace.save_prefs(app, {k: str(body[k]) for k in keys if k in body})
+    return {"kind": "agent_prefs_saved"}
+
+
 _ACTIONS: dict[str, Callable[[App, dict[str, Any]], dict[str, Any]]] = {
+    "prefs_save": _prefs_save,
     "start": lambda app, body: workspace.agent_start(app, body, _turns(app)),
     "intake": endpoints_agent_intake.agent_intake,
     "decide": agent_decide,
@@ -234,6 +242,6 @@ def agent_post(app: App, action: str, read_body: Callable[..., dict[str, Any]]
     if handler is None:
         raise FreeAgentError(
             f"不认识的动作：{action!r}"
-            "（可选：start/intake/decide/stop/project_save/project_select/"
+            "（可选：prefs_save/start/intake/decide/stop/project_save/project_select/"
             "project_update/project_delete/reveal）")
     return handler(app, read_body())

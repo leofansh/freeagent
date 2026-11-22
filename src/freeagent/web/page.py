@@ -26,6 +26,7 @@ from .js_core import JS_CORE
 from .js_nav import JS_NAV
 from .js_compact import JS_COMPACT
 from .js_chat_search import JS_CHAT_SEARCH
+from .js_chat_shell import JS_CHAT_SHELL
 from .js_detail import JS_DETAIL
 from .js_contacts import JS_CONTACTS
 from .js_promises import JS_PROMISES
@@ -92,6 +93,7 @@ INDEX_HTML = (
             # chat_search 提供 chatSearchOpen（buildBar 的搜索按钮 onclick 用），
             # 依赖 JS_CHAT 建立的 #chatlog / .msg .bubble 结构。
             JS_CHAT_SEARCH,
+            JS_CHAT_SHELL,
             # onboard 提供 renderChatWelcome（renderChatShell 空对话时调）。
             # 只依赖 core 的 $/el/esc 与 chat 建立的 #chatlog；声明提升让
             # 顺序无关，仍按依赖写在 chat 之后。

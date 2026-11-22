@@ -47,4 +47,77 @@ STYLE_CHAT_CSS = r"""
     border: 1px solid var(--line); border-radius: var(--radius);
     font-size: 13px; line-height: 1.5; text-align: left;
   }
+
+  /* 输入框左侧的"+"附件入口（V1.149）：替代原先单摆的拍照胶囊。 */
+  #visionbar { position: relative; display: flex; align-items: flex-end; }
+  .btn.attach {
+    width: 44px; height: 44px; padding: 0; font-size: 22px; line-height: 1;
+    border-radius: 10px;
+  }
+  .attach-menu {
+    position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 30;
+    min-width: 240px; padding: 6px;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: 0 8px 24px rgba(20, 24, 30, .14);
+  }
+  .attach-item {
+    width: 100%; text-align: left; padding: 9px 10px;
+    background: var(--card-2); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px;
+    font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .attach-item:hover:not(:disabled) {
+    border-color: var(--accent); background: var(--accent-soft);
+  }
+  .attach-item:disabled { opacity: .55; cursor: not-allowed; }
+  .attach-hint { float: right; color: var(--ink-3); font-size: 12px; }
+  .attach-note { padding: 7px 4px 2px; font-size: 12px; line-height: 1.5; color: var(--ink-3); }
+
+  /* 对话工具"…"（V1.149）：搜索 / 清空 / 多选从输入栏挪到右上角。 */
+  .chat { position: relative; }
+  .chat-tools { position: absolute; top: 0; right: 0; z-index: 25; }
+  .chat-tool-menu { left: auto; right: 0; min-width: 220px; }
+  .chat-tool-menu button { white-space: nowrap; }
+  /* 右端发送箭头（V1.150）：左 + 右 ↑，与 OpenCode 的输入栏同款骨架。 */
+  .chatbar .send-arrow {
+    width: 38px; height: 38px; padding: 0; border-radius: 10px;
+    font-size: 18px; line-height: 1;
+  }
+  /* V1.153：输入框与 + / ↑ 做成一体容器，工具在下方那一行（OpenCode 同款）。 */
+  .chatbar {
+    display: flex; flex-direction: column; gap: 6px; align-items: stretch;
+    border: 1px solid var(--line); border-radius: 14px;
+    background: var(--card); padding: 10px 12px;
+  }
+  .chatbar:focus-within { border-color: var(--accent); }
+  .chatbar textarea {
+    border: none; background: transparent; padding: 0 2px;
+    min-height: 40px; max-height: 140px;
+  }
+  .chatbar textarea:focus { outline: none; }
+  .chatbar-tools { display: flex; align-items: center; gap: 8px; }
+  .chatbar-tools #visionbar { margin-right: auto; }
+  .chat-ctrl {
+    max-width: 150px; padding: 6px 8px; font: inherit; font-size: 12px;
+    color: var(--ink-2); background: var(--card-2);
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+  }
+
+  /* 三栏外壳（V1.154）：左工作区 / 中对话 / 右产物，两侧可收。 */
+  .chat-shell { display: flex; gap: 12px; height: calc(100vh - 150px); min-height: 420px; }
+  .chat-shell > .chat { flex: 1; height: 100%; min-height: 0; }
+  .chat-rail, .chat-side {
+    width: 210px; flex: none; overflow-y: auto; padding: 10px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .chat-side { width: 260px; }
+  .chat-rail-list { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+  .chat-rail-item, .chat-side-file {
+    text-align: left; padding: 7px 9px; font: inherit; font-size: 13px;
+    background: var(--card-2); color: var(--ink-2);
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+    overflow-wrap: anywhere;
+  }
+  .chat-side-files { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+  .chat-side-file { cursor: default; }
 """

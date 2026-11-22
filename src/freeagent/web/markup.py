@@ -24,7 +24,6 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
     <!-- 一级入口只放日常高频视图；其余低频视图收进「更多」下拉（V1.119）。
          视图本身一个不删，只是入口下沉 —— 下拉项仍带 data-view，接线同走 boot。 -->
     <button data-view="chat" aria-selected="true">对话</button>
-    <button data-view="workbench">工作台</button>
     <button data-view="today">今天<span class="badge" id="b-today" hidden></span></button>
     <button data-view="all">事务</button>
     <div class="menu" id="more-menu">
@@ -46,6 +45,7 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
         <button data-view="pending">待处理<span class="badge" id="b-pending" hidden></span></button>
         <button data-view="nudge">催办<span class="badge" id="b-nudge" hidden></span></button>
         <div class="menu-group">执行与通道</div>
+        <button data-view="workbench">工作台（进度与授权）</button>
         <button data-view="oc">委派总览</button>
         <button data-view="services">后台服务</button>
         <button data-view="feishu">飞书通道</button>
@@ -54,8 +54,8 @@ PAGE_MARKUP = r"""<!DOCTYPE html>
       </div>
     </div>
     <span class="spacer"></span>
-    <!-- 刷新是动作按钮，不是视图：不挂 data-view，样式弱化（.ghost）。 -->
-    <button id="refresh" title="重新读取" class="ghost">刷新</button>
+    <!-- 刷新是动作按钮，不是视图：不挂 data-view，样式弱化（.btn.ghost）。 -->
+    <button id="refresh" title="重新读取" class="btn ghost">刷新</button>
   </nav>
   <div id="root"></div>
   <p class="disclaimer" id="foot">启发式提示，不是评分 —— 助手不替你决定先做哪个。</p>

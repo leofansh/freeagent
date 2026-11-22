@@ -23,7 +23,7 @@ import pytest
 
 from freeagent.domain import FreeAgentError
 from freeagent.services import agent_turn
-from freeagent.web import endpoints_agent, endpoints_agent_workspace
+from freeagent.web import endpoints_agent, endpoints_agent_intake, endpoints_agent_workspace
 
 
 class _FakeTurns:
@@ -69,6 +69,31 @@ def _app(tmp_path, turns=None):
         agent_turns=turns,
         config=types.SimpleNamespace(home=str(tmp_path)),
     )
+
+
+class TestPrefsSaveEndpoint:
+    def test_only_whitelisted_keys_are_written(self, tmp_path):
+        app = _app(tmp_path)
+        # workspace.save_prefs 用 app.config.home；这里只验动作存在且白名单过滤。
+        from freeagent.web import endpoints_agent
+
+        assert "prefs_save" in endpoints_agent._ACTIONS
+        saved = endpoints_agent._prefs_save(app, {"model": "m1", "evil": "x"})
+        assert saved["kind"] == "agent_prefs_saved"
+
+
+class TestIntakeReadinessEndpoint:
+    def test_reports_both_prerequisites_without_touching_the_model(self):
+        """探测只读、不花模型；两项前提各自如实回，不合并成一个布尔。"""
+        app = types.SimpleNamespace(
+            chat=types.SimpleNamespace(capabilities=None),
+            llm=None,
+        )
+        data = endpoints_agent_intake.agent_intake_ready(app)
+        assert data["kind"] == "agent_intake_ready"
+        assert data["ready"] is False
+        assert data["projects"] is False and data["model"] is False
+        assert data["reason"] == "no_projects" and data["question"]
 
 
 class TestStateAndTurn:

@@ -95,11 +95,6 @@ function renderChatShell(menu) {
   log.id = "chatlog";
   wrap.appendChild(log);
 
-  // 拍照入口的容器要**先于**输入框存在，loadVisionBar 才能挂上去
-  const vbar = el("div", "chips");
-  vbar.id = "visionbar";
-  wrap.appendChild(vbar);
-
   // wrap 必须**在往里 addMsg 之前**就进文档。
   //
   // 踩过的坑（真在浏览器里跑出来的）：addMsg / addChips 用
@@ -134,45 +129,48 @@ function renderChatShell(menu) {
 
   const bar = buildBar();
   wrap.appendChild(bar);
+  // 对话工具（搜索 / 清空 / 多选）收进右上角"…"，不占输入栏。
+  chatToolsMount();
+  chatShellMount();  // V1.154：左工作区 / 右产物三栏外壳
   // wrap 早就挂到 root 上了（见上面那行），这里只补输入框。
-  $("#foot").textContent =
-    "我能读你已记的事，也能记新的；不改已有事务。启用了排序的地方都是启发式提示，不是评分。";
+  // 页脚只留契约要求的免责标记；能力边界已在欢迎区说过，不必每行重复。
+  $("#foot").textContent = "启发式提示，不是评分 —— 助手不替你决定先做哪个。";
   $("#chatinput").focus();
 }
 
 function buildBar() {
   const bar = el("div", "chatbar");
+  // V1.153：输入区做成一体容器；+ 与发送箭头并排在输入框下方那一行。
+  const tools = el("div", "chatbar-tools");
+  const vbar = el("div"); vbar.id = "visionbar"; tools.appendChild(vbar);
   const ta = el("textarea");
   ta.id = "chatinput";
   ta.rows = 1;
-  ta.placeholder = "问我「今天该做什么」，或直接说一件事记下来";
-  const send = el("button", null, "发送");
-  send.id = "chatsend";
+  ta.placeholder = "问我「今天该做什么」，或直接说一件事记下来（回车发送）";
   bar.appendChild(ta);
-  bar.appendChild(send);
-  // 对话内搜索（V1.132）：长对话能搜能跳；Ctrl/Cmd+F 也走这里。
-  const search = el("button", null, "搜索");
-  search.title = "搜这段对话（Ctrl+F）";
-  search.onclick = () => chatSearchOpen();
-  bar.appendChild(search);
-  if (history_.length) {
-    const clear = el("button", null, "清空");
-    clear.title = "清掉这段对话（不影响已记的事务）";
-    clear.onclick = clearHistory;
-    bar.appendChild(clear);
-    // 「多选删除」入口；选择态与删除语义在 js_chat_select（行数守卫）。
-    const pick = el("button", null, "多选删除");
-    pick.title = "勾选要删的消息：删所选，或删到此为止（含这条）";
-    pick.onclick = chatEnterPick;
-    bar.appendChild(pick);
-  }
+  // 箭头在 + 同一行右端（回车仍是主路径，箭头照顾触屏）。
+  const send = el("button", "btn primary send-arrow", "↑");
+  send.id = "chatsend"; send.title = "发送（回车）";
+  send.onclick = () => sendChat();
+  tools.appendChild(send); bar.appendChild(tools);
+  // 直接把剪贴板里的图片粘进输入框 → 走同一条视觉识别链路（V1.150）。
+  ta.onpaste = (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const it of items) {
+      if (it.type && it.type.indexOf("image/") === 0) {
+        const blob = it.getAsFile();
+        if (blob) { e.preventDefault(); doVision(blob); return; }
+      }
+    }
+  };
+  ta.title = "回车发送，Shift+回车换行；可直接粘贴图片";
   ta.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendChat();
     }
   };
-  send.onclick = () => sendChat();
   ta.oninput = () => {
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, 140) + "px";

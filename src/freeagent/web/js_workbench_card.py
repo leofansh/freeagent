@@ -108,10 +108,11 @@ async function wbDecide(id, allow, answer, scope) {
   wbArm(100);
 }
 
-async function wbSend(force) {
+async function wbSend(force, presetText) {
   if (wbBusy) return;
   const dir = ($("#wb-dir") || {}).value || "";
-  const text = ($("#wb-text") || {}).value || "";
+  // 第二个输入框已收（V1.157）：「仍交给引擎」重发时用最近一轮的原文。
+  const text = (presetText || "").trim() || (wbTurn && wbTurn.brief) || "";
   const model = ($("#wb-model") || {}).value || "";
   const mode = ($("#wb-mode") || {}).value || "ask";
   const injectBox = $("#wb-inject");
@@ -144,7 +145,7 @@ async function wbSend(force) {
       route.appendChild(b);
     }
   }
-  if (res.routed) { $("#wb-text").value = ""; }
+  // 输入框已收走，没有可清的草稿（V1.157）。
   // 发新的一句话 = 回到「现在」：还留着历史标记的话，画面上会挂一条
   // 「正在看历史」，而人刚才是要它动手。
   wbHistId = "";

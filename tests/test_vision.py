@@ -353,6 +353,24 @@ class TestNoVisionConfigured:
         assert app.vision is not None
         app.close()
 
+    def test_apply_config_rebuilds_vision_without_restart(self, tmp_path, monkeypatch):
+        """设置页存完 Key 不该还提示「没有 DEEPSEEK_API_KEY」（V1.147）。
+
+        真机踩到的坑：apply_config 只重建了文本层，vision 停在启动时的 None，
+        而健康接口按 app.vision 报「有没有 Key」，于是配置与提示自相矛盾。
+        """
+        from freeagent.app import build_app
+        from freeagent.config import load_config
+
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        app = build_app(tmp_path / "a.db", clock=FrozenClock(datetime(2026, 9, 26, 14)))
+        assert app.vision is None
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        app.apply_config(load_config(str(tmp_path)))
+        assert app.vision is not None, "配置立即生效必须包含视觉层，不能要重启"
+        app.close()
+
 
 # =============================================================================
 # 图片不落盘

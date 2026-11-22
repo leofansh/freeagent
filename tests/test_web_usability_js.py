@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from freeagent.web.js_boot import JS_BOOT
 from freeagent.web.js_chat import JS_CHAT
+from freeagent.web.js_workbench_intake import JS_WORKBENCH_INTAKE
 from freeagent.web.js_contacts import JS_CONTACTS
 from freeagent.web.js_detail import JS_DETAIL
 from freeagent.web.js_promises import JS_PROMISES
@@ -320,13 +321,26 @@ class TestWorkbenchIntake:
         assert "wbIntakeMount()" in INDEX_HTML
         assert "function wbIntake" in INDEX_HTML
 
-    def test_mount_is_in_workbench_page(self):
+    def test_mount_is_not_in_workbench_page(self):
+        # V1.157：第二个输入框已收，派活只在对话页（V1.152 的「…→交给它执行」）。
         body = _body(JS_WORKBENCH_PAGE, "loadWorkbench")
-        assert "wbIntakeMount()" in body, "识别卡片必须挂在工作台里"
+        assert "wbIntakeMount()" not in body
 
     def test_calls_the_intake_endpoint(self):
         body = _body(JS_WORKBENCH_INTAKE, "wbIntake")
         assert '"/api/agent/intake"' in body
+
+    def test_prerequisites_are_shown_before_the_user_types(self):
+        """V1.147：卡片先探测前提，没授权项目 / 没连模型时输入框保持禁用。"""
+        mount = _body(JS_WORKBENCH_INTAKE, "wbIntakeMount")
+        assert "wbIntakeProbe()" in mount
+        assert 'input.disabled = true' in mount and 'go.disabled = true' in mount
+        probe = _body(JS_WORKBENCH_INTAKE, "wbIntakeProbe")
+        assert '"/api/agent/intake/ready"' in probe
+        assert "wbIntakeReady = res" in probe, "结果存模块级，重绘后不用重探"
+        paint = _body(JS_WORKBENCH_INTAKE, "wbIntakeApply")
+        assert "input.disabled = false" in paint and "go.disabled = false" in paint
+        assert 'res.reason === "no_model" ? "settings" : "feishu"' in paint
 
     def test_recognized_prefills_the_existing_form(self):
         body = _body(JS_WORKBENCH_INTAKE, "wbIntake")

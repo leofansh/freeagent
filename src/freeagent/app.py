@@ -153,6 +153,10 @@ class App:
         """
         self.config = config
         self.llm = build_provider(config)
+        # 视觉层也要随配置重建（V1.147）：以前只换文本层，设置页存完 Key 后
+        # llm 已是 DeepSeek，vision 却还是启动时那个 None，页面继续说「没有
+        # DEEPSEEK_API_KEY」—— 配置声称立即生效，视觉这一半却要重启才生效。
+        self.vision = build_vision_provider(config)
         self.energy_windows = config.energy_windows
         self.today.set_energy_windows(config.energy_windows)
         self.quiet_hours = config.quiet_hours

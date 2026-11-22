@@ -15,7 +15,83 @@ from __future__ import annotations
 __all__ = ["JS_CHAT_SEARCH"]
 
 JS_CHAT_SEARCH = r"""// 对话内搜索（V1.132）：在 #chatlog 前插一条搜索框，逐条高亮命中。
+// 对话工具（V1.149）也挂在这里：搜索 / 清空 / 多选删除同属「对这段对话做事」，
+// 一起收进右上角"…"，不再各占一颗输入栏按钮（豆包同款位置）。
 let faSearchHits = [];
+let chatToolsBound = false;
+
+async function chatDelegate() {
+  const ta = $("#chatinput");
+  const text = (ta ? ta.value : "").trim();
+  if (!text) { toast("先写一句要做什么"); return; }
+  let st;
+  try { st = await api("/api/agent/state"); }
+  catch (e) { toast("读不到工作台设置：" + e.message); return; }
+  const p = st.prefs || {};
+  const dir = p.directory || "";
+  if (!dir) { toast("还没选工作目录 —— 先去工作台选一个"); return; }
+  const modeText = p.mode === "auto_dir" ? "本目录内自动" : "逐次授权";
+  // 显式确认：派发出去会花钱、可能改文件，目录与档位必须让人看一眼。
+  if (!window.confirm("把这句话交给引擎执行？\n\n目录：" + dir +
+      "\n档位：" + modeText + "\n\n" + text)) return;
+  try {
+    const r = await post("/api/agent/start", {
+      text: text, directory: dir, mode: p.mode || "ask", force: true,
+    });
+    addMsg("bot", "已交给引擎：" + (r.reason || "正在后台跑"), "kind-answer", null, false);
+    ta.value = ""; ta.style.height = "auto";
+    load("workbench");  // 进度 / 授权卡都在那边看
+  } catch (e) { toast("派发失败：" + e.message); }
+}
+
+function chatToolsMount() {
+  const chat = document.querySelector(".chat");
+  if (!chat || $("#chat-tools")) return;
+  const box = el("div", "chat-tools");
+  box.id = "chat-tools";
+  const btn = el("button", "btn ghost", "···");
+  btn.id = "chat-more-btn";
+  btn.title = "对话工具：搜索 / 清空 / 多选";
+  btn.setAttribute("aria-haspopup", "true");
+  btn.setAttribute("aria-expanded", "false");
+  const menu = el("div", "menu-pop chat-tool-menu");
+  menu.id = "chat-tool-menu";
+  menu.hidden = true;
+  const add = (label, fn) => {
+    const b = el("button", null, label);
+    b.onclick = () => {
+      menu.hidden = true; btn.setAttribute("aria-expanded", "false"); fn();
+    };
+    menu.appendChild(b);
+  };
+  // 对话是唯一入口：一句话在这里说完，"交给它"也在这里（V1.152）。
+  add("交给它执行", chatDelegate);
+  add("查找对话内容（Ctrl+F）", chatSearchOpen);
+  if (history_.length) {
+    add("清空对话", clearHistory);
+    add("多选删除", chatEnterPick);
+  }
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    menu.hidden = !menu.hidden;
+    btn.setAttribute("aria-expanded", String(!menu.hidden));
+  };
+  box.appendChild(btn); box.appendChild(menu);
+  chat.appendChild(box);
+  if (!chatToolsBound) {
+    chatToolsBound = true;
+    document.addEventListener("click", (e) => {
+      const b = $("#chat-tools");
+      if (b && !b.contains(e.target)) {
+        menu.hidden = true; btn.setAttribute("aria-expanded", "false");
+      }
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { menu.hidden = true; btn.setAttribute("aria-expanded", "false"); }
+    });
+  }
+}
+
 let faSearchIdx = -1;
 
 function chatSearchOpen() {

@@ -265,10 +265,12 @@ class TestChatSelectWiring:
             "loadChat 末尾必须调 chatPickPaint —— 否则渲染出的消息没有复选框"
         )
 
-    def test_build_bar_has_entry_button(self):
-        body = _chat_body("buildBar")
-        assert "chatEnterPick" in body, (
-            "输入框工具条里要有「多选删除」入口"
+    def test_tools_menu_has_entry_button(self):
+        from freeagent.web.js_chat_search import JS_CHAT_SEARCH
+
+        assert "function chatToolsMount" in JS_CHAT_SEARCH
+        assert "chatEnterPick" in JS_CHAT_SEARCH, (
+            "「多选删除」入口要在右上角对话工具菜单里"
         )
 
     def test_nav_leaves_pick_mode(self):

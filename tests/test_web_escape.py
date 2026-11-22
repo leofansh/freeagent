@@ -100,14 +100,16 @@ class TestWorkbenchRenderEscapes:
         from freeagent.web.js_workbench_card import JS_WORKBENCH_CARD
         from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
 
-        assert "wbSend(false)" in JS_WORKBENCH_PAGE
+        # V1.157：第二个输入框已收，「仍交给引擎」重发用最近一轮原文。
+        assert "wbSend(false)" not in JS_WORKBENCH_PAGE
+        assert "(wbTurn && wbTurn.brief)" in JS_WORKBENCH_CARD
         assert "wbDecide(turn.id" in JS_WORKBENCH_CARD
 
     def test_stop_and_send_buttons_carry_ids(self):
         from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
 
         assert 'stop.id = "wb-stop"' in JS_WORKBENCH_PAGE
-        assert 'send.id = "wb-send"' in JS_WORKBENCH_PAGE
+        assert 'send.id = "wb-send"' not in JS_WORKBENCH_PAGE, "第二个输入框已收"
 
 
 def _js_body(path: Path) -> str:

@@ -148,3 +148,36 @@ class TestCarryAnswers:
             carry={"need": "project", "project": "", "brief": "做点事"},
         )
         assert p.directory == "D:/beta"
+
+
+class RuleBasedProvider:
+    """假规则层：名字与真实现一致，readiness 必须认出它不是可用模型。"""
+
+    def parse_delegation(self, text, known_projects):
+        raise AssertionError("规则层不该被当成可用模型调用")
+
+
+class TestReadiness:
+    def test_ready_when_projects_and_model_present(self):
+        r = delegate_intake.readiness(_view(), _LLM())
+        assert r.ready and r.projects and r.model
+        assert not r.reason and not r.question
+
+    def test_no_projects_blocks_even_with_model(self):
+        r = delegate_intake.readiness(CapabilityView(), _LLM())
+        assert not r.ready and not r.projects and r.model
+        assert r.reason == "no_projects"
+
+    def test_rule_based_provider_is_not_a_model(self):
+        r = delegate_intake.readiness(_view(), RuleBasedProvider())
+        assert not r.ready and r.projects and not r.model
+        assert r.reason == "no_model"
+
+    def test_probe_and_parse_agree_on_the_message(self):
+        # 卡面与实际解析必须说同一句话，否则「卡上说没授权、点下去说没模型」。
+        r = delegate_intake.readiness(CapabilityView(), _LLM())
+        p = delegate_intake.plan("让它改 Alpha 做事", CapabilityView(), _LLM())
+        assert r.reason == p.reason and r.question == p.question
+        r2 = delegate_intake.readiness(_view(), RuleBasedProvider())
+        p2 = delegate_intake.plan("让它改 Alpha 做事", _view(), RuleBasedProvider())
+        assert r2.reason == p2.reason and r2.question == p2.question
