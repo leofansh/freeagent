@@ -1,9 +1,18 @@
-"""工作台前端（二·补）：工作目录浏览（设计文档 21.4 / V1.123）。
+"""工作台前端（二·补）：工作目录浏览（设计文档 21.4 / V1.123，V1.127 重做）。
 
 ## 为什么从 ``js_workbench_page`` 拆出来
 
 页面装配 + 模型清单 + 目录浏览三段挤在一个文件里，250 行体积守卫
 （``TestWebPackageStaysSmall``）守不住；按职责把「目录浏览」这一刀独立出来。
+
+## V1.127 重做了什么
+
+旧版把一整层目录塞进原生 ``<select>``：选中即进入下一层，导航与选择挤在同一
+个控件里，首屏还混着点目录与 Windows 遗留 junction。这一版改成：
+
+- 行列表点行进入，底部「选用此目录」选定当前层；
+- 可见路径输入框，可粘贴绝对路径、回车走同一道校验跳转；
+- 最近目录一行（项目档案），快捷位置 / 盘符 / 面包屑 / 当前层过滤保留。
 
 ## 目录浏览为什么只到「点」为止
 
@@ -29,9 +38,13 @@ let wbDirData = null;
 //: 二级浏览的选定回调：建档 / 表单回填各传一个；为空时沿用旧行为（写回 #wb-dir）。
 let wbPickCallback = null;
 
+function dirSep(p) {
+  return p.indexOf(String.fromCharCode(92)) >= 0 ? String.fromCharCode(92) : "/";
+}
+
 // 把绝对路径拆成可点击的面包屑段；Windows 盘符段与 Unix 根分别拼累积路径。
 function dirSegments(p) {
-  const seg = p.indexOf(String.fromCharCode(92)) >= 0 ? String.fromCharCode(92) : "/";
+  const seg = dirSep(p);
   const parts = p.split(seg).filter(Boolean);
   const segs = [];
   let acc = "";
@@ -44,32 +57,29 @@ function dirSegments(p) {
   return segs;
 }
 
-function paintDirSelect() {
-  const sel = $("#wb-dir-pick");
-  if (!sel || !wbDirData) return;
-  sel.innerHTML = "";
+function paintDirList() {
+  const list = $("#wb-dir-list");
+  if (!list || !wbDirData) return;
+  list.innerHTML = "";
   const q = (($("#wb-dir-filter") || {}).value || "").trim().toLowerCase();
   if (wbDirData.parent) {
-    const up = el("option", null, ".. 上一级");
-    up.value = wbDirData.parent;
-    sel.appendChild(up);
+    const up = el("button", "dir-row", ".. 上一级");
+    up.onclick = () => wbBrowse(wbDirData.parent, wbPickCallback);
+    list.appendChild(up);
   }
-  // 当前目录作为禁选项列出来：打开下拉时不至于分不清「现在在哪」。
-  const here = el("option", null, "（当前目录）");
-  here.value = wbDirData.path;
-  here.disabled = true;
-  sel.appendChild(here);
-  const seg = wbDirData.path.indexOf(String.fromCharCode(92)) >= 0
-    ? String.fromCharCode(92) : "/";
-  wbDirItems.filter((n) => !q || n.toLowerCase().includes(q)).forEach((name) => {
-    const o = el("option", null, esc(name));
-    o.value = (wbDirData.path.endsWith(seg) ? wbDirData.path : wbDirData.path + seg) + name;
-    sel.appendChild(o);
+  const seg = dirSep(wbDirData.path);
+  const base = wbDirData.path.endsWith(seg) ? wbDirData.path : wbDirData.path + seg;
+  const hits = wbDirItems.filter((n) => !q || n.toLowerCase().includes(q));
+  if (!hits.length) {
+    list.appendChild(el("div", "note", "这一层没有匹配的文件夹"));
+    return;
+  }
+  hits.forEach((name) => {
+    const row = el("button", "dir-row", esc(name));
+    row.title = base + name;
+    row.onclick = () => wbBrowse(base + name, wbPickCallback);
+    list.appendChild(row);
   });
-  sel.onchange = () => {
-    $("#wb-dir").value = sel.value;
-    wbBrowse(sel.value, wbPickCallback);
-  };
 }
 
 async function wbBrowse(path, onPick) {
@@ -88,10 +98,22 @@ async function wbBrowse(path, onPick) {
   wbDirData = data;
   wbDirItems = data.items;
   box.innerHTML = "";
-  // 无论从 chips / 面包屑 / 下拉哪条路过来，输入框都跟着当前层走，
-  // 否则人看到的路径与浏览面板对不上。
+  // 无论从 chips / 面包屑 / 路径框哪条路过来，隐藏目录框都跟着当前层走，
+  // 否则人看到的路径与发送时用的目录对不上。
   const dirInput = $("#wb-dir");
   if (dirInput) dirInput.value = data.path;
+
+  // 最近目录：项目档案里用过的文件夹，直达不用逐级翻。这是入口不是白名单。
+  if ((data.recent || []).length) {
+    const recent = el("div", "chips");
+    data.recent.forEach((r) => {
+      const b = el("button", "chip", esc(r.label));
+      b.title = r.path;
+      b.onclick = () => wbBrowse(r.path, wbPickCallback);
+      recent.appendChild(b);
+    });
+    box.appendChild(recent);
+  }
 
   // 快捷位置（家目录/桌面/下载/文档）与可用盘符：点下去仍走同一个校验端点。
   const quick = el("div", "chips");
@@ -117,19 +139,38 @@ async function wbBrowse(path, onPick) {
   });
   box.appendChild(crumb);
 
-  box.appendChild(el("div", "note", esc(data.path) +
-    (data.truncated ? "（只列前 " + data.items.length + " 个，共 " + data.total + "）" : "")));
+  // 可见路径框：可粘贴绝对路径；回车按同一道 resolve_workdir 校验后跳转。
+  const pathInput = el("input");
+  pathInput.type = "text";
+  pathInput.id = "wb-dir-path";
+  pathInput.value = data.path;
+  pathInput.placeholder = "粘贴或输入绝对路径，回车跳转";
+  pathInput.onkeydown = (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      wbBrowse(pathInput.value.trim(), wbPickCallback);
+    }
+  };
+  box.appendChild(pathInput);
+
+  const note = el("div", "note");
+  note.id = "wb-dir-note";
+  note.textContent = data.truncated
+    ? "只列前 " + data.items.length + " 个，共 " + data.total + " 个文件夹"
+    : "";
+  box.appendChild(note);
 
   const filter = el("input");
+  filter.type = "text";
   filter.id = "wb-dir-filter";
   filter.placeholder = "过滤当前层目录…";
-  filter.oninput = paintDirSelect;
+  filter.oninput = paintDirList;
   box.appendChild(filter);
 
-  const sel = el("select");
-  sel.id = "wb-dir-pick";
-  box.appendChild(sel);
-  paintDirSelect();
+  const list = el("div", "dir-list");
+  list.id = "wb-dir-list";
+  box.appendChild(list);
+  paintDirList();
 
   // 二级兜底：选定当前层才建档 / 回填。没有回调时写回隐藏目录框，沿用旧行为。
   const useRow = el("div", "row1");

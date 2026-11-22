@@ -83,12 +83,12 @@ class TestPath:
         assert default_path(tmp_path) == tmp_path / CACHE_FILE_NAME
 
     def test_uses_freeagent_home_env(self, tmp_path, monkeypatch):
-        """和 ``config.config_path`` 同一套解析：FREEAGENT_HOME → ~/.freeagent。
+        """和 ``config.config_path`` 同一套解析：STEWARD_HOME → ~/.freeagent。
 
         刻意不用「另写一遍路径解析」—— 复制粘贴的解析迟早漂移，而漂移的
         表现是「写 A 目录、读 B 目录找」，缓存永远不命中且**没有任何报错**。
         """
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
         assert default_path() == tmp_path / CACHE_FILE_NAME
 
 

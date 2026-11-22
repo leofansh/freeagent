@@ -832,7 +832,7 @@ class TestSettings:
         都没它，于是那个框又窄又没统一外观，占位符被截成
         「填了会写进 ~\\.free…」—— 而那正是用户最需要看清的一句
         （它要说清 Key 会写到哪个文件）。真值见 ``paths.py``：
-        默认 ``~/.freeagent/llm.env``，可由 ``FREEAGENT_HOME`` 改。
+        默认 ``~/.freeagent/llm.env``，可由 ``STEWARD_HOME`` 改。
         """
         from freeagent.web.style import STYLE_CSS
 

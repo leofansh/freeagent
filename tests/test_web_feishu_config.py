@@ -104,7 +104,7 @@ def test_saved_config_actually_reaches_the_bridge(served, monkeypatch):
     回归：``load_config`` 原先**只读进程环境变量**、不读 ``feishu.env``，
     于是界面存了配置、桥接却当没有 —— 一个「显示已保存但毫无作用」的假功能。
 
-    这里用 ``FREEAGENT_HOME`` 把默认状态目录指到测试目录，然后调
+    这里用 ``STEWARD_HOME`` 把默认状态目录指到测试目录，然后调
     ``load_config(env=None)`` —— 和桥接启动时**完全一样**的调用方式。
     只测 ``merged_env(home=...)`` 是不够的：那验证的是合并函数，
     而桥接压根不传 home。
@@ -117,7 +117,7 @@ def test_saved_config_actually_reaches_the_bridge(served, monkeypatch):
     })
     assert status == 200
     home = Path(_app_home(addr))
-    monkeypatch.setenv("FREEAGENT_HOME", str(home))
+    monkeypatch.setenv("STEWARD_HOME", str(home))
 
     from freeagent.feishu.config import load_config
 
@@ -138,7 +138,7 @@ def test_bridge_env_wins_over_file(served, monkeypatch):
     一次性覆盖会失效，而 doctor、测试、CI 都依赖它。"""
     addr, _app = served
     save(addr, {"FEISHU_APP_ID": "cli_from_file"})
-    monkeypatch.setenv("FREEAGENT_HOME", str(_app_home(addr)))
+    monkeypatch.setenv("STEWARD_HOME", str(_app_home(addr)))
     monkeypatch.setenv("FEISHU_APP_ID", "cli_from_env")
 
     from freeagent.feishu.config import load_config
@@ -153,7 +153,7 @@ def test_empty_env_var_is_not_silently_refilled(served, monkeypatch):
     最不该被悄悄推翻的就是用户明确写出来的空值。"""
     addr, _app = served
     save(addr, {"FEISHU_APP_SECRET": SECRET})
-    monkeypatch.setenv("FREEAGENT_HOME", str(_app_home(addr)))
+    monkeypatch.setenv("STEWARD_HOME", str(_app_home(addr)))
     monkeypatch.setenv("FEISHU_APP_SECRET", "")
 
     from freeagent.feishu.config import merged_env
@@ -326,7 +326,7 @@ def test_lock_port_from_the_file_reaches_the_bridge(served, monkeypatch):
     addr, _app = served
     status, _data = save(addr, {"FEISHU_LOCK_PORT": "8791"})
     assert status == 200
-    monkeypatch.setenv("FREEAGENT_HOME", str(_app_home(addr)))
+    monkeypatch.setenv("STEWARD_HOME", str(_app_home(addr)))
     monkeypatch.delenv("FEISHU_LOCK_PORT", raising=False)
 
     from freeagent.feishu.bridge import lock_port_from_env
@@ -336,7 +336,7 @@ def test_lock_port_from_the_file_reaches_the_bridge(served, monkeypatch):
 
 def test_lock_port_still_defaults(served, monkeypatch):
     """改了读取方式之后,默认值不能被顺带弄坏。"""
-    monkeypatch.setenv("FREEAGENT_HOME", str(_app_home(served[0])))
+    monkeypatch.setenv("STEWARD_HOME", str(_app_home(served[0])))
     monkeypatch.delenv("FEISHU_LOCK_PORT", raising=False)
     from freeagent.feishu.bridge import DEFAULT_LOCK_PORT, lock_port_from_env
 
@@ -353,7 +353,7 @@ def test_lock_port_garbage_still_raises(served, monkeypatch):
     （见 ``test_rejects_a_non_numeric_lock_port``），所以手改文件和
     ``set`` 变量是剩下两条真正可达的坏值来源，后者要照样炸。
     """
-    monkeypatch.setenv("FREEAGENT_HOME", str(_app_home(served[0])))
+    monkeypatch.setenv("STEWARD_HOME", str(_app_home(served[0])))
     monkeypatch.setenv("FEISHU_LOCK_PORT", "not-a-number")
 
     from freeagent.feishu.bridge import lock_port_from_env

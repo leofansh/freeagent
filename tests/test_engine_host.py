@@ -29,6 +29,8 @@ class FakeServer:
         self.healthy_answer = True
         self.prompts: list[tuple[str, str, dict[str, str]]] = []
         self.aborts = 0
+        self.pending: list[object] = []
+        self.pending_error: Exception | None = None
         FakeServer.instances.append(self)
 
     def start(self) -> "FakeServer":
@@ -51,6 +53,11 @@ class FakeServer:
 
     def events(self, *, timeout: float = 600.0):  # noqa: ANN201 - 替身
         return iter(())
+
+    def pending_permissions(self, directory: str | None = None) -> list[object]:
+        if self.pending_error is not None:
+            raise self.pending_error
+        return list(self.pending)
 
     def abort(self, session: str) -> None:
         self.aborts += 1
@@ -227,3 +234,73 @@ class TestLifecycle:
         host.halt()
         host.halt()
         assert FakeServer.instances[0].closed == 1
+
+
+class TestPendingPassthrough:
+    """挂起授权兜底拉取：透传列表；服务不在 / 拉取失败回空，不抛、不放行。"""
+
+    def test_no_server_returns_empty(self, host) -> None:
+        assert host.pending_permissions() == []
+
+    def test_passthrough_pending_list(self, host, tmp_path) -> None:
+        host.ensure(directory=str(tmp_path))
+        FakeServer.instances[0].pending = [{"id": "p1"}]
+        assert host.pending_permissions(directory=str(tmp_path)) == [{"id": "p1"}]
+
+    def test_server_failure_falls_back_to_empty(self, host, tmp_path) -> None:
+        host.ensure(directory=str(tmp_path))
+        FakeServer.instances[0].pending_error = ServerError("拉不到")
+        # 兜底查询失败不能把这一轮炸掉，也不能误报「没有授权」。
+        assert host.pending_permissions() == []
+
+
+class TestLedger:
+    """改动账（V1.135）：附加信息，读不到说原因、带缓存、换会话清掉。"""
+
+    def _server_cls(self):
+        class LedgerServer(FakeServer):
+            def __init__(self, **kw: object) -> None:
+                super().__init__(**kw)
+                self.calls = 0
+
+            def call(self, path, method="GET", body=None, *, timeout=30.0):
+                self.calls += 1
+                return (200, (
+                    b'{"data":[{"content":[{"type":"tool","name":"edit",'
+                    b'"state":{"input":{"filePath":"D:/a.py"}}}]}]}'
+                ))
+
+        return LedgerServer
+
+    def test_no_session_is_unreadable(self, host) -> None:
+        data = host.ledger()
+        assert data["state"] == "unreadable"
+        assert data["files"] == []
+        assert "理由" in data["reason"] or "会话" in data["reason"]
+
+    def test_read_and_cache(self, host, tmp_path) -> None:
+        host._factory = self._server_cls()
+        host.ensure(directory=str(tmp_path))
+        first = host.ledger()
+        assert first["state"] == "changed"
+        assert first["files"] == [{"path": "D:/a.py", "count": 1}]
+        server = FakeServer.instances[0]
+        assert server.calls == 1
+        host.ledger()
+        assert server.calls == 1, "TTL 内不该再分页拉引擎消息"
+
+    def test_adapter_without_call_is_unreadable(self, host, tmp_path) -> None:
+        host.ensure(directory=str(tmp_path))  # FakeServer 没有 call
+        data = host.ledger()
+        assert data["state"] == "unreadable"
+        assert "接口" in data["reason"]
+
+    def test_halt_clears_cache(self, host, tmp_path) -> None:
+        host._factory = self._server_cls()
+        host.ensure(directory=str(tmp_path))
+        host.ledger()
+        host.halt()
+        assert host.ledger()["state"] == "unreadable", "停了就不拿旧账充数"
+        host.ensure(directory=str(tmp_path))
+        host.ledger()
+        assert FakeServer.instances[-1].calls == 1, "换会话重新拉，不沿用上一会话的账"

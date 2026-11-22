@@ -134,6 +134,36 @@ class TestProjectEndpoints:
         assert state["prefs"]["directory"] == str(tmp_path)
 
 
+class TestProjectCounts:
+    """左栏的「跑过几轮」（V1.139）—— 现算，读不到回 None 而不是 0。
+
+    「还没跑过」和「读不出来」是两句话：把后者写成 0，人就会以为这个
+    工作区是空白的，而实际上只是轮次表没挂上。
+    """
+
+    def _turn(self, app, directory: str, i: int) -> None:
+        app.turn_repo.add(
+            turn_id=f"t{i}", brief="一句话", directory=directory,
+            mode="ask", started_at=app.clock.now(),
+        )
+
+    def test_counts_only_this_directory(self, app, tmp_path):
+        for i in range(2):
+            self._turn(app, str(tmp_path), i)
+        self._turn(app, str(tmp_path / "other"), 9)
+        ep.agent_project_save(app, {"directory": str(tmp_path)})
+        assert ep.agent_projects(app)["projects"][0]["turns"] == 2
+
+    def test_zero_turns_is_zero_not_missing(self, app, tmp_path):
+        ep.agent_project_save(app, {"directory": str(tmp_path)})
+        assert ep.agent_projects(app)["projects"][0]["turns"] == 0
+
+    def test_no_turn_repo_reads_as_none(self, app, tmp_path, monkeypatch):
+        ep.agent_project_save(app, {"directory": str(tmp_path)})
+        monkeypatch.setattr(app, "turn_repo", None)
+        assert ep.agent_projects(app)["projects"][0]["turns"] is None
+
+
 class _NoRepoApp:
     """老装配 / 测试替身没挂仓储：建档能力如实缺席，至少把目录记进偏好。"""
 

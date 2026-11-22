@@ -47,8 +47,8 @@ class _FakeTurns:
     def view(self, turn_id):
         return self._view if (self._view and turn_id == self._view.turn_id) else None
 
-    def decide(self, turn_id, *, allow, answer=""):
-        self.decided.append((turn_id, allow, answer))
+    def decide(self, turn_id, *, allow, answer="", scope=""):
+        self.decided.append((turn_id, allow, answer, scope))
         return turn_id == "t1"
 
     def stop(self, turn_id):
@@ -126,6 +126,29 @@ class TestDirs:
         assert data["drives"], "至少要有一个可浏览的根"
         for root in data["drives"]:
             assert pathlib.Path(root).is_dir()
+
+    def test_normal_dirs_come_before_dot_dirs(self, tmp_path):
+        """点目录保留但排后：找常用文件夹不必先翻过一堆隐藏项。"""
+        (tmp_path / ".hidden").mkdir()
+        (tmp_path / "src").mkdir()
+        data = endpoints_agent_workspace.agent_dirs(
+            _app(tmp_path), {"path": [str(tmp_path)]})
+        assert data["items"] == ["src", ".hidden"]
+
+    def test_normal_dir_is_not_reparse(self, tmp_path):
+        assert endpoints_agent_workspace._is_reparse(tmp_path) is False
+
+    def test_recent_dirs_come_from_project_repo(self, tmp_path):
+        """最近目录直达入口：档案按最近使用倒序，目录去重；不是白名单。"""
+        app = _app(tmp_path)
+        app.project_repo = types.SimpleNamespace(list_all=lambda: [
+            {"name": "freeagent", "directory": str(tmp_path / "proj-a")},
+            {"name": "freeagent", "directory": str(tmp_path / "proj-a")},
+            {"name": "proj-b", "directory": str(tmp_path / "proj-b")},
+        ])
+        data = endpoints_agent_workspace.agent_dirs(app, {"path": [str(tmp_path)]})
+        assert [r["path"] for r in data["recent"]] == [
+            str(tmp_path / "proj-a"), str(tmp_path / "proj-b")]
 
 
 class TestStart:
@@ -273,8 +296,20 @@ class TestPost:
         body = {"id": "t1", "allow": True, "answer": ""}
         endpoints_agent.agent_post(app, "decide", lambda **kw: body)
         endpoints_agent.agent_post(app, "stop", lambda **kw: {"id": "t1"})
-        assert turns.decided == [("t1", True, "")]
+        assert turns.decided == [("t1", True, "", "")]
         assert turns.stopped == ["t1"]
+
+    def test_session_scope_is_passed_to_decide(self, tmp_path):
+        """「本会话内允许此类」的 scope 必须透传到服务层（V1.138）。
+
+        只在前端加按钮、端点不传 scope，服务层就永远不会记住同类放行 ——
+        卡上点了「本会话都允许」却下一次还问，这是最像兑现的落空。
+        """
+        turns = _FakeTurns()
+        app = _app(tmp_path, turns)
+        body = {"id": "t1", "allow": True, "answer": "", "scope": "session"}
+        endpoints_agent.agent_post(app, "decide", lambda **kw: body)
+        assert turns.decided == [("t1", True, "", "session")]
 
     def test_decide_on_a_finished_turn_explains_why_not(self, tmp_path):
         turns = _FakeTurns()
@@ -282,6 +317,33 @@ class TestPost:
         with pytest.raises(FreeAgentError, match="没有待回答的卡"):
             endpoints_agent.agent_post(app, "decide",
                                        lambda **kw: {"id": "t9", "allow": True})
+
+    def test_intake_is_a_known_action(self, tmp_path):
+        """一句话起手是 POST 表里的一等动作 —— 不许静默 200 成不认识。"""
+        from freeagent.services.capability import CapabilityView
+        from freeagent.services.llm.provider import DelegationIntent
+
+        class _LLM:
+            def parse_delegation(self, text, known_projects):
+                return DelegationIntent("Alpha", "改登录页", True)
+
+        app = types.SimpleNamespace(
+            chat=types.SimpleNamespace(capabilities=CapabilityView(
+                projects=("D:/alpha",), project_names=("Alpha",))),
+            llm=_LLM(),
+        )
+        body = {"text": "让它改 Alpha 改登录页"}
+        out = endpoints_agent.agent_post(app, "intake", lambda **kw: body)
+        assert out["kind"] == "agent_intake"
+        assert out["recognized"] and out["project"] == "Alpha"
+        assert out["directory"] == "D:/alpha" and out["brief"] == "改登录页"
+        assert out["need"] == ""
+
+    def test_intake_needs_text(self, tmp_path):
+        app = types.SimpleNamespace(
+            chat=types.SimpleNamespace(capabilities=None), llm=None)
+        with pytest.raises(FreeAgentError, match="先说一句"):
+            endpoints_agent.agent_post(app, "intake", lambda **kw: {"text": ""})
 
 
 class _TurnsWithHistory:
@@ -358,3 +420,66 @@ class TestFootprint:
             agent_turn.TurnView(turn_id="w1", status="done"))
         assert data["files"] == []
         assert data["commands"] == []
+
+
+class TestReveal:
+    """在系统文件管理器中定位（V1.135）：验根内、不拼 shell、根没配说清。"""
+
+    def _app_with_root(self, tmp_path):
+        app = _app(tmp_path)
+        app.engine = types.SimpleNamespace(
+            state=lambda: types.SimpleNamespace(directory=str(tmp_path)))
+        return app
+
+    def test_state_carries_ledger(self, tmp_path):
+        data = endpoints_agent.agent_state(_app(tmp_path))
+        assert data["ledger"]["state"] == "unreadable"
+        assert data["ledger"]["files"] == []
+        assert "reason" in data["ledger"]
+
+    def test_relative_path_inside_root(self, tmp_path, monkeypatch):
+        from freeagent.web import endpoints_reveal
+
+        seen = {}
+
+        def fake_popen(args, **kw):
+            seen["args"] = args
+            seen["kw"] = kw
+
+        monkeypatch.setattr(endpoints_reveal.subprocess, "Popen", fake_popen)
+        app = self._app_with_root(tmp_path)
+        data = endpoints_agent.agent_post(
+            app, "reveal", lambda: {"path": "src/a.py"})
+        assert data["path"] == str(tmp_path / "src" / "a.py")
+        assert seen["kw"]["shell"] is False, "不拼 shell —— 路径来自引擎"
+        assert seen["args"][0] in ("explorer", "open", "xdg-open")
+        # win32 走 `explorer /select,<path>`（参数带 /select, 前缀），
+        # darwin 走 `open -R path`，linux 走 `xdg-open <目录>`。
+        # 判「解析后的绝对路径确实传给了文件管理器」，不能假设它就是末参。
+        assert any(
+            data["path"] in str(a) or str(a) in data["path"]
+            for a in seen["args"]
+        ), "解析后的绝对路径要传给文件管理器"
+
+    def test_path_outside_root_is_refused(self, tmp_path, monkeypatch):
+        from freeagent.web import endpoints_reveal
+
+        called = []
+        monkeypatch.setattr(
+            endpoints_reveal.subprocess, "Popen",
+            lambda *a, **k: called.append(1))
+        app = self._app_with_root(tmp_path)
+        with pytest.raises(FreeAgentError, match="不在当前工作目录内"):
+            endpoints_agent.agent_post(
+                app, "reveal", lambda: {"path": "C:/Windows/System32/x"})
+        assert not called, "越界路径一个进程都不许起"
+
+    def test_no_root_is_loud(self, tmp_path):
+        # engine=None、偏好里也没目录 —— 没配就说清，不静默什么都不做。
+        with pytest.raises(FreeAgentError, match="还没选目录"):
+            endpoints_agent.agent_post(
+                _app(tmp_path), "reveal", lambda: {"path": "a.py"})
+
+    def test_unknown_action_still_names_reveal(self, tmp_path):
+        with pytest.raises(FreeAgentError, match="reveal"):
+            endpoints_agent.agent_post(_app(tmp_path), "nope", lambda: {})

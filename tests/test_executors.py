@@ -478,3 +478,46 @@ class TestHermesAdapter:
         assert ex._hermes_run_id_of({"run_id": "run_abc", "status": "started"}) == "run_abc"
         assert ex._hermes_run_id_of({"id": "run_abc"}) == "run_abc", "兼容旧形状但不依赖"
         assert ex._hermes_run_id_of({"status": "started"}) is None
+
+
+class TestV2ToolLifecycle:
+    """真机 2.0.29：工具调用四段用同一个 ``id`` 串联，name / 参数 / 结果分置不同帧。"""
+
+    def _parse(self, frame: dict[str, object]) -> tuple[str, object] | None:
+        a = ex.adapter_for(2)
+        assert a is not None and a.api is not None
+        return a.api.parse_event(frame)
+
+    def test_started_carries_name_and_call_id(self) -> None:
+        assert self._parse({
+            "type": "session.tool.input.started",
+            "data": {"id": "c1", "name": "read"},
+        }) == ("tool.started", {"tool": "read", "call_id": "c1"})
+
+    def test_called_carries_input_and_running_without_name(self) -> None:
+        kind, payload = self._parse({
+            "type": "session.tool.called",
+            "data": {"id": "c1", "input": {"path": "D:/a.py"}},
+        })
+        assert kind == "tool"
+        assert isinstance(payload, dict)
+        assert payload["call_id"] == "c1"
+        assert "tool" not in payload, "called 不带名字，名字由轮次层按 id 回找"
+        assert payload["state"]["input"] == {"path": "D:/a.py"}
+        assert payload["state"]["status"] == "running"
+
+    def test_success_is_completed_done(self) -> None:
+        assert self._parse({
+            "type": "session.tool.success", "data": {"id": "c1"},
+        }) == ("tool.done", {"call_id": "c1", "state": {"status": "completed"}})
+
+    def test_failed_is_error_done(self) -> None:
+        assert self._parse({
+            "type": "session.tool.failed", "data": {"id": "c1"},
+        }) == ("tool.done", {"call_id": "c1", "state": {"status": "error"}})
+
+    def test_interrupted_execution_maps_to_idle(self) -> None:
+        assert self._parse({
+            "type": "session.execution.interrupted",
+            "data": {"sessionID": "ses-1"},
+        }) == ("session.idle", {"sessionID": "ses-1", "outcome": "interrupted"})

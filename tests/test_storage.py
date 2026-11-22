@@ -75,7 +75,7 @@ def test_primary_keys_are_not_null(conn):
 
 
 def test_db_path_env_override(tmp_path, monkeypatch):
-    monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path / "custom"))
+    monkeypatch.setenv("STEWARD_HOME", str(tmp_path / "custom"))
     path = resolve_db_path()
     assert path.parent == tmp_path / "custom"
     assert path.name == "agent.db"
@@ -83,7 +83,7 @@ def test_db_path_env_override(tmp_path, monkeypatch):
 
 
 def test_db_path_explicit_beats_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path / "env"))
+    monkeypatch.setenv("STEWARD_HOME", str(tmp_path / "env"))
     path = resolve_db_path(tmp_path / "explicit")
     assert path.parent == tmp_path / "explicit"
 

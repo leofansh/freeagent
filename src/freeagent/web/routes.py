@@ -17,12 +17,14 @@ from typing import Any
 from ..app import App
 from . import (
     endpoints_agent,
+    endpoints_agent_files,
     endpoints_agent_workspace,
     endpoints_delegate_browse,
     endpoints_delegate_live,
     endpoints_delegate_projects,
     endpoints_feishu,
     endpoints_feishu_config,
+    endpoints_harness,
     endpoints_oc_selection,
     endpoints_nudge,
     endpoints_pending,
@@ -31,6 +33,7 @@ from . import (
     endpoints_summary,
     serialize,
     serialize_api,
+    serialize_week,
     endpoints_services,
 )
 
@@ -106,11 +109,18 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     # 最近的活（21.4 / V1.115）。同样只读：列一张表不该起引擎。
     "/api/agent/turns": endpoints_agent.agent_turns_list,
     "/api/agent/dirs": endpoints_agent_workspace.agent_dirs,
+    # 这个工作区里有什么（V1.142 / 借鉴 CLOAK 的「文件管理」）：只读、一层、
+    # 不读内容。根由工作区档案取（不收绝对路径），越界 fail-closed。
+    "/api/agent/files": endpoints_agent_files.agent_files,
     "/api/agent/projects": endpoints_agent_workspace.agent_projects,
     "/api/today": lambda app, q: serialize.today_payload(
         app.today.view(),
         endpoints_read.role_names(app),
         pending_count=app.pending.count(),
+    ),
+    # 周回顾（6.5 / V1.133）：纯只读，服务层算完窗口，这里只投影。
+    "/api/week": lambda app, q: serialize_week.week_payload(
+        app.week.view(), endpoints_read.role_names(app)
     ),
     "/api/all": lambda app, q: endpoints_read.all_tasks(
         app, (q.get("scope") or ["open"])[0]
@@ -135,5 +145,8 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     "/api/summary": endpoints_summary.summary,
     # 连续性个人模型（11.17 / V1.59）：节奏 / 关系 / 承诺 三面，只读聚合。
     "/api/model": endpoints_model.model,
+    # Harness 一页（V1.143 / 21.7）：项目规矩 / 记忆 / 事务与承诺 / 能力与设置，
+    # **只读聚合**。计数走现成只读接口（不调 today.view —— 那个会顺延并留记录）。
+    "/api/harness": endpoints_harness.harness_page,
     **feishu_routes(),
 }

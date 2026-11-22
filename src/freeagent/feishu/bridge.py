@@ -402,7 +402,7 @@ class FeishuBridge:
                 return (f"已跳过这 {total} 个问题，不阻它。"
                         "它会按「没有答案」继续（或自己放弃）。")
             return (f"收到了，这 {total} 个问题全部答完。"
-                    "opencode 继续干活。")
+                    "它继续干活。")
         return (f"收到了（第 {slot + 1}/{total} 问）。还有 "
                 f"{total - slot - 1} 个问题，直接回消息答。")
 
@@ -1681,7 +1681,7 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         # ``stop_delegation`` 必须在白名单里，否则点了会被这条静默丢弃 ——
         # 而症状是「点了没反应」，那正好是「停止」最不能有的表现。
         if not credential or choice not in (
-            "allow_once", "deny", "stop_delegation",
+            "allow_once", "allow_session", "deny", "stop_delegation",
         ):
             log.info("【卡片动作】载荷不认（credential=%r choice=%r）—— 丢弃",
                      credential, choice)
@@ -1743,11 +1743,17 @@ def _card_action(data: Any = None) -> dict[str, Any]:
                 "success", "已停止这条委派",
             )
 
+        # 「本会话内允许此类」在库里仍是普通的 ``allow`` —— decision 只有
+        # allow/deny 两值（写第三值会被 decide() 归一成 deny，动作直接被拒）。
+        # 「本会话」这个**范围**信号走 ``decided_via="card_session"``：执行器
+        # 侧据此记住同类动作、本会话内不再弹卡（V1.138，不加列、不改判据）。
+        decision = "deny" if choice == "deny" else "allow"
+        via = "card_session" if choice == "allow_session" else "card"
         wrote = store.resolve(
             credential,
-            "allow" if choice == "allow_once" else "deny",
+            decision,
             decided_by=who,
-            via="card",
+            via=via,
         )
         # **不是发起人**要单独判、单独说 —— 它和「已决定过」「已过期」在
         # :meth:`resolve` 里都是 ``False``，但给用户的话**完全不同**。
@@ -1816,10 +1822,18 @@ def _card_action(data: Any = None) -> dict[str, Any]:
         log.info("【卡片动作】%s 凭据=%s 主题=%r 点击者=%s event_id=%s",
                  "允许" if granted else "拒绝",
                  credential, known.subject, prior, event_id)
+        # 「本会话内允许此类」点后卡面要说清**范围**：它不只是一次的 allow，
+        # 执行器会据此在本次委派内对同类动作免问。不写清，人会以为只批了这一
+        # 次，后面同类动作不弹卡反而像「闸门坏了」（V1.138）。
+        session_scope = bool(
+            settled is not None and settled.decided_via == "card_session"
+        )
+        allow_text = ("**已允许**（本会话内此类不再问）" if session_scope
+                      else "**已允许**")
         return _card_action_response(
             _decided_card(
                 known.subject,
-                (f"**已允许**（{prior}）\n\n{known.detail or ''}" if granted else
+                (f"{allow_text}（{prior}）\n\n{known.detail or ''}" if granted else
                  f"**已拒绝**（{prior}）\n\n没有访问任何东西。"),
                 granted=granted,
             ),
@@ -1862,7 +1876,7 @@ def _menu_entries() -> list[tuple[str, str]]:
     「真的会有人点它吗」。
     """
     return [
-        ("让 opencode 改代码", "oc_select"),
+        ("让它改代码", "oc_select"),
         ("我有哪些角色", "roles"),
         ("今天该做什么", "today"),
         ("我能做什么", "help"),
@@ -1999,7 +2013,7 @@ def _menu_help_text() -> str:
         "· 今天该做什么 → 发 `/today`\n"
         "· 记一件事 → 发 `/new <角色> | <描述>`\n"
         "· 有哪些角色 → 点上面「我有哪些角色」那张卡里的角色名\n"
-        "· 交给 opencode 改代码 → 点「让 opencode 改代码」，选项目/模型后说清要做的事\n"
+        "· 交给它改代码 → 点「让它改代码」，选项目/模型后说清要做的事\n"
         "\n完整命令表发 `/help`。"
     )
 
@@ -2120,7 +2134,7 @@ def _menu_dispatch(choice: str) -> dict[str, Any]:
 def _oc_options(stage: str) -> tuple[list[Any], str]:
     """某一阶段的选项 —— **转手** :func:`services.oc_discovery.stage_options`。
 
-    这里**不再自己查 OpenCode**：Web 的编程页签也要同一份选项，而那段
+    这里**不再自己查 OpenCode**：Web 的委派总览页也要同一份选项，而那段
     逻辑原先住在这个飞书模块里，于是让 Web 去 import 飞书桥接 ——
     一个 Web 端点依赖一个通道模块，方向是倒的，换掉飞书就连服务层一起删。
 
@@ -2530,7 +2544,7 @@ def _run_delegate_confirm(value: dict[str, Any], *, who: str) -> dict[str, Any]:
         )
 
     # 核对快照：重新读 oc_selection.json，若与快照不一致（例如用户在 Web
-    # 编程页改了），就提示重选、**不建委派**。这是「回显与实际派发同源」
+    # 委派总览页改了），就提示重选、**不建委派**。这是「回显与实际派发同源」
     # 的另一半 —— 回显用快照，派发前再核对一次，防止快照与当前选择漂移。
     current = _oc_load_selection()
     if (current.project, current.model, current.agent, current.variant) != (
@@ -2965,7 +2979,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="freeagent-feishu",
         description="把本地助手接到飞书/Lark（长连接，无需公网 IP）",
     )
-    parser.add_argument("--db", default=None, help="数据库路径（默认 ~/.freeagent）")
+    parser.add_argument("--db", default=None,
+                        help="数据库路径（默认 ~/.steward；旧 ~/.freeagent 有库则沿用）")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(

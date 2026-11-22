@@ -22,6 +22,7 @@ from freeagent.domain.enums import WaitingKind
 from freeagent.services.clock import FrozenClock
 from freeagent.services.sorting import EnergyWindows
 from freeagent.services.week import WeekService
+from freeagent.storage.repos import DecisionLogRepo, PromiseRepo
 
 #: 2026-10-21 是周三。刻意选周三而不是周一：周一起止的边界错误在
 #: 「今天正好是周一」时会被掩盖（上周的结束时间 = 本周开始时间）。
@@ -298,3 +299,106 @@ class TestGrowthGoals:
         _new(app, role, "一件杂事")
         text = render_week(_view(env), {})
         assert "成长目标：还没记过" in text
+
+
+# ------------------------------------------- V1.133：拍板 / 承诺 / 工作台痕迹
+class TestWeekTraces:
+    """周回顾加厚的三段：本周拍过什么板、许过什么诺、交给引擎几次。
+
+    与四个事务分区不同，这三段是**做过的事**而不是**待做的事**，所以刻意
+    放在最后、互不混排。时间戳按本地日过滤 —— 带时区偏移的 ISO 串不能
+    交给 SQLite date()（会把日期挪一天，V1.113 的对峙日教训）。
+    """
+
+    def _full_week(self, env) -> WeekService:
+        app, clock, _role = env
+        return WeekService(
+            app.task_repo, app.record_repo, clock,
+            today=app.today, memory=app.memory,
+            decisions=DecisionLogRepo(app.conn),
+            promises=PromiseRepo(app.conn),
+            turns=app.turn_repo,
+        )
+
+    def test_defaults_keep_old_construction(self, env):
+        """三个新字段都带默认值：旧构造（含既有测试）不必改。"""
+        app, clock, _role = env
+        view = WeekService(app.task_repo, app.record_repo, clock).view()
+        assert view.decisions == () and view.promises == () and view.turn_count == 0
+
+    def test_decisions_this_week_only(self, env):
+        app, clock, _role = env
+        decisions = DecisionLogRepo(app.conn)
+        decisions.add(
+            chosen_index=0, options_json="[]", reason_text="因为近",
+            conflict_text="A 还是 B", decided_at=clock.now(),
+            confront_on=date(2026, 10, 28),
+        )
+        decisions.add(
+            chosen_index=1, options_json="[]", reason_text="因为远",
+            conflict_text="上周的板", decided_at=datetime(2026, 10, 12, 10, 0),
+            confront_on=date(2026, 10, 19),
+        )
+        view = self._full_week(env).view()
+        assert [d.conflict_text for d in view.decisions] == ["A 还是 B"]
+
+    def test_promises_this_week_only(self, env):
+        app, clock, role = env
+        task = _new(app, role, "挂承诺的事务")
+        promises = PromiseRepo(app.conn)
+        promises.add(task_id=task.id, statement="下周三给方案", now=clock.now())
+        promises.add(
+            task_id=task.id, statement="上周的承诺",
+            now=datetime(2026, 10, 12, 10, 0),
+        )
+        view = self._full_week(env).view()
+        assert [p.statement for p in view.promises] == ["下周三给方案"]
+
+    def test_turn_count_this_week_only(self, env):
+        app, clock, _role = env
+        app.turn_repo.add(
+            turn_id="t1", brief="改一下", directory="D:/x", mode="ask",
+            started_at=clock.now(),
+        )
+        app.turn_repo.add(
+            turn_id="t2", brief="上周的活", directory="D:/x", mode="ask",
+            started_at=datetime(2026, 10, 12, 10, 0),
+        )
+        assert self._full_week(env).view().turn_count == 1
+
+    def test_traces_make_an_empty_week_nonempty(self, env):
+        """只有拍板 / 承诺 / 轮次也算有内容 —— 否则那几段会被静默吞掉。"""
+        app, clock, _role = env
+        app.turn_repo.add(
+            turn_id="t1", brief="改一下", directory="D:/x", mode="ask",
+            started_at=clock.now(),
+        )
+        assert not self._full_week(env).view().is_empty
+
+    def test_render_shows_the_three_traces(self, env):
+        app, clock, role = env
+        task = _new(app, role, "挂承诺的事务")
+        DecisionLogRepo(app.conn).add(
+            chosen_index=0, options_json="[]", reason_text="因为近",
+            conflict_text="A 还是 B", decided_at=clock.now(),
+            confront_on=date(2026, 10, 28),
+        )
+        PromiseRepo(app.conn).add(
+            task_id=task.id, statement="下周三给方案", now=clock.now()
+        )
+        app.turn_repo.add(
+            turn_id="t1", brief="改一下", directory="D:/x", mode="ask",
+            started_at=clock.now(),
+        )
+        text = render_week(self._full_week(env).view(), {})
+        assert "本周拍板 1 件" in text and "A 还是 B" in text and "因为近" in text
+        assert "本周许下的承诺 1 件" in text and "下周三给方案" in text
+        assert "本周交给引擎 1 轮" in text
+
+    def test_render_empty_traces_say_so(self, env):
+        app, _clock, role = env
+        _new(app, role, "一件杂事")
+        text = render_week(self._full_week(env).view(), {})
+        assert "本周拍板：没有拍过板。" in text
+        assert "本周承诺：没有新许下的承诺。" in text
+        assert "本周没有交给引擎的轮次。" in text

@@ -1,4 +1,4 @@
-"""编程页签：四段下拉 + 这一页的渲染与加载。
+"""委派总览页：四段下拉 + 这一页的渲染与加载。
 
 ## 为什么这个页签与飞书共用一份选项
 
@@ -88,21 +88,20 @@ function renderOcSelection(data, root) {
   // 界面上出现两份清单（实测 85 → 170 个开关），而
   // ``getElementById`` 返回的是**第一份**，于是「清单已生效」也看不出来。
   // 症状是「勾了没反应」—— 而真实原因是自己把自己画了两遍。
-  root.appendChild(el("div", "title", "编程"));
+  root.appendChild(el("div", "title", "委派总览"));
   // 实时面板**放最上面**：有委派在跑或等你批时，那是这一页最该先看到的东西，
   // 埋在四段下拉与清单下面就等于没有（设计文档 12.8）。
   mountLivePanel(root);
   root.appendChild(el("div", "hint",
-    "这四段决定「交给 opencode 时用哪个项目、哪个工作模式、" +
+    "这四段决定「交给引擎时用哪个项目、哪个工作模式、" +
     "哪个模型、哪个推理档」。跟飞书里那四张卡<strong>是同一份数据</strong>，" +
     "所以在飞书选过的这里也一样。<br>" +
-    "这个页签<strong>配置 + 实时交互</strong>：授权卡与提问都在上面的面板里，" +
+    "这一页<strong>配置 + 实时交互</strong>：授权卡与提问都在上面的面板里，" +
     "飞书那边是同一套 —— 代码不该在你没点过的情况下动。"));
 
   if (!data.discovery_ok) {
     root.appendChild(el("div", "note",
-      "连不上 OpenCode，所以下面都是空的。先确认它能起来" +
-      "（命令行 <code>opencode --version</code> 有输出），再点右上「刷新」。"));
+      "连不上后台引擎，所以下面都是空的。先确认它能起来，再点右上「刷新」。"));
   }
 
   const card = el("div", "card");
@@ -164,7 +163,7 @@ function renderOcSelection(data, root) {
 }
 
 function loadOcSelection(root) {
-  root.appendChild(el("div", "loading", "正在问 opencode 有哪些项目 / 模型…"));
+  root.appendChild(el("div", "loading", "正在问引擎有哪些项目 / 模型…"));
   api("/api/oc/options").then((d) => {
     root.replaceChildren();
     renderOcSelection(d, root);

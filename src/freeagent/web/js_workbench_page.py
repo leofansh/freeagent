@@ -51,8 +51,11 @@ async function loadWorkbench() {
     return;
   }
   const prefs = st.prefs || {};
+  // 工作台视觉收口（V1.126）：所有本页 DOM 收进 .wb-view，样式规则只挂这一层，
+  // 其余 14 个视图吃不到工作台专属的中性灰 / 实心按钮覆盖。
+  const view = el("div", "wb-view");
 
-  const bar = el("div", "card");
+  const bar = el("div", "card"); bar.id = "wb-bar";
 
   // 项目选择器（21.6 / V1.124）：触发芯片 + 下拉（搜索 / 已有项目 / 三个动作）。
   // 文件系统浏览退到二级，由「选择本地文件夹」与新建表单里的浏览按钮打开。
@@ -120,18 +123,19 @@ async function loadWorkbench() {
   bar.appendChild(dir);
   wbInitProjects(st);
 
-  bar.appendChild(el("div", "row1", "模型"));
+  bar.appendChild(el("div", "wb-label", "模型"));
+  const modelRow = el("div", "wb-field-row");
   const model = el("input");
   model.id = "wb-model";
   model.value = prefs.model || "";
   model.placeholder = "留空 = 引擎默认";
-  model.style.width = "60%";
-  bar.appendChild(model);
+  modelRow.appendChild(model);
   const pick = el("button", "btn", "载入清单");
   pick.onclick = wbModels;
-  bar.appendChild(pick);
+  modelRow.appendChild(pick);
+  bar.appendChild(modelRow);
 
-  bar.appendChild(el("div", "row1", "授权档"));
+  bar.appendChild(el("div", "wb-label", "授权档"));
   const mode = el("select");
   mode.id = "wb-mode";
   (st.modes || []).forEach((m) => {
@@ -149,15 +153,15 @@ async function loadWorkbench() {
   bar.appendChild(el("div", "note",
     "自动档下跑命令不会弹卡，但每一条都会列在「它跑过的命令」里；" +
     "换档只对下一轮生效，这一轮仍按开始时的那一档。"));
-  root.appendChild(bar);
+  view.appendChild(bar);
 
   const dirs = el("div", "note");
   dirs.id = "wb-dirs";
   dirs.hidden = true;
-  root.appendChild(dirs);
+  view.appendChild(dirs);
   const models = el("div", "row1");
   models.id = "wb-models";
-  root.appendChild(models);
+  view.appendChild(models); view.appendChild(wbIntakeMount());  // 一句话起手（V1.141）：认项目 + 要做的事，人确认后再交给它
 
   const ask = el("div", "card");
   const ta = el("textarea");
@@ -174,11 +178,14 @@ async function loadWorkbench() {
   // 带上「今天的事 / 承诺 / 相关记忆」（21.5 / V1.115）。默认开 —— 但
   // 开关必须看得见：它把这台机器上的私人记录送进模型，人有权当场关掉，
   // 而不是只能改配置文件。
-  const injectRow = el("div", "note");
+  const injectRow = el("div", "note wb-check-row");
   const inject = el("input");
   inject.type = "checkbox";
   inject.id = "wb-inject";
   inject.checked = true;
+  inject.onchange = () => {
+    if (typeof wbHarnessPaint === "function") wbHarnessPaint();
+  };
   injectRow.appendChild(inject);
   injectRow.appendChild(el("span", null,
     " 带上今天的事、未结清的承诺与相关记忆（会显示它带了什么）"));
@@ -196,29 +203,48 @@ async function loadWorkbench() {
     wbArm(200);
   };
   ask.appendChild(stop);
-  root.appendChild(ask);
+  view.appendChild(ask);
 
-  const route = el("div", "note");
+  // 外层只是容器：提示条与「仍交给引擎」按钮由 wbSend 挂进来。外层若也带
+  // .note，就会和内层提示条叠两层底色（V1.126 走查看到的宽灰块）。
+  const route = el("div");
   route.id = "wb-route";
-  root.appendChild(route);
+  view.appendChild(route);
 
   const eng = el("div", "note");
   eng.id = "wb-engine";
-  root.appendChild(eng);
+  view.appendChild(eng); view.appendChild(wbRunNote());
 
   const stream = el("div");
   stream.id = "wb-stream";
-  root.appendChild(stream);
+  view.appendChild(stream);
 
   // 「最近的活」（21.4 / V1.115）：点开某一条就走 wbOpen，看的是当时的
   // 全文与结局，而不是现在。放在正文下面而不是侧面 —— 这一页的主动作
   // 永远是「说一句话」，历史是回头看的。
-  root.appendChild(el("div", "row1", "最近的活"));
+  view.appendChild(el("div", "wb-label", "最近的活"));
   const hist = el("div");
   hist.id = "wb-history";
-  root.appendChild(hist);
+  view.appendChild(hist);
+
+  // 产物侧栏（V1.132）：纵向流收进左栏，右边固定放产物；窄屏折回一列。
+  // 从 view 里搬现成的 children（不重建），paint/history 的 id 引用照旧。
+  const main = el("div", "wb-col-main");
+  while (view.firstChild) main.appendChild(view.firstChild);
+  const side = el("div", "wb-col-side");
+  side.id = "wb-side"; wbSideMount(side);
+  // 左栏工作区（V1.139）：工作区列表常驻，选完不再收起来 —— 人在干活的
+  // 全过程里看得见「还有哪些工作区、各自跑过多少」。三栏：工作区 / 正文 / 产物。
+  const cols = el("div", "wb-cols");
+  cols.appendChild(wbRailMount());
+  cols.appendChild(main);
+  cols.appendChild(side);
+  view.appendChild(cols);
+
+  root.appendChild(view);
 
   wbPaint(st);
   wbHistory();
+  wbRailPaint(); wbZenBoot();
 }
 """

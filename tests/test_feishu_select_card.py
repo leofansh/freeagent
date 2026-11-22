@@ -501,3 +501,53 @@ def test_failure_is_distinguishable_from_empty(monkeypatch):
         assert snap.projects is None and snap.providers is None
     finally:
         monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+
+
+def test_failed_snapshot_is_not_cached(monkeypatch):
+    """半残快照不进 30s 缓存：下一次请求要立刻重查。
+
+    真机踩过 /api/model 因插件未激活连回 503，重试窗口过后
+    providers=None。旧实现把这个 None 缓存满 30 秒，于是插件早就
+    激活完了，界面还在说「查不到模型」。
+    """
+    class Partial(_FakeServer):
+        def list_models(self):
+            raise RuntimeError("插件还没激活")
+
+    Partial.opened = 0
+    monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+    monkeypatch.setattr(
+        "freeagent.services.opencode_server.OpenCodeServer.discovery",
+        classmethod(lambda cls, **kw: Partial()))
+    try:
+        first = discovery.snapshot()
+        assert first.providers is None and first.projects
+        assert discovery._SNAPSHOT is None, "失败快照不许进缓存"
+        assert Partial.opened == 1
+
+        second = discovery.snapshot()
+        assert second.providers is None
+        assert Partial.opened == 2, "下一次请求必须真重查，不是复用坏快照"
+    finally:
+        monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+
+
+def test_passed_snapshot_avoids_requery(monkeypatch):
+    """一次请求里各段共用一份快照，失败路径也不该起四遍进程。"""
+    class Partial(_FakeServer):
+        def list_models(self):
+            raise RuntimeError("插件还没激活")
+
+    Partial.opened = 0
+    monkeypatch.setattr(discovery, "_SNAPSHOT", None)
+    monkeypatch.setattr(
+        "freeagent.services.opencode_server.OpenCodeServer.discovery",
+        classmethod(lambda cls, **kw: Partial()))
+    try:
+        snap = discovery.snapshot()
+        assert Partial.opened == 1
+        for stage in ("project", "agent", "model"):
+            discovery.stage_options(stage, snap=snap)
+        assert Partial.opened == 1, "传了 snap 就不该再起进程"
+    finally:
+        monkeypatch.setattr(discovery, "_SNAPSHOT", None)

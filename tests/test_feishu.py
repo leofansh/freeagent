@@ -1743,7 +1743,7 @@ class TestDoctorAgreesWithBridge:
         标致命会让人以为整个通道都废了，反而不好定位 —— 真实情况只是
         群里不响应。
         """
-        monkeypatch.delenv("FREEAGENT_HOME", raising=False)
+        monkeypatch.delenv("STEWARD_HOME", raising=False)
         got = check_identity(self._cfg(), tmp_path, live=False)
         assert not got.ok, "没缓存又没联网就该报未探到"
         assert not got.fatal, "身份缺失不该标致命"

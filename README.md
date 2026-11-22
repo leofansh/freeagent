@@ -1,4 +1,4 @@
-# 个人事务助手（原型）
+# 值守（Steward）· 个人事务助手原型
 
 解决「角色多、事情杂」的个人日常事务助手原型。
 
@@ -18,13 +18,26 @@
 **日常只需要一个入口**：飞书里跟助手说话。开机自启已经配好（见下），登录后
 桥接自动拉起，**不用开任何终端窗口**。
 
-### 最省事的三条
+### 最省事的四条
 
 | 想做什么 | 怎么做 |
 |---|---|
 | 记一笔、看今天 | 直接在**飞书**里说 |
+| 双击就能用（不装 Python） | 拿到打包目录后双击 `install.cmd`，桌面出现 `Steward` 快捷方式；以后双击它即可（**关窗口 = 停服务**，想让它继续跑就用下面的网页版） |
 | 管理事务 | 双击 `tools\run_web.bat`（自动定位 Python 3.11+、起服务并开浏览器到 <http://127.0.0.1:8770/>） |
 | 临时用终端 | `set PYTHONIOENCODING=utf-8` + `set PYTHONPATH=src` + `python -m freeagent.cli.app` |
+
+### 自己打这个安装包
+
+```bash
+python tools\pack\build_portable.py
+```
+
+产出 `dist\Steward\`：官方 embeddable Python 3.11.9（`runtime\`）+ 本仓 `src` 的副本
+（`app\`）+ `desktop_main.pyw` + `install.cmd` / `uninstall.cmd`。把整个目录压成 zip
+发给别人，对方解压后双击 `install.cmd` 即可 —— **对方机器不需要装 Python**。
+首次构建会下载约 11 MB 的 embeddable zip（缓存到 `tools\pack\.cache\`，离线机可用
+`--python-zip <已下载的 zip>` 跳过下载）。
 
 ### 开机自动运行
 
@@ -38,8 +51,11 @@
 再复制一份进去即可（**零权限**，不用管理员）：
 
 ```bat
-copy /y tools\_svc_bridge.cmd "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\FreeAgent-bridge.cmd"
+copy /y tools\_svc_bridge.cmd "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Steward-bridge.cmd"
 ```
+
+> 已经按旧名装过 `FreeAgent-bridge.cmd` 的，先把那一份删掉再复制 —— 两份
+> 同名服务同时起会抢同一个锁端口，症状是其中一个反复报「端口被占用」。
 
 **为什么不用「计划任务」**：`schtasks /create` 即使配`/sc onlogon` 也需要
 **管理员权限**，报错「拒绝访问」。启动文件夹是**按用户**生效的，零权限，

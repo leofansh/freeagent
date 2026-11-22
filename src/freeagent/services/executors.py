@@ -1041,13 +1041,21 @@ _V2_EVENT_ALIAS: dict[str, str] = {
     "form.created": "question.asked",
     "session.execution.succeeded": "session.idle",
     "session.execution.failed": "session.error",
+    # ``interrupted`` 是被叫停（人点停止 / 会话中断），不是失败 —— 收成
+    # idle，由上层按载荷里的 outcome 再分 stopped / done，不在这里判。
+    "session.execution.interrupted": "session.idle",
     "session.text.delta": "message.part.delta",
     "session.text.ended": "message.part.updated",
     # ``tool.started`` 是**只给进度卡片**的（delegate 认得任意 kind）；
     # ``tool`` 才是 ask.py 数轮次的那一个 —— 一次工具调用只能计一次，
     # 所以这里刻意只把 ``session.tool.called`` 映射成 ``tool``。
+    # ``tool.done`` 是完成 / 失败态（V2 真机 2.0.29 实测：``success`` /
+    # ``failed`` 都不带 name、不带 input，只有 ``id`` 与结果）—— 它既不
+    # 计次，也不补目标，只按 ``id`` 把早先那行步骤收成终态。
     "session.tool.input.started": "tool.started",
     "session.tool.called": "tool",
+    "session.tool.success": "tool.done",
+    "session.tool.failed": "tool.done",
 }
 
 
@@ -1084,20 +1092,43 @@ def _v2_parse_event(obj: Any) -> tuple[str, Any] | None:
             return None
         return mapped, {"part": {"type": "text", "text": text}}
 
-    if mapped in ("tool", "tool.started"):
-        name = data.get("name") if isinstance(data, dict) else None
-        if not isinstance(name, str) or not name:
-            return None
+    if mapped in ("tool", "tool.started", "tool.done"):
+        call_id = data.get("id") if isinstance(data, dict) else None
+        base: dict[str, Any] = {}
+        if isinstance(call_id, str) and call_id:
+            base["call_id"] = call_id
+        if mapped == "tool.started":
+            name = data.get("name")
+            if not isinstance(name, str) or not name:
+                return None
+            base["tool"] = name
+            return mapped, base
         if mapped == "tool":
-            payload: dict[str, Any] = {"tool": name}
+            # ``called`` 真机实测不带 name（name 只在 started 上）：名字由
+            # 调用方按 ``call_id`` 回到 started 那行，这里只带参数对象。
+            # 状态显式标 running：V1 的 ``tool`` 是执行完之后，V2 的 ``called``
+            # 却是「已派发、未收尾」——完成要等 success/failed，不能走 V1 兜底。
             args = data.get("input")
+            state: dict[str, Any] = {"status": "running"}
             if isinstance(args, dict):
-                payload["state"] = {"input": args}
-            return mapped, payload
-        return mapped, {"tool": name}
+                state["input"] = args
+            base["state"] = state
+            return mapped, base
+        # ``tool.done``：完成 / 失败的判据是**原始事件名**（success / failed），
+        # 载荷里没有状态字段；``executed`` 也不是完成态（success 帧上为 false）。
+        status = "completed" if kind == "session.tool.success" else "error"
+        base["state"] = {"status": status}
+        return mapped, base
 
     # 其余原样透传（含 permission.asked：它的载荷形状由
     # :func:`_v2_parse_request` 自己判，不在这里猜）。
+    if kind == "session.execution.interrupted":
+        # 中断帧本身不带 ``outcome``：被叫停这个事实在**事件名**里，不在载荷里
+        # （同 tool.done 按原始事件名定 completed/error）。不补上，上层 idle 分支
+        # 会按缺字段兜底成「完成」——把叫停报成做完了，正是静默失效那一类。
+        payload = dict(data) if isinstance(data, dict) else {}
+        payload.setdefault("outcome", "interrupted")
+        return mapped, payload
     return mapped, data
 
 
@@ -1395,7 +1426,12 @@ _V2_API = ExecutorApi(
     # 期间 /api/model 回 503、/api/{provider,agent} 回空数组。
     # 空的 agent 列表会让 delegate 的工作模式校验**误杀一次真实委派**，
     # 所以列表方法要按这个窗口重试。
-    catalog_lag_seconds=4.0,
+    # 窗口从 4s 提到 10s：真机踩过 /api/model 在整个 4s 里连回
+    # 503 {"_tag":"ServiceUnavailableError","message":"Location plugins did not
+    # finish activating","service":"plugin"} —— 插件激活比目录加载还慢，
+    # 于是「选模型」整段报「查不到」。成功即提前返回，健康启动仍是 ~2.7s，
+    # 变长的只有真失败时的上报延迟（fail-closed，不把故障显示成「没有」）。
+    catalog_lag_seconds=10.0,
 )
 
 

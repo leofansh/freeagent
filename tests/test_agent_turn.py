@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 
 import pytest
@@ -34,13 +35,22 @@ def _adapter(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class ScriptedHost:
-    def __init__(self, script: list[tuple[str, object]], *, ensure_error: Exception | None = None) -> None:
+    def __init__(self, script: list[tuple[str, object]], *,
+                 ensure_error: Exception | None = None,
+                 reply_error: Exception | None = None) -> None:
         self.script = script
         self.ensure_error = ensure_error
+        #: 送答复失败（V1.137）：用来验证「送不到不许假装成功」。
+        self.reply_error = reply_error
         self.ensure_kwargs: dict[str, object] = {}
         self.prompts: list[tuple[str, dict[str, str]]] = []
         self.replies: list[tuple[str, str]] = []
         self.aborts = 0
+        self.pending: list[object] = []
+        self.pending_calls = 0
+        #: 事件流是否先于指令建立（SSE volatile，晚挂会漏终态帧）。
+        self.events_opened = False
+        self.events_before_prompt = True
 
     def ensure(self, **kwargs: object) -> str:
         if self.ensure_error is not None:
@@ -49,18 +59,29 @@ class ScriptedHost:
         return "ses-1"
 
     def prompt(self, text: str, **kw: str) -> None:
+        if not self.events_opened:
+            self.events_before_prompt = False
         self.prompts.append((text, dict(kw)))
 
     def events(self, *, timeout: float = 600.0):  # noqa: ANN201
+        self.events_opened = True
         return iter(self.script)
 
     def abort(self) -> None:
         self.aborts += 1
 
+    def pending_permissions(self, *, directory: str = "") -> list[object]:
+        self.pending_calls += 1
+        return list(self.pending)
+
     def reply_permission(self, request_id: str, decision: str) -> None:
+        if self.reply_error is not None:
+            raise self.reply_error
         self.replies.append((request_id, decision))
 
     def reply_question(self, request_id: str, answers: list[list[str]]) -> None:
+        if self.reply_error is not None:
+            raise self.reply_error
         self.replies.append((request_id, answers[0][0] if answers else ""))
 
 
@@ -76,6 +97,27 @@ def _service(script: list[tuple[str, object]], *, max_tool_calls: int = 40,
 def _start(svc: turn_mod.AgentTurnService, **kw: object) -> str:
     view = svc.start(text="改一下 app.py", directory="D:\\p", **kw)  # type: ignore[arg-type]
     return view.turn_id
+
+
+def _wait_for_ask_id(svc: turn_mod.AgentTurnService, tid: str, want_id: str,
+                     *, timeout: float = 10.0):
+    """等**指定 request_id** 的卡，而不是「任意一张卡」。
+
+    ``wait_for_ask`` 只 ``ask_event.wait``、**不清事件**，连续等第二张时
+    会被上一张遗留的置位骗到（当场返回旧的 ``view.ask``，而 worker 还没
+    处理完上一张的决定、还没挂新卡）。测试里要辨认「换动作仍挂卡」，必须
+    按 id 轮询到目标卡出现 —— 用事件 + 短超时等待，不裸 ``sleep``。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        view = svc.view(tid)
+        if view is not None and view.ask is not None \
+                and view.ask.request_id == want_id:
+            return view.ask
+        turn = svc._turns[tid]
+        turn.ask_event.wait(0.05)
+        turn.ask_event.clear()
+    return None
 
 
 class TestHappyPath:
@@ -135,6 +177,61 @@ class TestPermission:
         svc.wait(tid, timeout=10)
         assert host.replies == [("per-2", "deny")]
 
+    def test_session_scope_remembers_permission(self) -> None:
+        """点「本会话内允许此类」后，同类动作直接放行、不再挂卡。
+
+        事件串行消费：第一条 permission 触发的 ``_ask_and_reply`` 会阻塞等
+        decision，第二条要等第一条决定后才被处理 —— 这样第二条才能命中
+        ``turn.session_allows``、走「免问直接 reply」那条路。
+        """
+        e1 = ToolPermission("e1", "edit", ("a.py",))
+        e2 = ToolPermission("e2", "edit", ("b.py",))
+        svc, host = _service([
+            ("permission.asked", e1),
+            ("permission.asked", e2),
+            ("session.idle", {}),
+        ])
+        tid = _start(svc)
+        card = svc.wait_for_ask(tid, timeout=10)
+        assert card is not None and card.request_id == "e1"
+        # session 档记住的是「edit」这个动作类型，不是某一条 request_id。
+        assert svc.decide(tid, allow=True, scope="session") is True
+        view = svc.wait(tid, timeout=10)
+        assert view is not None and view.status == turn_mod.DONE
+        # 两条都是 allow：第二条没挂卡、没等人决定，直接放行送回引擎。
+        assert host.replies == [("e1", "allow"), ("e2", "allow")]
+
+    def test_session_scope_does_not_cover_other_permission(self) -> None:
+        """记住 edit 不代表记住 bash —— 换一种动作仍要问（范围宁可小）。"""
+        e1 = ToolPermission("e1", "edit", ("a.py",))
+        e2 = ToolPermission("e2", "bash", ("ls",))
+        svc, host = _service([
+            ("permission.asked", e1),
+            ("permission.asked", e2),
+            ("session.idle", {}),
+        ])
+        tid = _start(svc)
+        assert svc.wait_for_ask(tid, timeout=10) is not None
+        assert svc.decide(tid, allow=True, scope="session") is True
+        # 第二种动作仍挂卡等人；按 id 轮询，绕开 wait_for_ask 不清事件的坑。
+        card2 = _wait_for_ask_id(svc, tid, "e2")
+        assert card2 is not None
+        assert svc.decide(tid, allow=True) is True
+        svc.wait(tid, timeout=10)
+        assert host.replies == [("e1", "allow"), ("e2", "allow")]
+        assert svc._turns[tid].session_allows == {"edit"}
+
+    def test_empty_permission_never_records(self) -> None:
+        """认不出动作名时连 session 档也不记 —— 空串不是「所有动作」。"""
+        perm = ToolPermission("e-empty", "", ("a.py",))
+        svc, host = _service([("permission.asked", perm), ("session.idle", {})])
+        tid = _start(svc)
+        assert svc.wait_for_ask(tid, timeout=10) is not None
+        assert svc.decide(tid, allow=True, scope="session") is True
+        svc.wait(tid, timeout=10)
+        turn = svc._turns[tid]
+        assert turn.session_allows == set()
+
     def test_auto_mode_denies_an_unexpected_ask_and_says_so(self) -> None:
         # 自动档下本该一条都不来。来了 = 覆盖层可能没生效 ——
         # 那时唯一安全的动作是拒绝并留一条备注，而不是顺手放行。
@@ -167,6 +264,47 @@ class TestPermission:
         assert "没有拿到答案" in view.reason
         assert host.aborts >= 1
 
+    def test_reply_failure_fails_the_turn_and_aborts(self) -> None:
+        """卡面显示「已允许」却没送回引擎 —— 不许静默，不许报成功。"""
+        perm = ToolPermission("per-reply-fail", "edit", ("a.py",))
+        host = ScriptedHost(
+            [("permission.asked", perm), ("session.idle", {})],
+            reply_error=OSError("engine gone"),
+        )
+        svc = turn_mod.AgentTurnService(
+            host, clock=FrozenClock(datetime(2026, 9, 26, 9, 0)),
+            reply_sleep=lambda _: None,
+        )
+        tid = _start(svc)
+        assert svc.wait_for_ask(tid, timeout=10) is not None
+        assert svc.decide(tid, allow=True) is True
+        view = svc.wait(tid, timeout=10)
+        assert view is not None
+        assert view.status == turn_mod.FAILED
+        assert "没能送回引擎" in view.reason
+        assert any("没能送回引擎" in n for n in view.notes)
+        assert host.aborts == 1
+        assert host.replies == []
+
+    def test_answer_reply_failure_fails_the_turn_and_aborts(self) -> None:
+        q = ToolQuestion("q-reply-fail", ("用哪个目录？",), ("src",))
+        host = ScriptedHost(
+            [("question.asked", q), ("session.idle", {})],
+            reply_error=OSError("engine gone"),
+        )
+        svc = turn_mod.AgentTurnService(
+            host, clock=FrozenClock(datetime(2026, 9, 26, 9, 0)),
+            reply_sleep=lambda _: None,
+        )
+        tid = _start(svc)
+        assert svc.wait_for_ask(tid, timeout=10) is not None
+        assert svc.decide(tid, allow=True, answer="src") is True
+        view = svc.wait(tid, timeout=10)
+        assert view is not None
+        assert view.status == turn_mod.FAILED
+        assert "没能送回引擎" in view.reason
+        assert host.aborts == 1
+
     def test_unparseable_request_is_denied_not_approved(self) -> None:
         svc, host = _service([("permission.asked", {"weird": True}), ("session.idle", {})])
         view = svc.wait(_start(svc), timeout=10)
@@ -195,6 +333,33 @@ class TestStopsAndLimits:
         assert view.status == turn_mod.FAILED
         assert "额度用完了" in view.reason
         assert view.ok is False
+
+    def test_event_stream_is_subscribed_before_prompt(self) -> None:
+        # SSE 是 volatile 的：晚一步挂流，启动瞬间就失败的终态帧会漏掉，
+        # 轮次只能干等到总时长超时（界面一直转圈、步骤正文全空）。
+        svc, host = _service([("session.idle", {})])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert host.events_opened is True
+        assert host.events_before_prompt is True
+
+    def test_idle_with_failed_outcome_fails_with_engine_message(self) -> None:
+        # idle 族里也混着 failed：不看 outcome 就一律记「完成」是静默谎报。
+        svc, _ = _service([(
+            "session.idle",
+            {"outcome": "failed", "error": {"message": "模型不可用：opencode/x"}},
+        )])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert view.status == turn_mod.FAILED
+        assert "模型不可用" in view.reason
+        assert view.ok is False
+
+    def test_idle_with_interrupted_outcome_is_stopped(self) -> None:
+        svc, _ = _service([("session.idle", {"outcome": "interrupted"})])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert view.status == turn_mod.STOPPED
 
     def test_stream_that_ends_without_idle_is_not_a_success(self) -> None:
         svc, _ = _service([("message.part.delta", {"delta": "看起来干完了"})])
@@ -293,6 +458,93 @@ class TestSteps:
         assert view is not None
         assert view.status == turn_mod.DONE
         assert view.tool_calls == 0
+
+
+class TestV2CallIdPairing:
+    """V2 真机 2.0.29：name 只在 started、参数在 called、结果在 success/failed，
+    三段各带同一个 ``id``。缺一段配对，步骤就会目标全空 / 永远进行中。"""
+
+    def test_started_called_success_merge_into_one_row(self) -> None:
+        svc, _ = _service([
+            ("tool.started", {"tool": "read", "call_id": "c1"}),
+            ("tool", {"call_id": "c1", "state": {"input": {"path": "D:/a.py"}}}),
+            ("tool.done", {"call_id": "c1", "state": {"status": "completed"}}),
+            ("session.idle", {}),
+        ])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert len(view.steps) == 1
+        step = view.steps[0]
+        assert step.name == "read"
+        assert step.target == "D:/a.py"
+        assert step.status == turn_mod.STEP_DONE
+        # 一次调用只计一次（只有 called 是 ``tool``）。
+        assert view.tool_calls == 1
+
+    def test_failed_call_is_marked_failed(self) -> None:
+        svc, _ = _service([
+            ("tool.started", {"tool": "shell", "call_id": "c1"}),
+            ("tool", {"call_id": "c1", "state": {"input": {"command": "x"},
+                                                  "status": "running"}}),
+            ("tool.done", {"call_id": "c1", "state": {"status": "error"}}),
+            ("session.idle", {}),
+        ])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert view.steps[0].status == turn_mod.STEP_FAILED
+
+    def test_done_without_started_and_name_is_not_invented(self) -> None:
+        # 完成帧丢了开始帧、又认不出名字：不编一个名字硬列一行。
+        svc, _ = _service([
+            ("tool.done", {"call_id": "c2", "state": {"status": "completed"}}),
+            ("session.idle", {}),
+        ])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert view.steps == ()
+
+
+class TestReferenceMarkerStrip:
+    def test_dangling_reference_marker_is_removed(self) -> None:
+        svc, _ = _service([
+            ("message.part.updated", {"part": {"type": "text",
+                                               "text": "看完现状 @17@，正在跑测试"}}),
+            ("session.idle", {}),
+        ])
+        view = svc.wait(_start(svc), timeout=10)
+        assert view is not None
+        assert "@17@" not in view.text
+        assert view.text == "看完现状，正在跑测试"
+
+
+class TestPendingRecovery:
+    """实时事件漏掉的挂起授权，靠兜底拉取摆成卡（#49）。"""
+
+    def test_recovery_surfaces_a_permission_missed_on_the_stream(self) -> None:
+        perm = ToolPermission("per-9", "bash", ("git diff",))
+        svc, host = _service([("session.idle", {})])
+        host.pending = [perm]
+        tid = _start(svc)
+        card = svc.wait_for_ask(tid, timeout=10)
+        assert card is not None and card.request_id == "per-9"
+        assert host.pending_calls >= 1
+        assert svc.decide(tid, allow=True) is True
+        view = svc.wait(tid, timeout=10)
+        assert view is not None and view.status == turn_mod.DONE
+        assert host.replies == [("per-9", "allow")]
+
+    def test_recovery_skips_unparseable_and_already_seen(self) -> None:
+        perm = ToolPermission("per-9", "bash", ("git diff",))
+        svc, host = _service([("permission.asked", perm), ("session.idle", {})])
+        # 同一 rid 已走事件流挂过卡；再来一条认不出的坏载荷：兜底不重复摆、
+        # 也不把整轮判失败。
+        host.pending = [perm, {"id": "junk"}]
+        tid = _start(svc)
+        card = svc.wait_for_ask(tid, timeout=10)
+        assert card is not None and card.request_id == "per-9"
+        assert svc.decide(tid, allow=True) is True
+        view = svc.wait(tid, timeout=10)
+        assert view is not None and view.status == turn_mod.DONE
 
 
 class TestArtifactAndCommandFootprint:

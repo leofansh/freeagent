@@ -75,7 +75,7 @@ SERVICES: tuple[ServiceSpec, ...] = (
         key="executor",
         title="委派执行器",
         mark=_EXECUTOR_MARK,
-        note="每 5 秒扫库，把已 /start 的委派交给 opencode；执行期逐次授权。",
+        note="每 5 秒扫库，把已 /start 的委派交给后台引擎；执行期逐次授权。",
     ),
 )
 

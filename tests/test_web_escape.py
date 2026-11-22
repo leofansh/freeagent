@@ -83,12 +83,18 @@ class TestWorkbenchRenderEscapes:
     def test_directory_names_are_escaped(self):
         from freeagent.web.js_workbench_dirs import JS_WORKBENCH_DIRS
 
-        assert 'el("option", null, esc(name))' in JS_WORKBENCH_DIRS
+        assert 'el("button", "dir-row", esc(name))' in JS_WORKBENCH_DIRS
 
     def test_model_note_is_escaped(self):
         from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
 
         assert "esc(data.model.note)" in JS_WORKBENCH_PAGE
+
+    def test_step_name_and_target_are_escaped(self):
+        from freeagent.web.js_workbench_card import JS_WORKBENCH_CARD
+
+        assert "esc(s.name" in JS_WORKBENCH_CARD
+        assert "esc(s.target)" in JS_WORKBENCH_CARD
 
     def test_enter_submits_textarea_and_answer(self):
         from freeagent.web.js_workbench_card import JS_WORKBENCH_CARD

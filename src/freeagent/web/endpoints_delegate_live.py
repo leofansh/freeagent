@@ -179,10 +179,13 @@ def delegate_live(app: App) -> dict[str, Any]:
         # 返回无穷大，即「这条显示成卡住」，而那比「显示成正在跑」安全。
         age = projection_age_seconds(updated_at, now)
         stale = age >= _STALE_AFTER_SECONDS
-        # 「事务已删但进度行还在」的坏行毒死整个面板（真机 2026-10-18：
-        # get() 对不存在的事务**抛** NotFoundError，面板整体 400）。
-        # find() 返回 None，兜底文案（"(事务已不存在)"）本来就在。
+        # find() 返回 None = 事务已删（get() 会抛 NotFoundError 毒死整个面板，真机 2026-10-18）。
         task = repo.find(task_id)
+        # 孤儿投影：没有任务可重派 / 放弃，也没有执行器会再来更新，留在面板上就是
+        # 秒数一直涨的幽灵（真机涨到 2789313）。读侧跳过、但不删数据（留取证）；
+        # 它的待批项仍走 by_task 第二循环照常显示 —— 藏幽灵行 ≠ 藏待批项（12.7.1）。
+        if task is None:
+            continue
         # 12.11.1（V1.39）：陈旧且**还没结束**的委派给两个恢复动作
         # 「重新派发 / 放弃」，前端据此画按钮。
         # * 非陈旧不给 —— 怕误触一条正在正常跑的东西；

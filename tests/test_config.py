@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from freeagent import paths
 from freeagent.app import build_app
 from freeagent.config import (
     API_KEY_ENV,
@@ -102,10 +103,10 @@ class TestKeyNeverPersisted:
 
 
 class TestHomeEnvWhitespace:
-    """``FREEAGENT_HOME`` 的尾随空白。
+    """``STEWARD_HOME`` 的尾随空白。
 
     踩过的坑（真实踩到，不是设想的）：冒烟时在 cmd 里写
-    ``set FREEAGENT_HOME=%TEMP%\\x && python ...``，那个 ``&&`` 前的空格
+    ``set STEWARD_HOME=%TEMP%\\x && python ...``，那个 ``&&`` 前的空格
     被算进了值里，于是得到 ``...\\x \\agent.db``。Windows 会**剥掉路径组件
     末尾的空格**，结果：
 
@@ -120,25 +121,89 @@ class TestHomeEnvWhitespace:
 
     def test_trailing_space_is_stripped(self, tmp_path, monkeypatch):
         target = tmp_path / "data"
-        monkeypatch.setenv("FREEAGENT_HOME", f"{target} ")
+        monkeypatch.setenv("STEWARD_HOME", f"{target} ")
         assert config_path().parent == target
         assert resolve_db_path().parent == target
 
     @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n"])
-    def test_blank_means_unset(self, blank, monkeypatch):
-        """空白值当没设，回落到 ``~/.freeagent`` —— 别建出名为空白的目录。"""
-        monkeypatch.setenv("FREEAGENT_HOME", blank)
-        assert config_path() == Path.home() / ".freeagent" / "config.json"
-        assert resolve_db_path() == Path.home() / ".freeagent" / "agent.db"
+    def test_blank_means_unset(self, blank, monkeypatch, tmp_path):
+        """空白值当没设，回落到默认目录 —— 别建出名为空白的目录。
 
-    def test_unset_falls_back_to_home(self, monkeypatch):
+        ``Path.home`` 必须指到干净的临时目录：真机上 ``~/.freeagent`` 里
+        有真库，而「旧目录有库」正是一条合法的沿用分支 —— 不隔开的话，
+        这条用例在开发机上和 CI 上会得到两个不同答案。
+        """
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", blank)
         monkeypatch.delenv("FREEAGENT_HOME", raising=False)
-        assert config_path() == Path.home() / ".freeagent" / "config.json"
+        assert config_path() == tmp_path / paths.DEFAULT_DIR_NAME / "config.json"
+        assert resolve_db_path() == tmp_path / paths.DEFAULT_DIR_NAME / "agent.db"
+
+    def test_unset_falls_back_to_home(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("STEWARD_HOME", raising=False)
+        monkeypatch.delenv("FREEAGENT_HOME", raising=False)
+        assert config_path() == tmp_path / paths.DEFAULT_DIR_NAME / "config.json"
+
+
+class TestHomeCompat:
+    """改名（V1.140）：新名 ``STEWARD_HOME`` / 旧名 ``FREEAGENT_HOME`` / 旧目录沿用。
+
+    这五条都**决定数据在哪** —— 错了的表现不是报错，而是「库看起来空了」，
+    所以每一条都得钉死。判据刻意是「旧目录里有没有 ``agent.db``」：
+    目录存在不算数（``resolve_db_path`` 的 ``mkdir`` 会先建出一个空目录）。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_notices(self):
+        """明示是「同一条只打一次」的，跨用例不清会互相吞掉。"""
+        paths._seen_notices.clear()
+        yield
+        paths._seen_notices.clear()
+
+    def test_new_env_wins_over_legacy_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path / "new"))
+        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path / "old"))
+        assert paths.state_dir() == tmp_path / "new"
+
+    def test_legacy_env_is_honoured_and_announced(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.delenv("STEWARD_HOME", raising=False)
+        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path / "old"))
+        assert paths.state_dir() == tmp_path / "old"
+        err = capsys.readouterr().err
+        assert "FREEAGENT_HOME" in err and "STEWARD_HOME" in err
+
+    def test_legacy_dir_with_a_db_is_kept(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("STEWARD_HOME", raising=False)
+        monkeypatch.delenv("FREEAGENT_HOME", raising=False)
+        (tmp_path / ".freeagent").mkdir()
+        (tmp_path / ".freeagent" / "agent.db").write_bytes(b"")
+        assert paths.state_dir() == tmp_path / ".freeagent"
+        assert ".freeagent" in capsys.readouterr().err
+
+    def test_new_dir_wins_once_it_has_its_own_db(self, tmp_path, monkeypatch, capsys):
+        """两个目录都有库 → 用新目录，且**不再**提示（已经搬过来了）。"""
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("STEWARD_HOME", raising=False)
+        monkeypatch.delenv("FREEAGENT_HOME", raising=False)
+        for name in (paths.LEGACY_DIR_NAME, paths.DEFAULT_DIR_NAME):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "agent.db").write_bytes(b"")
+        assert paths.state_dir() == tmp_path / paths.DEFAULT_DIR_NAME
+        assert capsys.readouterr().err == ""
+
+    def test_notice_is_printed_only_once(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.delenv("STEWARD_HOME", raising=False)
+        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path / "old"))
+        paths.state_dir()
+        paths.state_dir()
+        assert capsys.readouterr().err.count("FREEAGENT_HOME") == 1
 
     def test_actually_connectable_with_trailing_space(self, tmp_path, monkeypatch):
         """真连一次。这才是原始症状所在，光断言字符串不够。"""
         target = tmp_path / "data"
-        monkeypatch.setenv("FREEAGENT_HOME", f"{target} ")
+        monkeypatch.setenv("STEWARD_HOME", f"{target} ")
         conn = connect(resolve_db_path())
         try:
             conn.execute("SELECT 1")
@@ -148,7 +213,7 @@ class TestHomeEnvWhitespace:
     def test_db_and_config_land_in_same_dir(self, tmp_path, monkeypatch):
         """两处解析必须一致，否则「库在 A、配置在 B」比单个路径错更难查。"""
         target = tmp_path / "data"
-        monkeypatch.setenv("FREEAGENT_HOME", f"{target} ")
+        monkeypatch.setenv("STEWARD_HOME", f"{target} ")
         assert resolve_db_path().parent == config_path().parent
 
 

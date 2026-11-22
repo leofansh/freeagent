@@ -35,7 +35,7 @@ def _handlers(tmp_path, monkeypatch, db: str | None = None):
     ``FileHandler`` 持有真实文件对象，测试里不关就是 ``ResourceWarning``，
     而本仓库把这类告警当失败（那是**对的** —— 资源泄漏就该拦住）。
     """
-    monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+    monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
     handlers = bridge_mod._log_handlers(_args(db))
     try:
         yield handlers
@@ -69,12 +69,12 @@ class TestLogPathFollowsDb:
     """路径与身份缓存、事件去重表同源（设计文档 11.9.5）。"""
 
     def test_default_uses_state_home(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
         assert bridge_mod._log_path(None) == tmp_path / "feishu.log"
 
     def test_follows_db_directory(self, tmp_path, monkeypatch):
         """``--db`` 指到哪儿，日志就跟到哪儿 —— 不然换了一套数据，日志却在别处。"""
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path / "unused"))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path / "unused"))
         db_dir = tmp_path / "elsewhere"
         assert bridge_mod._log_path(str(db_dir / "agent.db")) == db_dir / "feishu.log"
 
@@ -84,7 +84,7 @@ class TestLogPathFollowsDb:
         复制粘贴的路径解析迟早漂移，而漂移的表现是「缓存写在 A、读取去 B 找」，
         永远命中不了且**没有任何报错**（见 ``state_home`` 的 docstring）。
         """
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
         assert bridge_mod._log_path(None) == bridge_mod.state_home(None) / "feishu.log"
 
 
@@ -195,7 +195,7 @@ class TestSupervisorDoesNotFightTheLogFile:
     def test_popen_does_not_redirect_into_log_file(self, tmp_path, monkeypatch):
         from freeagent.feishu import supervisor
 
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
         monkeypatch.setattr(supervisor, "_preflight", lambda home=None: None)
 
         captured = {}
@@ -250,7 +250,7 @@ class TestSupervisorDoesNotFightTheLogFile:
         """
         from freeagent.feishu import supervisor
 
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
         monkeypatch.setattr(supervisor, "_preflight", lambda home=None: None)
         assert supervisor._log_path() == tmp_path / "feishu.log"
 
@@ -263,7 +263,7 @@ class TestUnwritableLogDoesNotKillBridge:
         """造一个「路径存在但不是目录」的场景 -> mkdir/FileHandler 必然失败。"""
         blocker = tmp_path / "blocked"
         blocker.write_text("not a directory", encoding="utf-8")
-        monkeypatch.setenv("FREEAGENT_HOME", str(blocker))
+        monkeypatch.setenv("STEWARD_HOME", str(blocker))
         return str(blocker / "sub" / "agent.db")
 
     def test_falls_back_to_stderr_only(self, tmp_path, monkeypatch, capsys):

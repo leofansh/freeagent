@@ -265,7 +265,7 @@ def build_app(
 
     显式给了 ``db_path`` 时，配置目录取它的父目录 —— 这样
     ``--db ./data/agent.db`` 会读 ``./data/config.json``，
-    而不是远处的 ``~/.freeagent/config.json``（那种行为会让人以为配置没生效）。
+    而不是远处的 ``~/.steward/config.json``（那种行为会让人以为配置没生效）。
     """
     if db_path is not None:
         path = Path(db_path)
@@ -384,6 +384,9 @@ def build_app(
     week_service = WeekService(
         task_repo, record_repo, the_clock,
         today=today_service, memory=memory_service,
+        # V1.133：把本周的拍板 / 承诺 / 工作台痕迹带进周回顾。三个 repo 都在这
+        # 之前建好（见上），越过后它们才可用。
+        decisions=decision_repo, promises=promise_repo, turns=turn_repo,
     )
     chat_service = ChatService(
         task_service, task_repo, role_service, restore_service,

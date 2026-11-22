@@ -28,8 +28,45 @@ JS_ARTIFACT = r"""// 产出验收：把「待你验收」从任务上的一句�
 // 复用 js_detail 里的 post() / toast() / openTask() —— 它们是全局的，
 // 刻意不重复一份 fetch 封装：令牌注入、错误转消息都在那儿，
 // 复制一份迟早与它漂移。
+function artifactCopyBar(data, card) {
+  const a = data.artifact;
+  if (!a || !a.content) return;
+  const title = data.task && data.task.title ? data.task.title : "产物";
+  // 反斜杠与引号走 char code：raw 串里写字面量会漏出转义引号让 JS 炸掉
+  // （V1.114 的坑，test_web_js_syntax 咬的就是这个）。
+  const illegal = [String.fromCharCode(92), "/", ":", "*", "?",
+                   String.fromCharCode(34), "<", ">", "|"];
+  const safe = title.split("").map((c) => illegal.includes(c) ? "_" : c).join("");
+  const row = el("div", "acts");
+  row.appendChild(el("span", "lbl", "产物"));
+  const cp = el("button", "btn", "复制这一版");
+  cp.onclick = () => {
+    if (!navigator.clipboard) { toast("复制不了：这个浏览器没有剪贴板接口。"); return; }
+    navigator.clipboard.writeText(a.content).then(
+      () => toast("这一版已复制。"), () => toast("复制失败，请手动选中。"));
+  };
+  const ex = el("button", "btn", "导出 .md");
+  ex.onclick = () => {
+    const blob = new Blob([a.content], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = safe + ".md";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+  row.appendChild(cp);
+  row.appendChild(ex);
+  card.appendChild(row);
+}
+
 function artifactBar(data, card) {
   const a = data.artifact;
+  // 复制 / 导出对任何有正文的稿都给（含已采纳版）—— 那是「直接可交」，
+  // 与验收是两件事，不能被草稿态判定挡掉。
+  artifactCopyBar(data, card);
   // 只有草稿可验收。已采纳 / 已被取代都不给按钮。
   if (!a || a.status !== "draft") return;
   const t = data.task;

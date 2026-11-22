@@ -171,7 +171,7 @@ def question_answer(app: App, credential: str, body: dict[str, Any]) -> dict[str
         "total": total,
         "complete": done,
         "message": (
-            f"收到了，这 {total} 个问题全部答完。opencode 继续干活。"
+            f"收到了，这 {total} 个问题全部答完。它继续干活。"
             if done else f"收到了（第 {slot + 1}/{total} 问）。"
             f"还有 {total - slot - 1} 个问题，直接在这里答。"
         ),

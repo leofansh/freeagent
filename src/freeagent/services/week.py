@@ -34,8 +34,14 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 
-from ..domain import RecordType, Task
-from ..storage.repos import RecordRepo, TaskRepo
+from ..domain import DecisionLog, Promise, RecordType, Task
+from ..storage.repos import (
+    DecisionLogRepo,
+    PromiseRepo,
+    RecordRepo,
+    TaskRepo,
+    WorkbenchTurnRepo,
+)
 from .clock import Clock
 from .today import TodayService
 
@@ -49,6 +55,24 @@ __all__ = ["SlipItem", "WeekService", "WeekView"]
 #: 表现为「刚做完的事在周回顾里看不见」，而那是本仓最忌讳的静默。
 #: ``chat.py`` 的 ``_time_window`` 用同一条口径（``now + timedelta(seconds=1)``）。
 _ONE_SECOND = timedelta(seconds=1)
+
+
+def _local_day(value: str | datetime | None) -> date | None:
+    """取**本地日历日**；读不懂返回 ``None``（宁可漏掉，不猜）。
+
+    仓储读回来的 ``decided_at`` / ``created_at`` 已是 ``datetime``，而工作台
+    轮次是原始 ISO 串 —— 两种形状都要接住。取日期用 ``.date()`` 而不是
+    SQLite 的 ``date()``：后者对带时区偏移的串先折 UTC，日期可能整体挪一天，
+    而「这一周」是按本地日 + 7 天算的（V1.113 在对峙日上踩过同一个坑）。
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +110,14 @@ class WeekView:
     #: 也不混进 ``care`` 的责任提醒（〇.8.6：对成长的事有意提示，不与责任并）。
     growth_goals: tuple[tuple[str, str], ...]        # (kind, text)　kind 恒为「目标」
 
+    # V1.133：拍板 / 承诺 / 工作台痕迹。带默认值放最后 —— 旧构造（含测试）
+    # 不必跟着改；这三段是「本周做过的事」的补充事实，不是事务分区的一员。
+    # 刻意只存**原样快照**（逐字冻结的 conflict_text/reason_text、承诺原文），
+    # 不在这里解析 options_json、不评价 —— 理由同模块文档的「不给结论」。
+    decisions: tuple[DecisionLog, ...] = ()
+    promises: tuple[Promise, ...] = ()
+    turn_count: int = 0
+
     @property
     def completed(self) -> tuple[Task, ...]:
         return tuple(t for t in self.closed if t.completed_at is not None)
@@ -103,6 +135,7 @@ class WeekView:
         return not (
             self.closed or self.slips or self.next_week
             or self.unscheduled or self.waiting or self.growth_goals
+            or self.decisions or self.promises or self.turn_count
         )
 
 
@@ -115,6 +148,9 @@ class WeekService:
         *,
         today: TodayService | None = None,
         memory: MemoryService | None = None,
+        decisions: DecisionLogRepo | None = None,
+        promises: PromiseRepo | None = None,
+        turns: WorkbenchTurnRepo | None = None,
     ) -> None:
         self._tasks = tasks
         self._records = records
@@ -124,6 +160,10 @@ class WeekService:
         self._today = today
         # 成长目标数据源（memory「目标」类）。可空：空则成长头为空。
         self._memory = memory
+        # V1.133 三处痕迹数据源。都可空：空则对应段落缺席，不编造。
+        self._decisions = decisions
+        self._promises = promises
+        self._turns = turns
 
     def view(self) -> WeekView:
         if self._today is not None:
@@ -181,6 +221,32 @@ class WeekService:
                 for entry in self._memory.list_all()
                 if entry.kind == "目标"
             )
+
+        # V1.133：本周拍的板 / 许下的承诺 / 交给引擎的轮数。
+        # 三项都按**本地日**过滤 [monday, monday+7)，与上面各分区同一周界。
+        # 读不出来的时间戳直接跳过（_local_day 返回 None），不把它算进任何一天。
+        week_end_day = monday + timedelta(days=7)
+        decisions: tuple[DecisionLog, ...] = ()
+        if self._decisions is not None:
+            decisions = tuple(
+                d for d in self._decisions.list_all()
+                if (day := _local_day(d.decided_at)) is not None
+                and monday <= day < week_end_day
+            )
+        promises: tuple[Promise, ...] = ()
+        if self._promises is not None:
+            promises = tuple(
+                p for p in self._promises.list_open()
+                if (day := _local_day(p.created_at)) is not None
+                and monday <= day < week_end_day
+            )
+        turn_count = 0
+        if self._turns is not None:
+            turn_count = sum(
+                1 for t in self._turns.recent(limit=500)
+                if (day := _local_day(t.get("started_at"))) is not None
+                and monday <= day < week_end_day
+            )
         return WeekView(
             start=monday,
             end=monday + timedelta(days=7),
@@ -190,4 +256,7 @@ class WeekService:
             unscheduled=unscheduled,
             waiting=waiting,
             growth_goals=growth_goals,
+            decisions=decisions,
+            promises=promises,
+            turn_count=turn_count,
         )

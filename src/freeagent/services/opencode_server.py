@@ -1543,8 +1543,18 @@ class OpenCodeServer:
             url += api.directory_query(directory)
         req = urllib.request.Request(url)
         req.add_header("Authorization", self._auth)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            for raw in resp:
-                parsed = parse_sse_event(raw.decode("utf-8", "replace").strip())
-                if parsed is not None:
-                    yield parsed
+        # **连接在生成器第一次 ``next()`` 之前就建立**：SSE 是 volatile 的，
+        # 晚挂上去会漏掉订阅前发出的终态帧（启动瞬间就失败的那一轮）。
+        # 所以这里当场 ``urlopen``，迭代器只负责读行；``close()`` 时收连接。
+        resp = urllib.request.urlopen(req, timeout=timeout)
+
+        def _iter() -> Iterator[tuple[str, Any]]:
+            try:
+                for raw in resp:
+                    parsed = parse_sse_event(raw.decode("utf-8", "replace").strip())
+                    if parsed is not None:
+                        yield parsed
+            finally:
+                resp.close()
+
+        return _iter()

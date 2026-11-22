@@ -45,15 +45,10 @@ function renderSettings(d) {
   const llm = renderLlmSection(d);
 
   const f = el("form", "set");
-  // 挂进 form，而不是 root。
-  //
-  // 踩过的坑（真在浏览器里看出来的）：style.css 里所有字段样式都是
-  // **以 form.set 为前缀**的 —— `form.set .field > label { display: block }`
-  // 让标签压在输入框上面，`form.set .field input[type=text] { width: 100% }`
-  // 让输入框铺满。挂在 form 外面就一条都吃不到：标签变成**和输入框并排**，
-  // 输入框退化成通用的 `flex: 1 1 260px`，于是接口地址被截成
-  // 「https://api.deepseek.c」，刚好少掉 /v1 —— 而那是个真能跑和真跑不通
-  // 的区别。DOM 断言全绿，因为结构没错、只是没吃到样式。
+  // 挂进 form 而不是 root：字段样式全以 form.set 为前缀（标签压在框上、输入框
+  // 铺满）。挂外面会退化成 flex 并排，接口地址被截成 https://api.deepseek.c
+  // —— DOM 断言全绿，浏览器里却跑不通。
+  f.appendChild(settingsGroupLabel("智能层与模型"));
   f.appendChild(llm.node);
 
   const field = (label, node, hint) => {
@@ -71,6 +66,7 @@ function renderSettings(d) {
   const ewOn = el("input"); ewOn.type = "checkbox";
   ewOn.checked = !!d.energy_windows;
 
+  f.appendChild(settingsGroupLabel("运行与降级"));
   f.appendChild(field("超时（秒）", to, "1–600。调大适合慢网络，但失败时会等更久。"));
 
   const fbWrap = el("label", "check");
@@ -118,6 +114,7 @@ function renderSettings(d) {
   ewField.appendChild(bands);
   ewField.appendChild(el("div", "hint",
     "左闭右开，单位为小时。默认早晨 5–12、下午 12–18、晚上 18–24。"));
+  f.appendChild(settingsGroupLabel("排序偏好"));
   f.appendChild(ewField);
 
   const syncBands = () => {
@@ -178,7 +175,7 @@ function renderSettings(d) {
   root.appendChild(el("div", "hint",
     "非秘密项存在 " + esc(d.config_path) + "，改这里等于改那个文件，" +
     "也可以直接编辑它（记得重启）。Key 另存 " +
-    esc(String(d.config_path || "").replace(/[\\/][^\\/]+$/, "") || "~/.freeagent") +
+    esc(String(d.config_path || "").replace(/[\\/][^\\/]+$/, "") || "~/.steward") +
     "/llm.env —— 不在这里，因为它不是配置、而是凭据。"));
   $("#foot").textContent =
     "Key 可以在这里填，会写进 llm.env（不写进 config.json）。" +

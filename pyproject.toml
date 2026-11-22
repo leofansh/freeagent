@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "freeagent"
 version = "0.1.0"
-description = "个人事务助手原型 — 角色脉络 / 事务生命周期 / 今天视图 / 可恢复状态"
+description = "值守（Steward）— 个人事务助手原型：角色脉络 / 事务生命周期 / 今天视图 / 可恢复状态"
 requires-python = ">=3.11"
 dependencies = []
 
@@ -23,6 +23,12 @@ dev = ["pytest>=8"]
 feishu = ["lark-oapi>=1.2.0"]
 
 [project.scripts]
+# 新名字（V1.140）。装过包的人敲 `steward` 就起。
+steward = "freeagent.cli.app:main"
+steward-feishu = "freeagent.feishu.bridge:main"
+steward-feishu-doctor = "freeagent.feishu.doctor:main"
+# 旧名字**保留成别名**：已装好的快捷方式、批处理、肌肉记忆都还能用，
+# 改名不该让谁的启动项突然失效。包名本身没动（那是另一刀）。
 freeagent = "freeagent.cli.app:main"
 freeagent-feishu = "freeagent.feishu.bridge:main"
 freeagent-feishu-doctor = "freeagent.feishu.doctor:main"

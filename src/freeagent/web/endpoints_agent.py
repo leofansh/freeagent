@@ -20,6 +20,8 @@ from ..app import App
 from ..domain import FreeAgentError
 from ..services import agent_turn, engine_host
 from . import endpoints_agent_workspace as workspace
+from . import endpoints_agent_intake
+from . import endpoints_reveal
 
 __all__ = ["agent_state", "agent_turn_get", "agent_turns_list", "agent_decide",
            "agent_stop", "agent_post", "engine_dict", "turn_dict"]
@@ -114,6 +116,12 @@ def agent_state(app: App) -> dict[str, Any]:
     return {
         "kind": "agent_state",
         "engine": engine_dict(_host(app).state()),
+        # 用量是轮询接口上的附加信息：读不到也只回 unreadable + 原因，
+        # 不让状态页整体失败（host.usage() 内部已 fail-closed + TTL 缓存）。
+        "usage": _host(app).usage(),
+        # 改动账同理（V1.135）：工作台「变更」视图的数据源，走 engine_ledger
+        # 的会话消息接口；读不到回 unreadable + 原因，不落成「没改」。
+        "ledger": _host(app).ledger(),
         "turn": turn_dict(_turns(app).latest()),
         "projects": projects["projects"],
         "prefs": {
@@ -184,9 +192,10 @@ def agent_decide(app: App, body: dict[str, Any]) -> dict[str, Any]:
         raise FreeAgentError("没说答的是哪一轮")
     allow = bool(body.get("allow"))
     answer = str(body.get("answer") or "").strip()
+    scope = str(body.get("scope") or "").strip()
     # 只记账、不在这里发请求：把一次网络往返挂在服务端锁上，症状正是
     # 「点了没反应」（12.7.2）。真正的答复由执行线程发。
-    if not _turns(app).decide(turn_id, allow=allow, answer=answer):
+    if not _turns(app).decide(turn_id, allow=allow, answer=answer, scope=scope):
         raise FreeAgentError(
             "这一轮现在没有待回答的卡 —— 可能它已经结束了，或卡已过期")
     return {"kind": "agent_decide", "id": turn_id, "allow": allow}
@@ -206,12 +215,15 @@ def agent_stop(app: App, body: dict[str, Any]) -> dict[str, Any]:
 #: （将来还要「接着上一句说」），而 ``routes_write.py`` 已经贴着行数上限。
 _ACTIONS: dict[str, Callable[[App, dict[str, Any]], dict[str, Any]]] = {
     "start": lambda app, body: workspace.agent_start(app, body, _turns(app)),
+    "intake": endpoints_agent_intake.agent_intake,
     "decide": agent_decide,
     "stop": agent_stop,
     "project_save": lambda app, body: workspace.agent_project_save(app, body),
     "project_select": lambda app, body: workspace.agent_project_select(app, body),
     "project_update": lambda app, body: workspace.agent_project_update(app, body),
     "project_delete": lambda app, body: workspace.agent_project_delete(app, body),
+    # 在系统文件管理器中定位（V1.135）：会起本地进程，单独模块实现。
+    "reveal": endpoints_reveal.agent_reveal,
 }
 
 
@@ -222,6 +234,6 @@ def agent_post(app: App, action: str, read_body: Callable[..., dict[str, Any]]
     if handler is None:
         raise FreeAgentError(
             f"不认识的动作：{action!r}"
-            "（可选：start/decide/stop/project_save/project_select/"
-            "project_update/project_delete）")
+            "（可选：start/intake/decide/stop/project_save/project_select/"
+            "project_update/project_delete/reveal）")
     return handler(app, read_body())

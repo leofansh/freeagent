@@ -5,12 +5,12 @@
 * **API Key 只从环境变量 ``DEEPSEEK_API_KEY`` 读，永不落盘、永不进配置文件、
   永不进日志与错误信息。**
 * model / base_url / timeout / 精力档位这类非秘密项可以写进
-  ``~/.freeagent/config.json``，环境变量优先。
+  ``~/.steward/config.json``，环境变量优先。
 
 配置来源优先级（后者覆盖前者）：
 
 1. 内置默认值
-2. ``~/.freeagent/config.json``（``FREEAGENT_HOME`` 可改目录）
+2. ``~/.steward/config.json``（``STEWARD_HOME`` 可改目录，旧名仍认）
 3. 环境变量
 """
 
@@ -431,7 +431,8 @@ def _abs_path_list(raw: Any, key: str) -> list[str]:
 def load_config(home: str | Path | None = None) -> Config:
     """按「默认 → 文件 → 环境变量」的顺序合并配置。
 
-    ``home`` 为空时用 ``FREEAGENT_HOME`` 或 ``~/.freeagent``。
+    ``home`` 为空时用 ``STEWARD_HOME``（旧名 ``FREEAGENT_HOME`` 仍认）或
+    ``~/.steward``（旧目录里有库时沿用旧目录，见 :func:`freeagent.paths.state_dir`）。
     显式传入时（例如 ``build_app`` 用数据库所在目录）以它为准 ——
     库和配置放在一起，避免「改了 --db 就找不到配置」。
     """

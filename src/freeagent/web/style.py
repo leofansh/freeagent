@@ -143,14 +143,14 @@ STYLE_CSS = r"""  :root {
      「填了会写进 ~\.free…」—— 而那正是用户最需要看清的一句
      （它要说清 Key 会写到哪个文件）。
      占位符由 js_settings_llm.py 用 stateDir 运行时拼出，真值见 paths.py：
-     默认 ~/.freeagent/llm.env，可由 FREEAGENT_HOME 改。 */
+     默认 ~/.steward/llm.env，可由 STEWARD_HOME 改（旧名 FREEAGENT_HOME 仍认）。 */
   input[type=text], input[type=password], select, input[type=number] {
     font: inherit; font-size: 14px; padding: 7px 11px; border-radius: 8px;
     border: 1px solid var(--line); background: var(--card); color: var(--ink);
   }
   input[type=text] { flex: 1 1 260px; min-width: 0; }
   input[type=number] { width: 82px; }
-  /* 编程页签的四个下拉要**占满整行**：模型名有长有短（「Nemotron 3.5
+  /* 委派总览页的四个下拉要**占满整行**：模型名有长有短（「Nemotron 3.5
      Lightning Free」29 字 vs「Big Pickle」10），窄的下拉会把长名截断成
      「Nemotron 3.5 Lig…」，而那正好是最难认的一批。 */
   .field > select { width: 100%; box-sizing: border-box; }

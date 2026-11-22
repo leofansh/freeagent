@@ -2,7 +2,7 @@
 
 ## 它在替换什么
 
-改造前，「让 OpenCode 干活」的唯一路径是**编程页签里四段选择 + 建一条委派
+改造前，「让 OpenCode 干活」的唯一路径是**旧「编程」页（今委派总览）里四段选择 + 建一条委派
 事务 + 去终端敲 /start**。那三步里只有第一步属于人（选目录、选模型），
 后两步是系统该自己判断的事。这一块把第一步做成一页。
 
@@ -89,6 +89,8 @@ function wbPaint(st) {
   const eng = st.engine || null;
   const turn = st.turn;
   wbTurn = turn;
+  // 产物侧栏（V1.132）：和流同屏，无轮次时也要清掉上一轮的残留。
+  if (typeof wbSidePaint === "function") wbSidePaint(turn, st.ledger);
   // 按钮可用态随状态走：没在跑就停不掉，上一轮没完再发只会吃到「还在跑」。
   const live = !!(turn && (turn.status === "running" || turn.status === "waiting"));
   const stopBtn = $("#wb-stop"); if (stopBtn) stopBtn.disabled = !live;
@@ -98,11 +100,14 @@ function wbPaint(st) {
   // 只画「现在这台引擎」：点开一条历史时 st.engine 是空的，
   // 那时把引擎一行刷成 undefined 会让人以为引擎没了。
   if (engBox && eng) {
+    // 只留「就绪/在跑」+ 用量一行：pid / 会话 ID / 目录是排障才要看的内部细节，
+    // 摆在工作台顶栏等于把底座当主角（第21章「引擎藏到后台、用户无感」）。
     const bits = ["引擎：" + (eng.status === "ready" ? "就绪" : eng.status)];
-    if (eng.pid) bits.push("pid " + eng.pid);
-    if (eng.directory) bits.push("目录 " + eng.directory);
-    if (eng.session_id) bits.push("会话 " + eng.session_id.slice(0, 12));
     if (eng.error) bits.push("失败原因：" + eng.error);
+    // 用量（V1.133）：读不到就说读不到，绝不显示 0 —— 把故障显示成「用了 0」是说谎。
+    const u = st.usage;
+    if (u && u.state === "ok") bits.push("Token 输入 " + u.input + " / 输出 " + u.output);
+    else if (u && u.reason) bits.push("Token 读不到：" + u.reason.slice(0, 60));
     engBox.textContent = bits.join(" · ");
   }
 
@@ -140,15 +145,7 @@ function wbPaint(st) {
   if (steps.length) {
     // 一句「交给它」之后，人能看到的中间过程就是这份清单 ——
     // 「在跑」加一个工具计数说不出「跑到第几步、哪一步卡住」。
-    const box = el("div", "card");
-    box.appendChild(el("div", "row1", "步骤（" + steps.length + "）"));
-    steps.forEach((s, i) => {
-      const line = el("div", "note");
-      line.textContent = (i + 1) + ". " + s.name +
-        (s.target ? "  " + s.target : "") + "  · " + wbStep(s.status);
-      box.appendChild(line);
-    });
-    stream.appendChild(box);
+    stream.appendChild(wbStepsCard(steps));
   }
   if (turn.reason) {
     stream.appendChild(el("div", "note",
@@ -161,13 +158,13 @@ function wbPaint(st) {
   const files = turn.files || [];
   const cmds = turn.commands || [];
   if (files.length) {
-    const box = el("div", "card");
+    const box = el("div", "card wb-process");
     box.appendChild(el("div", "row1", "碰过的文件（" + files.length + "）"));
     files.forEach((f) => box.appendChild(el("div", "note", esc(f))));
     stream.appendChild(box);
   }
   if (cmds.length) {
-    const box = el("div", "card");
+    const box = el("div", "card wb-process");
     box.appendChild(el("div", "row1", "它跑过的命令（" + cmds.length + "）"));
     cmds.forEach((c) => box.appendChild(el("div", "note", "$ " + esc(c))));
     stream.appendChild(box);

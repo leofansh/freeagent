@@ -28,11 +28,14 @@ from __future__ import annotations
 import logging
 import pathlib
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
 from .agent_router import one_line
 from .clock import Clock, SystemClock
+from .engine_ledger import EngineLedger, read_session_ledger
+from .engine_usage import EngineUsage, read_session_usage
 from .opencode_server import OpenCodeServer, ServerError, auto_dir_permission_config
 
 log = logging.getLogger(__name__)
@@ -137,6 +140,13 @@ class EngineHost:
         self._status = STOPPED
         self._error = ""
         self._started_at = ""
+        # 用量是「附加信息」，由状态页轮询。带 TTL 缓存避免每次轮询都打引擎；
+        # 换会话（_halt_locked）时清掉，免得把上一会话的数说成这一会话的。
+        self._usage_cache: tuple[float, str, EngineUsage] | None = None
+        # 改动账与用量同理：状态页会轮询，而账要分页拉引擎消息（一次会话实测
+        # 431 次工具调用），每轮都拉会拖垮引擎。带 TTL 缓存；换会话清掉，
+        # 免得把上一会话的账说成这一会话的。
+        self._ledger_cache: tuple[float, str, EngineLedger] | None = None
 
     # -- 对外 ---------------------------------------------------------- #
     def ensure(
@@ -251,6 +261,23 @@ class EngineHost:
                 raise ServerError("引擎不在，没法回提问")
             self._server.reply_question(request_id, answers)
 
+    def pending_permissions(self, *, directory: str = "") -> list[Any]:
+        """列出当前挂起的授权请求（**兜底恢复**，不是主路径）。
+
+        主路径走实时事件流；这里只在事件漏掉时把挂着的请求捞出来摆成卡。
+        拉取失败回空列表 —— 兜底不能因为自己查不到就误报「没有授权」，
+        也不该在这里放行任何东西。
+        """
+        with self._lock:
+            if self._server is None:
+                return []
+            server = self._server
+        try:
+            return server.pending_permissions(directory=directory or None)
+        except Exception as exc:  # noqa: BLE001 - 兜底查询失败不阻断这一轮
+            log.warning("【引擎】挂起授权拉取失败：%s", exc)
+            return []
+
     def abort(self) -> None:
         """尽力叫停。失败只记不抛 —— 叫停不是必须成功的事。"""
         with self._lock:
@@ -284,6 +311,66 @@ class EngineHost:
                 error=self._error,
                 started_at=self._started_at,
             )
+
+    def usage(self, *, max_age: float = 15.0) -> dict[str, Any]:
+        """最近一次会话的 token 用量，供状态页显示。
+
+        ## 为什么不进 EngineState、也不抛异常
+
+        引擎的用量形状没有版本承诺（V1.110 踩过直接读 SQLite 的坑），
+        所以这里只报「认得出的数」，认不出就回 `state="unreadable"` + 原因。
+        它是附加信息，读不到**不能**让引擎状态页整体失败 —— 因此连
+        `call` 抛异常也收在这里。带 TTL 缓存是因为状态页会轮询，没必要
+        每次都打引擎。
+        """
+        with self._lock:
+            if self._server is None or not self._session:
+                return _usage_dict(EngineUsage(reason="引擎还没就绪，没有会话可读用量"))
+            session, server = self._session, self._server
+            now = time.monotonic()
+            cached = self._usage_cache
+            if cached and cached[1] == session and now - cached[0] < max_age:
+                return _usage_dict(cached[2])
+            call = getattr(server, "call", None)
+            try:
+                usage = (read_session_usage(session, call)
+                         if callable(call) else
+                         EngineUsage(reason="引擎适配器没有用量读取接口"))
+            except Exception as exc:  # noqa: BLE001 - 附加信息不拖垮主视图
+                usage = EngineUsage(reason=f"读用量失败：{exc}")
+            self._usage_cache = (now, session, usage)
+            return _usage_dict(usage)
+
+    def ledger(self, *, max_age: float = 15.0) -> dict[str, Any]:
+        """本会话的改动账，供工作台「变更」视图显示。
+
+        ## 为什么带缓存、且永不抛异常
+
+        改动账走 ``GET /api/session/{sid}/message`` 分页拉取（V1.110），
+        一个会话实测 431 次工具调用要翻好几页；工作台状态页 1~2 秒轮询一次，
+        每轮都拉会把引擎拖垮。它与用量一样是**附加信息**：读不到只回
+        `state="unreadable"` + 原因，绝不让状态页整体失败；更不能把
+        「读不到」显示成「没改」—— 那是本仓反复避开的静默（lens L6）。
+        """
+        with self._lock:
+            if self._server is None or not self._session:
+                return _ledger_dict(EngineLedger(
+                    "unreadable", reason="引擎还没就绪，没有会话可查账"))
+            session, server = self._session, self._server
+            now = time.monotonic()
+            cached = self._ledger_cache
+            if cached and cached[1] == session and now - cached[0] < max_age:
+                return _ledger_dict(cached[2])
+            call = getattr(server, "call", None)
+            try:
+                ledger = (read_session_ledger(session, server=server)
+                          if callable(call) else
+                          EngineLedger("unreadable",
+                                       reason="引擎适配器没有消息读取接口"))
+            except Exception as exc:  # noqa: BLE001 - 附加信息不拖垮主视图
+                ledger = EngineLedger("unreadable", reason=f"查账失败：{exc}")
+            self._ledger_cache = (now, session, ledger)
+            return _ledger_dict(ledger)
 
     # -- 内部 ---------------------------------------------------------- #
     def _spawn(self, project: pathlib.Path, mode: str) -> Any:
@@ -332,6 +419,8 @@ class EngineHost:
         self._mode = ""
         self._status = STOPPED
         self._started_at = ""
+        self._usage_cache = None
+        self._ledger_cache = None
         if server is not None:
             self._close_quietly(server)
             log.info("【引擎】已停（%s）", reason)
@@ -342,6 +431,31 @@ class EngineHost:
             server.close()
         except Exception as exc:  # noqa: BLE001
             log.warning("【引擎】收口失败（进程可能残留）：%s", exc)
+
+
+def _usage_dict(usage: EngineUsage) -> dict[str, Any]:
+    """把 dataclass 摊成 API 用的纯 dict（不把对象漏给 JSON 序列化）。"""
+    return {
+        "state": usage.state,
+        "input": usage.input,
+        "output": usage.output,
+        "total": usage.total,
+        "reason": usage.reason,
+    }
+
+
+def _ledger_dict(ledger: EngineLedger) -> dict[str, Any]:
+    """把改动账摊成 API 用的纯 dict。``files`` 是 ``(路径, 次数)`` 的元组，
+    摊成对象数组而不是拼成一句给人看的话 —— 判「改了什么」要读结构化字段，
+    不能让前端拿文本去正则解析（lens L5：文案不是契约）。
+    """
+    return {
+        "state": ledger.state,
+        "files": [{"path": p, "count": n} for p, n in ledger.files],
+        "bash_failed": ledger.bash_failed,
+        "truncated": ledger.truncated,
+        "reason": ledger.reason,
+    }
 
 
 def _explain(exc: Exception) -> str:

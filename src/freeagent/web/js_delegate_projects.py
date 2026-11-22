@@ -46,16 +46,16 @@ function delegateProjectsView(data, onChanged) {
   // 注册表查不到 ≠ 没东西可显示：白名单行与可授权根浏览不依赖 OpenCode，
   // 这里**不再提前 return**（三源并集之前的旧版会把它们一起藏掉）。
   if (!data.opencode_found) box.appendChild(el("div", "note",
-    "读不到 OpenCode 的项目列表（它可能没装或没打开过）。" +
+    "读不到后台引擎的项目列表（它可能没起来或没打开过）。" +
     "已写入 config.json 的白名单行与可授权根浏览不受影响。"));
 
   if (!items.length && !delegatePicked.length && !roots.length) {
     box.appendChild(el("div", "hint",
-      data.opencode_found ? "OpenCode 里还没有任何项目。" : "没有可显示的项目。"));
+      data.opencode_found ? "后台引擎里还没有任何项目。" : "没有可显示的项目。"));
     return box;
   }
   box.appendChild(el("div", "hint",
-    "候选来自三处：OpenCode 注册表、已写入 config.json 的白名单、" +
+    "候选来自三处：后台引擎的项目注册表、已写入 config.json 的白名单、" +
     "可授权根点选。<b>列在这里不等于已经授权</b> —— 白名单行已授权" +
     "（只能撤销），其余要点「允许」。"));
 
@@ -104,7 +104,7 @@ function delegateItemRow(item, onChanged) {
   const line = el("div", "row1");
   line.appendChild(el("span", null, item.name));
   if (item.source === "whitelist") line.appendChild(
-    el("span", "tag", "白名单（OpenCode 不知道）"));
+    el("span", "tag", "白名单（引擎注册表里没有）"));
   line.appendChild(el("span", item.allowed ? "tag open" : "tag",
     item.allowed ? "已授权" : "未授权"));
   row.appendChild(line);
@@ -245,6 +245,6 @@ async function delegateBrowseGo(rootIdx, rel, repaint) {
 function delegateRestartBanner() {
   return el("div", "note",
     "⚠ <b>改了要重启才生效。</b>桥接和执行器都在启动时读一次配置，" +
-    "现在授权的只是文件；重启它们（tools\\run_feishu.bat / " +
-    "python -m freeagent.delegate）之后新白名单才被读进去。");
+    "现在授权的只是文件；到「后台服务」里重启桥接与执行器，" +
+    "之后新白名单才被读进去。");
 }"""

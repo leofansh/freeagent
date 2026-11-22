@@ -89,7 +89,7 @@ class TestClickExecutesTheView:
         from freeagent.services.channel import ChannelService
         from freeagent.feishu.config import load_config
 
-        monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+        monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
         app = build_app(tmp_path / "a.db")
         channel = ChannelService(app, allowed_senders=frozenset({"ou_me"}))
         sent: list[tuple[str, str]] = []

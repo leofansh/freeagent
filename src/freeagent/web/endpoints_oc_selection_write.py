@@ -100,11 +100,11 @@ def oc_selection_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
         if stage == "variant":
             options = sel.variant_options(snap.providers or {}, target.model)
         else:
-            options, _ = discovery.stage_options(stage, home=home)
+            options, _ = discovery.stage_options(stage, home=home, snap=snap)
         if value not in {o.value for o in options}:
             raise FreeAgentError(
                 f"这个{stage}不可选：{value[:40]}。"
-                "（可能已从清单里去掉，或 OpenCode 不再提供）")
+                "（可能已从清单里去掉，或后台引擎不再提供）")
 
     sel.save_selection(target, home)
     return {"ok": True, "selection": {

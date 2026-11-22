@@ -14,16 +14,9 @@ JS_CHAT = r"""function chatScroll() {
   if (log) log.scrollTop = log.scrollHeight;
 }
 
-// 入参是**条目数组**，不是整份 reply。
-//
-// 踩过的坑（浏览器里实测到的，测试套件全绿也没抓到）：这里原本收整份
-// reply，调用处也传 `reply`；而下面 addMsg 里存历史那行又按**数组**用
-// `(items || []).map(...)`。同一个参数被当成两种类型，于是
-// 送一条问句就抛 `(items || []).map is not a function` ——
-// 答复文字已经渲染出来了，紧跟着又补一句「出错了」。
-// 反过来从历史恢复时传的是数组，chatItems 读 `reply.items` 拿到 undefined
-// 就静默返回 null，**可点的任务卡片全丢了**，一声不吭。
-// 现在统一成数组，两边都对。
+// 入参是**条目数组**，不是整份 reply：曾经两种类型混用，发问时 .map 抛错、
+// 回放时读 reply.items 拿到 undefined 又把任务卡片全丢了（测试全绿也没抓到）。
+// 现在两边统一成数组。
 function chatItems(items) {
   if (!items || !items.length) return null;
   const box = el("div", "items");
@@ -48,6 +41,7 @@ function chatItems(items) {
 // history 存「文字 + 种类 + 条目摘要」，够恢复上下文与渲染，不必存 HTML
 function addMsg(who, text, cls, items, store, meta) {
   const log = $("#chatlog");
+  if (log) { log.classList.remove("is-empty"); const w = log.querySelector(".chat-welcome"); if (w) w.remove(); }  // 欢迎区与居中态都只在空对话时存在
   // 回放历史时把生成日期刷新成当天：日期是生成时冻进文本的，
   // 服务端不会重渲染已存文本。generated_at 只有「今天」类答复才有；
   // 老存档没有 meta，判空守卫直接跳过（不改写、不报错）。
@@ -82,7 +76,7 @@ function addChips(list, store) {
   const row = el("div", "chips");
   list.forEach((s) => {
     const b = el("button", "chip", esc(s));
-    b.onclick = () => sendChat(s);
+    b.onclick = () => { const ta = $("#chatinput"); if (ta) { ta.value = s; ta.focus(); ta.dispatchEvent(new Event("input")); } };
     row.appendChild(b);
   });
   log.appendChild(row);
@@ -133,9 +127,9 @@ function renderChatShell(menu) {
       else addMsg(m.who, m.text, m.cls, m.items, false, m.meta);
     });
   }
-  if (!history_.length && menu) {
-    addMsg("bot", menu.notice + "\n可以问我：", "kind-help", null, false);
-    addChips(menu.can_do, false);
+  // 空对话：摆居中欢迎区（renderChatWelcome 在 js_onboard；声明提升）。
+  if (!history_.length) {
+    log.classList.add("is-empty"); if (menu) renderChatWelcome(menu);
   }
 
   const bar = buildBar();
@@ -156,6 +150,11 @@ function buildBar() {
   send.id = "chatsend";
   bar.appendChild(ta);
   bar.appendChild(send);
+  // 对话内搜索（V1.132）：长对话能搜能跳；Ctrl/Cmd+F 也走这里。
+  const search = el("button", null, "搜索");
+  search.title = "搜这段对话（Ctrl+F）";
+  search.onclick = () => chatSearchOpen();
+  bar.appendChild(search);
   if (history_.length) {
     const clear = el("button", null, "清空");
     clear.title = "清掉这段对话（不影响已记的事务）";
@@ -190,6 +189,9 @@ async function sendChat(preset) {
   ta.style.height = "auto";
   // 清掉旧的快捷按钮，避免它们堆在下面看不懂
   $("#chatlog").querySelectorAll(".chips").forEach((n) => n.remove());
+  // 旧建议行撤出 DOM 时 history_ 也要一起撤，否则刷新重放时退役 chips 插回消息中间。
+  history_ = history_.filter((m) => m.who !== "chips");
+  chatSave(history_);
   const thinking = addMsg("bot", "…", "", null, false);
   try {
     const reply = await api("/api/chat", {
@@ -230,15 +232,15 @@ async function loadChat() {
   try {
     const h = await api("/api/health");
     if (h.llm === "RuleBasedProvider") {
-      const bar = el("div", "note");
-      bar.style.marginBottom = "10px";
+      const log = $("#chatlog");
+      const bar = el("div", "chat-status");
       bar.appendChild(el("span", null,
         "当前是规则层（离线）：能记事、排期、提醒；角色判断和草稿是模板。配置模型后启用智能回复。"));
-      const go = el("button", "btn", "去配置模型");
-      go.style.marginLeft = "10px";
-      go.onclick = () => load("settings");
+      const go = el("button", "btn", "去配置模型"); go.onclick = () => load("settings");
       bar.appendChild(go);
-      $("#chatlog").prepend(bar);
+      // 空对话时并进欢迎区；有历史才置顶。
+      const welcome = log.querySelector(".chat-welcome");
+      if (welcome) welcome.appendChild(bar); else log.prepend(bar);
     }
   } catch (e) { /* 状态读不到不挡住对话 */ }
   loadVisionBar();

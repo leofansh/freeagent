@@ -27,7 +27,7 @@ from freeagent.services import oc_selection as sel
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+    monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
     return tmp_path
 
 

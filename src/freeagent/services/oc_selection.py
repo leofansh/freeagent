@@ -49,10 +49,11 @@ OpenCode 侧**都是 204** —— 服务端不校验，所以**只能由我们**
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+from ..paths import state_dir
 
 __all__ = [
     "Option",
@@ -89,7 +90,7 @@ MODEL_PAGE_SIZE = 12
 #: 不排序的话同一组档位在不同模型上会以不同顺序出现，像 bug。
 VARIANT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
-#: 状态文件名。放在 ``~/.freeagent/`` 下，与 ``config.json`` 同级但独立 ——
+#: 状态文件名。放在状态目录（默认 ``~/.steward/``）下，与 ``config.json`` 同级但独立 ——
 #: 独立是为了**不与 ``save_config`` 抢同一个文件**（那个函数会整体重写
 #: ``config.json``，会把这里的字段抹掉）。
 _SELECTION_FILE = "oc_selection.json"
@@ -257,7 +258,7 @@ def current_agent_is_valid(rows: Iterable[dict[str, Any]], agent: str) -> bool:
     这一段的失效**不来自用户操作**：
 
     - agent 定义可以是**项目级**的（``.opencode/agent/*.md``），而
-      ``Selection.agent`` 是**全局一份**（``~/.freeagent/oc_selection.json``），
+      ``Selection.agent`` 是**全局一份**（``~/.steward/oc_selection.json``），
       不随项目变 —— 在 A 项目里选的 agent，切到 B 项目可能压根不存在。
     - OpenCode 升级后内置 agent 会变；用户也可能自己删了某个 agent 文件。
 
@@ -489,8 +490,14 @@ _CURATED_FILE = "oc_models.json"
 
 
 def _curated_path(home: str | Path | None = None) -> Path:
-    base = Path(home) if home is not None else Path.home() / ".freeagent"
-    return base / _CURATED_FILE
+    """日常清单文件。目录解析**只走** :func:`freeagent.paths.state_dir`。
+
+    以前这里自己拼 ``Path.home() / ".freeagent"``，于是它**不认**
+    ``FREEAGENT_HOME``、也不认 ``--db`` 之外的目录覆盖 —— 测试想把偏好
+    文件挪开时只能靠显式传 ``home``，漏传就写到开发者的真实目录里
+    （``test_oc_selection.py`` 记过这个坑）。改成一处的直接好处就是这个。
+    """
+    return state_dir(home) / _CURATED_FILE
 
 
 def load_curated_models(home: str | Path | None = None) -> list[str]:
@@ -601,8 +608,8 @@ def model_list_note(options: Sequence[Option]) -> str:
 # ── 状态持久化 ────────────────────────────────────────────────────────── #
 
 def _selection_path(home: str | Path | None = None) -> Path:
-    base = Path(home) if home is not None else Path.home() / ".freeagent"
-    return base / _SELECTION_FILE
+    # 目录解析同 :func:`_curated_path`，只走 paths.state_dir。
+    return state_dir(home) / _SELECTION_FILE
 
 
 def load_selection(home: str | Path | None = None) -> Selection:

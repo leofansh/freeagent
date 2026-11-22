@@ -202,7 +202,7 @@ def test_snapshot_drift_blocks_create(wired, monkeypatch):
     """快照与当前选择不一致 —— 提示重选，**不建委派**。
 
     这是「回显与实际派发同源」的另一半：回显用快照，派发前再核对一次，
-    防止用户在 Web 编程页改了选择而飞书这边还按旧快照建。
+    防止用户在 Web 委派总览页改了选择而飞书这边还按旧快照建。
     """
     sender, channel = wired
     _arm_and_fill()

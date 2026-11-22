@@ -32,9 +32,9 @@ DOC = pathlib.Path(__file__).resolve().parent.parent / "docs" / "真机验收矩
 
 #: 编号全集。**只增不重排**；作废请用删除线并在此注明，不要复用编号。
 KNOWN_IDS = frozenset(
-    [f"A{i}" for i in range(1, 13)]      # 表 1：动作 × 通道
+    [f"A{i}" for i in range(1, 15)]      # 表 1：动作 × 通道；A13/A14 本会话内允许此类（V1.138）
     + [f"B{i}" for i in range(1, 6)]     # 表 2：闸门自身行为
-    + [f"W{i}" for i in range(1, 5)]     # 表 3：工作台（V1.114）的卡与停止
+    + [f"W{i}" for i in range(1, 6)]     # 表 3：工作台（V1.114）的卡与停止；W5 兜底捞卡（V1.128）
     + [f"D{i}" for i in range(1, 5)]     # 附录：已不在链路上的项目级闸门
 )
 

@@ -2,7 +2,7 @@
 
 ## 为什么从 :mod:`freeagent.feishu.bridge` 里搬出来
 
-它原来住在飞书桥接里，因为**只有飞书用**。加了 Web 编程页签之后就成了
+它原来住在飞书桥接里，因为**只有飞书用**。加了 Web 委派总览页之后就成了
 ``web → feishu.bridge`` 的依赖 —— 一个 Web 端点去 import 一个飞书通道模块，
 方向是倒的：那让「通道」变成了「服务层」，于是换掉飞书（比如只留 Web）
 就得连服务层一起删。
@@ -127,7 +127,18 @@ def snapshot() -> Snapshot:
     except Exception:
         # 连服务都起不来：三份都没拿到。
         log.exception("【发现】起 opencode 服务失败")
-    _SNAPSHOT = snap
+
+    # 失败的快照**不进 30s 缓存**：插件激活这类启动抖动常几秒后就好，
+    # 缓存半残快照会让「查不到模型」在界面上赖满 30 秒（真机踩过：
+    # /api/model 连回 503，重试窗口过后 providers=None）。
+    # 清空缓存让**下一次请求**立刻重查，而不是把一次抖动固化成半分钟。
+    # 同一次请求内不会因此反复起进程 —— 调用方（oc_options / 保存选择）
+    # 把这里返回的 snap 直接传给 stage_options(snap=...)，四段共用一份。
+    if (snap.projects is not None and snap.agents is not None
+            and snap.providers is not None):
+        _SNAPSHOT = snap
+    else:
+        _SNAPSHOT = None
     return snap
 
 
@@ -195,7 +206,8 @@ def exec_world_agents(project: str = "") -> list[dict[str, Any]] | None:
     return rows
 
 
-def stage_options(stage: str, *, home: Any = None) -> tuple[list[sel.Option], str]:
+def stage_options(stage: str, *, home: Any = None,
+                  snap: Snapshot | None = None) -> tuple[list[sel.Option], str]:
     """某一阶段的选项。**返回 ``(选项, 提示语)``**。
 
     失败时返回 ``([], 原因)`` —— 理由是**用户必须看到真实原因**，而不是一张
@@ -203,17 +215,22 @@ def stage_options(stage: str, *, home: Any = None) -> tuple[list[sel.Option], st
     被解读成「没有可选的项目」，于是往错的方向查。
 
     :param home: 读当前选择时用的 ``~/.freeagent`` 位置。测试要隔离就传它。
+    :param snap: 调用方已经查过的快照。**同一次请求里四段必须共用一份**：
+        一次 /api/oc/options 先 snapshot()、中间还夹着约 7s 的
+        exec_world_agents()，再连调四次 stage_options —— 若每次各自
+        snapshot()，失败路径会把一次发现放大成五次起进程（30 秒以上）。
+        不传才自己查（飞书按阶段逐张发卡，每张卡是一次独立交互）。
     """
-    snap = snapshot()
+    snap = snapshot() if snap is None else snap
 
     if stage == "project":
         if snap.projects is None:
-            return [], "查不到项目列表 —— OpenCode 没起来或读不到它的项目库。"
+            return [], "查不到项目列表 —— 后台引擎没起来或读不到它的项目库。"
         return sel.list_project_options(snap.projects), ""
 
     if stage == "agent":
         if snap.agents is None:
-            return [], "查不到 OpenCode 的工作模式列表 —— OpenCode 没起来或版本不认。"
+            return [], "查不到后台引擎的工作模式列表 —— 后台引擎没起来或版本不认。"
         opts = sel.list_agent_options(snap.agents)
         return opts, "" if opts else "这台机器上没有可用的工作模式。"
 
@@ -221,12 +238,12 @@ def stage_options(stage: str, *, home: Any = None) -> tuple[list[sel.Option], st
     # 快照 —— 所以选完模型再选档位不再付那 7 秒。
     if stage == "model":
         if snap.providers is None:
-            return [], "查不到模型列表 —— OpenCode 没起来或 /provider 不可用。"
+            return [], "查不到模型列表 —— 后台引擎没起来或 /provider 不可用。"
         opts = sel.daily_model_options(snap.providers, home=home)
         if not opts:
             return [], (
                 "日常清单是空的，且没有已连接凭据的 provider —— "
-                "先在 OpenCode 里登录一个，或在设置里勾几个模型。"
+                "先在后台引擎里登录一个，或在设置里勾几个模型。"
             )
         return opts, sel.model_list_note(opts)
 
@@ -235,7 +252,7 @@ def stage_options(stage: str, *, home: Any = None) -> tuple[list[sel.Option], st
         if not current.model:
             return [], "还没选模型 —— 先选模型再选推理档。"
         if snap.providers is None:
-            return [], "查不到推理档列表 —— OpenCode 的 /provider 不可用。"
+            return [], "查不到推理档列表 —— 后台引擎的 /provider 不可用。"
         opts = sel.variant_options(snap.providers, current.model)
         if len(opts) <= 1:
             return opts, "这个模型没有可选推理档（用它的默认设置）。"

@@ -2,7 +2,7 @@
 
 ## 为什么这些断言重要
 
-编程页签的四个下拉框，其值最终决定「让 opencode 去哪个目录、用哪个模型」。
+委派总览页的四个下拉框，其值最终决定「让 opencode 去哪个目录、用哪个模型」。
 而那个值的来源是**浏览器** —— 浏览器载荷用户可以随便改（改 JS、重发请求）。
 
 所以两条硬要求：
@@ -26,7 +26,7 @@ from freeagent.web import endpoints_oc_dispatch as ep_dispatch
 from freeagent.web import endpoints_oc_selection as ep
 from freeagent.web import endpoints_oc_selection_write as ep_write
 
-#: 编程页签的端点**曾经**是一个文件，2026-10 按「读/ 写 / 建事务」拆成三个
+#: 委派总览页的端点**曾经**是一个文件，2026-10 按「读/ 写 / 建事务」拆成三个
 #: （那条 250 行守卫逼出来的）。下面几条测试是**扫源码**的，所以它们必须
 #: 跟着扫全部三个 —— 只扫其中一个等于「断言自己没持有的状态」，
 #: 搬走的那半边从此没人管。

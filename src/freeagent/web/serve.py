@@ -35,7 +35,7 @@ def serve(
         print(f"⚠ 今日备份没能执行（{exc}）；功能不受影响，明天会再试。")
     server = create_server(app, host, port)
     url = f"http://{host}:{server.server_address[1]}/"
-    print("个人事务助手 · Web UI")
+    print("值守 · Web UI")
     print(f"  地址：{url}")
     print(f"  智能层：{app.llm_name}")
     print("  仅监听回环地址（局域网不可达）。Ctrl+C 停止。")

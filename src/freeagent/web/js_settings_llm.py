@@ -38,7 +38,7 @@ function renderLlmSection(d) {
 
   // 密钥文件与 config.json 同目录：从 config_path 反推，别让用户自己找。
   const stateDir = String(d.config_path || "").replace(/[\\/][^\\/]+$/, "")
-    || "~/.freeagent";
+    || "~/.steward";
 
   // --- 服务商 ---
   const pick = el("select");

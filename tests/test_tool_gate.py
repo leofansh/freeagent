@@ -347,7 +347,7 @@ class _StubTask:
 
 class TestToolGateLoop:
     def _run(self, server, sender, store, approver="ou_owner",
-             requested_by="", **policy_kw):
+             requested_by="", *, reply_sleep=None, **policy_kw):
         from freeagent.delegate import run_with_tool_gate
         from freeagent.services.delegate import DelegationPolicy
         sender.bind(store)
@@ -365,6 +365,8 @@ class TestToolGateLoop:
             store=store, sender=sender, approver=approver,
             requested_by=requested_by,
             server_factory=factory,
+            # 成功路径一次就通、不睡；失败路径不真睡，测试要能快跑。
+            reply_sleep=reply_sleep or (lambda _: None),
         )
 
     def _tp_row(self, store):
@@ -425,6 +427,33 @@ class TestToolGateLoop:
         server = _FakeServer([_asked("per_1"), ("session.idle", {})])
         out = self._run(server, _FakeSender(auto="deny"), store)
         assert server.replies == [("per_1", "deny")]
+
+    def test_reply_failure_is_reported_not_pretended_success(
+            self, store: ApprovalStore) -> None:
+        """人批了、卡面也改了，但结论没送回引擎 —— 必须停住并说清。
+
+        这正是插件 v0.2.22 修的那类「审批放行被静默吞掉」：早先本仓这一行
+        连 try 都没有，失败后会话卡到 600s 超时，而用户以为自己已经批完。
+        """
+        class _BrokenReplyServer(_FakeServer):
+            def __init__(self, events):
+                super().__init__(events)
+                self.aborted = 0
+
+            def reply_permission(self, request_id, decision, *, directory=None):
+                raise OSError("engine unreachable")
+
+            def abort(self, session_id):
+                self.aborted += 1
+
+        server = _BrokenReplyServer([_asked("per_1")])
+        out = self._run(server, _FakeSender(auto="allow"), store)
+        assert out.ok is False
+        assert "没能送回引擎" in out.summary
+        assert "重新发起" in out.summary, "拒绝要给下一步出路"
+        assert server.replies == []
+        assert server.aborted == 1, "挂起的请求没人回，必须真的停"
+        assert any("没送回引擎" in c for c in out.tool_calls)
 
     def test_local_origin_row_is_web_decidable(self, store: ApprovalStore) -> None:
         """WEB/终端发起（requested_by 空）→ tp 行 requested_by **留空**。
@@ -829,6 +858,106 @@ class TestTtlIsOneNumber:
         seen, card_ttl = self._ttl_and_wait(store, monkeypatch)
         assert card_ttl == DELEGATE_TTL_SECONDS
         assert seen["wait_timeout"] == DELEGATE_TTL_SECONDS
+
+
+class _SessionScopeSender(_FakeSender):
+    """点「本会话内允许此类」的替身：按 resolve 的 via 落 card_session。"""
+
+    def send_tool_card(
+        self, *, open_id: str, subject: str, detail: str,
+        credential: str, ttl_seconds: int, reply_to: str = "",
+    ) -> str:
+        self._seq += 1
+        message_id = f"om_{self._seq}"
+        self.cards.append({"open_id": open_id, "subject": subject,
+                           "detail": detail, "credential": credential,
+                           "ttl": ttl_seconds, "message_id": message_id,
+                           "reply_to": reply_to})
+        if self._store is not None and self.auto:
+            self._store.resolve(credential, self.auto, decided_by=open_id,
+                                via="card_session")
+        return message_id
+
+
+class TestAskOneToolSessionScope:
+    """`_ask_one_tool` 的「本会话内此类不再问」（V1.138）。
+
+    记忆放在调用方持有的 `session_allows` 集合里（进程内存、函数返回即失效），
+    不落库、不加 schema 列。发卡前命中就免问；换动作仍要发卡 —— 范围宁可小。
+    """
+
+    def _req(self, perm: str):
+        from freeagent.services.opencode_server import ToolPermission
+        return ToolPermission(request_id="per_1", permission=perm,
+                              paths=("C:/p/x",), diff="+1")
+
+    def test_session_allow_skips_the_card_for_same_permission(
+        self, store: ApprovalStore,
+    ) -> None:
+        from freeagent.delegate import _ask_one_tool
+        from freeagent.services.approval import ApprovalContext
+
+        sender = _FakeSender(auto="allow")
+        sender.bind(store)
+        allows = {"edit"}
+        decision, credential = _ask_one_tool(
+            _NullOC(), self._req("edit"), store=store, sender=sender,
+            approver="ou_owner",
+            context=ApprovalContext("remote", who="ou_owner"),
+            session_allows=allows,
+        )
+        assert decision == "allow"
+        assert credential == ""  # 没发卡、没 wait，所以没有凭据
+        assert sender.cards == []  # 关键：命中同类直接放行，一张卡都不发
+
+    def test_session_allow_still_asks_for_a_different_permission(
+        self, store: ApprovalStore,
+    ) -> None:
+        from freeagent.delegate import _ask_one_tool
+        from freeagent.services.approval import ApprovalContext
+
+        sender = _FakeSender(auto="allow")
+        sender.bind(store)
+        allows = {"edit"}
+        decision, _ = _ask_one_tool(
+            _NullOC(), self._req("bash"), store=store, sender=sender,
+            approver="ou_owner",
+            context=ApprovalContext("remote", who="ou_owner"),
+            session_allows=allows,
+        )
+        assert decision == "allow"
+        assert len(sender.cards) == 1  # 换动作仍发卡问人
+
+    def test_card_session_via_is_remembered(self, store: ApprovalStore) -> None:
+        from freeagent.delegate import _ask_one_tool
+        from freeagent.services.approval import ApprovalContext
+
+        sender = _SessionScopeSender(auto="allow")
+        sender.bind(store)
+        allows: set[str] = set()
+        decision, _ = _ask_one_tool(
+            _NullOC(), self._req("edit"), store=store, sender=sender,
+            approver="ou_owner",
+            context=ApprovalContext("remote", who="ou_owner"),
+            session_allows=allows,
+        )
+        assert decision == "allow"
+        assert allows == {"edit"}  # via=card_session 才记；普通 card 不记
+
+    def test_plain_card_allow_is_not_remembered(self, store: ApprovalStore) -> None:
+        from freeagent.delegate import _ask_one_tool
+        from freeagent.services.approval import ApprovalContext
+
+        sender = _FakeSender(auto="allow")  # via 默认 card，不是 card_session
+        sender.bind(store)
+        allows: set[str] = set()
+        _ask_one_tool(
+            _NullOC(), self._req("edit"), store=store, sender=sender,
+            approver="ou_owner",
+            context=ApprovalContext("remote", who="ou_owner"),
+            session_allows=allows,
+        )
+        assert allows == set()  # 「允许这一次」不能顺带扩成整会话
 
 
 class _NullOC:

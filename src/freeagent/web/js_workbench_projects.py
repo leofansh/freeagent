@@ -31,6 +31,7 @@ function wbInitProjects(st) {
   if (dirInput) dirInput.value = wbProjectDir;
   wbRenderProjectButton();
   wbRenderProjectMenu();
+  if (typeof wbRailPaint === "function") wbRailPaint();
 }
 
 function wbCurrentProject() {
@@ -82,6 +83,11 @@ async function wbLoadProjects() {
     if (data.project_id) wbProjectId = data.project_id;
     wbRenderProjectMenu();
     wbRenderProjectButton();
+    // 左栏（V1.139）与下拉共用这一份清单：选中态、轮次数只在这里画一次。
+    if (typeof wbRailPaint === "function") wbRailPaint();
+    // 右栏文件清单（V1.142）跟着同一个刷新点走：切/建/删工作区都在这里
+    // 汇合，文件块不需要再各挂一次调用。
+    if (typeof wbFilesPaint === "function") wbFilesPaint();
   } catch (e) {
     // 列表读不到不挡发送：目录仍在隐藏输入框里，这一轮照走。
   }

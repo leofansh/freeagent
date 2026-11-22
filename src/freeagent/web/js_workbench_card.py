@@ -17,7 +17,44 @@ from __future__ import annotations
 
 __all__ = ["JS_WORKBENCH_CARD"]
 
-JS_WORKBENCH_CARD = r"""function wbAsk(turn) {
+JS_WORKBENCH_CARD = r"""// 步骤清单超过这个条数就收起早期步骤，留「展开全部」——一轮三四十个工具
+// 调用时全展开会把答复挤到屏幕外，而早先的步骤人只需要事后翻。
+const WB_STEP_COLLAPSE_AT = 8;
+
+function wbStepsCard(steps) {
+  const box = el("div", "card");
+  box.appendChild(el("div", "row1", "步骤（" + steps.length + "）"));
+  const list = el("div", "wb-steps");
+  // 最后一条 running 是「当前步」：高亮它，已执行的步骤整体弱化。
+  let lastRunning = -1;
+  steps.forEach((s, i) => { if (s.status === "running") lastRunning = i; });
+  const hiddenCount = steps.length > WB_STEP_COLLAPSE_AT
+    ? steps.length - WB_STEP_COLLAPSE_AT : 0;
+  steps.forEach((s, i) => {
+    const row = el("div", "wb-step step-" + (s.status || "running"));
+    if (hiddenCount && i < hiddenCount) row.classList.add("is-hidden");
+    if (i === lastRunning) row.classList.add("is-current");
+    row.appendChild(el("span", "wb-step-idx", String(i + 1) + "."));
+    row.appendChild(el("span", "wb-step-name", esc(s.name || "")));
+    // 目标为空就不拼双空格：旧版留两段空格，行尾看着像缺了一块。
+    if (s.target) row.appendChild(el("span", "wb-step-target", esc(s.target)));
+    row.appendChild(el("span", "wb-step-status", esc(wbStep(s.status))));
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+  if (hiddenCount) {
+    const more = el("button", "btn wb-step-more",
+      "展开全部 " + steps.length + " 步");
+    more.onclick = () => {
+      const open = list.classList.toggle("is-open");
+      more.textContent = open ? "收起" : "展开全部 " + steps.length + " 步";
+    };
+    box.appendChild(more);
+  }
+  return box;
+}
+
+function wbAsk(turn) {
   const box = el("div", "card");
   box.appendChild(el("div", "row1", "等你决定：" + esc(turn.ask.label || "")));
   if (turn.ask.detail) box.appendChild(el("div", "note", esc(turn.ask.detail)));
@@ -44,21 +81,25 @@ JS_WORKBENCH_CARD = r"""function wbAsk(turn) {
     const ok = el("button", "btn primary", "允许这一次");
     ok.onclick = () => wbDecide(turn.id, true, "");
     bar.appendChild(ok);
+    const session = el("button", "btn", "本会话内允许此类");
+    session.onclick = () => wbDecide(turn.id, true, "", "session");
+    bar.appendChild(session);
     const no = el("button", "btn danger", "拒绝");
     no.onclick = () => wbDecide(turn.id, false, "");
     bar.appendChild(no);
     box.appendChild(el("div", "note",
-      "只允许这一次。没有「永远允许」—— 换目录不会继承任何授权。"));
+      "允许这一次只放这一个动作；本会话内允许此类，则本次里同类动作不再问" +
+      "（换一种动作、换一轮、换目录仍会问，没有「永远允许」）。"));
   }
   box.appendChild(bar);
   return box;
 }
 
-async function wbDecide(id, allow, answer) {
+async function wbDecide(id, allow, answer, scope) {
   if (wbBusy) return;
   wbBusy = true;
   try {
-    await post("/api/agent/decide", { id: id, allow: allow, answer: answer });
+    await post("/api/agent/decide", { id: id, allow: allow, answer: answer, scope: scope || "" });
   } catch (e) {
     toast(e.message);
   } finally {

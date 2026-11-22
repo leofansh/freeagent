@@ -18,11 +18,12 @@ from freeagent.web.style_nav import STYLE_NAV_CSS
 PRIMARY_VIEWS = {"chat", "workbench", "today", "all"}
 MENU_VIEWS = {
     "closed", "roles", "model", "contacts", "promises", "pending",
-    "nudge", "oc", "services", "feishu", "settings",
+    "nudge", "week", "oc", "services", "feishu", "settings", "harness",
 }
 # 下拉内的三层分组（V1.121）：标签只做视线分组，不是可点视图。
 MENU_GROUPS = {
-    "我的事": {"closed", "roles", "model", "contacts", "promises", "pending", "nudge"},
+    "我的事": {"harness", "closed", "roles", "model", "contacts", "promises",
+               "pending", "nudge", "week"},
     "执行与通道": {"oc", "services", "feishu"},
     "系统": {"settings"},
 }
@@ -78,6 +79,14 @@ class TestMenuEntries:
     def test_no_extra_view_in_menu(self):
         extra = _views_in(_pop_fragment()) - MENU_VIEWS
         assert not extra, f"下拉里出现了未登记的视图：{extra}"
+
+    def test_oc_entry_is_named_for_the_job_not_the_engine(self):
+        """V1.146：编程页改名委派总览 —— 导航写人要做的事，不写底座术语。"""
+        button = next(
+            line for line in _pop_fragment().splitlines() if 'data-view="oc"' in line
+        )
+        assert ">委派总览<" in button, f"下拉里的 oc 入口名不对：{button}"
+        assert ">编程<" not in button, "旧名不该继续出现在导航上"
 
     def test_js_nav_menu_set_matches_markup(self):
         arr = JS_NAV.split("new Set([", 1)[1].split("])", 1)[0]

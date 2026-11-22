@@ -47,3 +47,14 @@ e2e_final.png
 wb_smoke.png
 tests/manual/shots/
 .smoke/
+
+# 引擎委派闸门残留的本机覆盖层：它是项目级配置、会覆盖 clone 出来的人
+# 自己的那份，且正常委派结束会自动删除，留着只说明上次被强杀。
+opencode.jsonc
+
+# 真机走查抓下来的 SSE 帧，含本机临时路径与会话数据，不是项目内容。
+tests/manual/sse_capture.jsonl
+
+# 桌面打包下载的 embeddable Python 缓存（zip + .part 分片，几十 MB 二进制），
+# 每次构建重新下载即可，不是项目内容。
+tools/pack/.cache/

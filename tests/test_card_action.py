@@ -64,6 +64,27 @@ class TestRecordsDecision:
         bridge_mod._card_action(payload(item.credential, "deny"))
         assert store.get(item.credential).decision == "deny"
 
+    def test_allow_session_records_the_scope_in_via(self, wired):
+        """「本会话内允许此类」按 **allow** 落库、范围记在 ``decided_via``。
+
+        为什么不写进 ``decision``：那是 ``allow``/``deny`` 两值枚举，塞第三值
+        会被 ``decide()`` 归一成 ``deny`` —— 人点了允许，动作却被拒。
+        执行器靠 ``decided_via == "card_session"`` 判断要不要记住这一类。
+        """
+        store = ApprovalStore(wired)
+        item = store.ask("改文件")
+        bridge_mod._card_action(payload(item.credential, "allow_session"))
+        got = store.get(item.credential)
+        assert got.decision == "allow"
+        assert got.decided_via == "card_session"
+
+    def test_allow_once_does_not_claim_session_scope(self, wired):
+        """「允许这一次」仍是普通 ``card`` —— 不能顺带扩成整会话。"""
+        store = ApprovalStore(wired)
+        item = store.ask("改文件")
+        bridge_mod._card_action(payload(item.credential, "allow_once"))
+        assert store.get(item.credential).decided_via == "card"
+
     def test_records_who_clicked(self, wired):
         """「谁批的」必须事后查得到 —— 没这一列就无从追责。"""
         store = ApprovalStore(wired)

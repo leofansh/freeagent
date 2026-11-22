@@ -19,6 +19,7 @@ from freeagent import config as cfg
 from freeagent.cli.app import _USAGE
 from freeagent.services.llm.providers import all_key_env_vars
 from freeagent.services.reminders import MISSED_AFTER
+from freeagent.paths import LEGACY_HOME_ENV
 from freeagent.storage.db import DEFAULT_HOME_ENV
 from freeagent.web import server as web_server
 
@@ -122,6 +123,9 @@ EXPECTED_ENV_VARS = {
     cfg._ALLOW_FALLBACK_ENV,
     cfg.PROVIDER_ENV,
     DEFAULT_HOME_ENV,
+    # 改名兼容（V1.140）：旧名 ``FREEAGENT_HOME`` 仍然认，手册必须说清这是个
+    # 兼容名、且两个都设时以新名为准 —— 不说就是让用户配了一个不生效的变量。
+    LEGACY_HOME_ENV,
     # 飞书通道（可选能力，但它有环境变量，手册就得写）
     ENV_APP_ID,
     ENV_APP_SECRET,

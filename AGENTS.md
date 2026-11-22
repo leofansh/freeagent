@@ -14,12 +14,77 @@
   - `docs/个人事务助手设计方案.md` 是**实现契约**：枚举值/字段名/权重/阈值
     以它为准；`tests/test_doc_contract.py` 逐字对账（含 12.2 文件树），
     加新文件必须同步登记，改文档示例必须与实际输出一致。
-  - `config.json` 绝不写 API Key（Key 只进 `~/.freeagent/llm.env`）。
+  - `config.json` 绝不写 API Key（Key 只进状态目录的 `llm.env`，默认 `~/.steward/llm.env`）。
   - web 包单文件有 250 行上限（`TestWebPackageStaysSmall` 守着）。
 - 提交信息格式：不用管——本仓由用户手动提交，agent 不主动 commit
   （用户明确要求时代劳，如 2026-10-21 的 V1.43–V1.50 一次提交）。
 - 文档版本号纪律：设计文档头部「本次变更（V1.x）」记录最新变更，
-  当前最新是 **V1.125**（项目备注折进上下文 —— 选中项目的备注作为站立
+  当前最新是 **V1.144**（Windows 桌面安装包第一层 —— 官方 embeddable Python 拼
+  `dist/Steward`（runtime + app + `desktop_main.pyw` + `install.cmd`）、
+  `desktop.py` 五条纪律（探活单实例 / 独立 `--user-data-dir` 窗口 / 窗口关=服务停 /
+  `pythonw` 无 stdout 全落日志 / 打包版没有 Tk 故不许 tkinter）；
+  `_pth` 追加 `..\app` 是唯一让 `import freeagent` 生效的地方；无 schema 变更；
+  新增 `desktop.py`（已登记 §12.2）+ 不同树的 `tools/pack/build_portable.py`）。
+  上一版 V1.143（Harness 统一入口 —— 「它记住了什么」一页四块只读回显：
+  项目与规矩（`AGENTS.md` 只报文件事实，不解析内容）/ 记忆 / 事务与承诺（缺键 ≠ 0）/
+  能力与设置；不新建存储、不调 `today.view()`；无 schema 变更；
+  新增 `services/harness.py` / `web/endpoints_harness.py` / `web/js_harness.py`）。
+  上一版 V1.142（继续借鉴 CLOAK 落三件 —— **安静模式**（一键收掉配置表单 /
+  左栏 / 右栏，窄条写当前工作区 + Esc 退出，状态存 localStorage）、**工作区文件清单**
+  （新 `GET /api/agent/files`，只读一层、不读内容，根收紧到工作区目录）、
+  **「它在后台自己跑」一句**（把 V1.136 收过头的细节补回一句实话）；无 schema 变更；
+  新增 `web/endpoints_agent_files.py` / `web/js_workbench_files.py` /
+  `web/js_workbench_shell.py`）。
+  上一版 V1.141（一句话起手 —— 工作台一句人话认项目 + 要做的事、预填表单、
+  拿不准就追问下一句即答案；复用已配文本模型 `parse_delegation`，追问走规则不花钱；
+  无 schema 变更；新增 `services/delegate_intake.py` / `web/endpoints_agent_intake.py` /
+  `web/js_workbench_intake.py`）。
+  上一版 V1.140（改名 —— FreeAgent 改成「值守 / Steward」：展示层
+  （界面标题 / CLI / 启动脚本 / README / 文档标题）、命令层（`pyproject.toml`
+  加 `steward` 三个入口，旧 `freeagent*` 留成别名）、数据目录层（`paths.py`
+  收口原本三处重复的路径解析，目录改 `.steward`、变量改 `STEWARD_HOME`，
+  旧名仍认且命中时打一行明示；旧 `.freeagent` 里有 `agent.db` 就沿用、不自动搬）；
+  包名与文档文件名不动；无 schema 变更、无新文件）。
+  上一版 V1.139（借鉴 CLOAK 的「个人 Harness」落两件 —— **工作区常驻
+  左栏**（三栏 = 工作区 / 正文 / 产物，搜索 + 选中态 + 轮次数）、**选中工作区
+  摆出「它已经记住了什么」**（备注可就地改 / 跑过几轮 / 本轮背景 / 规则来源）；
+  轮次数走 `count_by_directory` 现算、不给档案加列；无 schema 变更；新增
+  `web/js_workbench_rail.py`）。
+  上一版 V1.138（按钮粒度授权 —— 授权卡第四枚「本会话内允许此类」，同类动作
+  本会话免问；信号写 `decided_via="card_session"` 而非 `decision` 第三值
+  —— `decide()` 会把非 `"allow"` 归一成 `deny`；无 schema 变更、无新文件）。
+  上一版 V1.137（失败可恢复 —— 授权结论送回引擎有限重试，失败如实停住；
+  新增 `services/permission_reply.py`；无 schema 变更）。
+  上一版 V1.136（底座不突出显示 —— 界面 / 飞书用户可见文案不再点名
+  引擎品牌、工作台顶栏收起 pid / 会话 / 目录内部细节；纯展示文案，无 schema
+  变更、无新文件）。
+  上一版 V1.135（工作台右栏加「变更」视图 + 产物 / 变更文件行可「在系统文件
+  管理器中定位」；复用 engine_ledger + 受控端点；无 schema 变更；新增
+  `web/endpoints_reveal.py`）。
+  上一版 V1.134（实时面板不再挂幽灵行 —— 任务已删、进度行还在的
+  孤儿投影读侧跳过；纯读侧，无 schema 变更、无新文件）。
+  上一版 V1.133（参考豆包专业版/WorkBuddy/Today AI 的易用性四件套 ——
+  周回顾加厚并上 Web、产物一键复制/导出、零配置首句引导、引擎用量可见；
+  加厚 `/week` + 纯前端/服务层，无 schema 变更；新增 4 个模块）。
+  上一版 V1.132（易用性向豆包/WorkBuddy 靠拢五件套 —— 快捷提示词
+  填框可改、简洁模式开关（默认开）、对话内搜索与跳转、设置按用途分组、
+  工作台产物侧栏同屏；纯前端，无 schema 变更；新增 5 个 JS/style 模块）。
+  上一版 V1.131（修工作台快失败轮次漏终态事件 —— 先订阅事件流再发指令；
+  idle 按 outcome 分 failed/interrupted/succeeded；停止标记当场收口；
+  纯服务层，无 schema 变更、无新文件）。
+  上一版 V1.130（修对话刷新后历史错乱 —— 发问时旧建议行只摘了
+  DOM、没撤历史，刷新重放时退役 chips 插回消息中间；历史与界面保持 1:1；
+  纯前端，无 schema 变更、无新文件）。
+  上一版 V1.128（真机 v2.0.29 工作台三收口 —— 工具步骤按 `call_id`
+  四段合成一行、正文剥 `@数字@` 标记、挂起授权兜底拉取；纯服务层，无 schema
+  变更、无新文件）。
+  上一版 V1.127（工作台目录选择器面板内重做 —— 行列表点行进入替代原生下拉、
+  可见路径框可粘贴绝对路径回车校验、最近目录直达；后端列举跳重解析点、
+  点目录排后；无 schema 变更、无新文件）。
+  上一版 V1.126（工作台界面视觉收口 —— 中性现代风：提示 / 空态 /
+  状态条改中性冷灰、主按钮实心、卡片轻阴影，米黄只留真警示；先只改工作台
+  一页；新增 `web/style_workbench.py`；无 schema 变更）。
+  上一版 V1.125（项目备注折进上下文 —— 选中项目的备注作为站立
   偏好随每轮带进引擎背景一行；无 schema 变更、无新文件）。
   上一版 V1.124（工作台项目档案选择器 —— **最近项目平铺 + 搜索 +
   新建项目 + 选择本地文件夹**，文件浏览退为二级；schema v35 新表
@@ -137,7 +202,775 @@
   它们**不进测试、不会报红**，只能靠 `grep -rn $'\ufffd'` 找出来。改文件时
   顺手扫一遍，别让新的进来。
 
-## 当前进行中的工作（V1.125 已完成 · 2026-11-17）
+## 当前进行中的工作（V1.146 完成 · 2026-11-22）
+
+**「更多 → 执行与通道」的「编程」改名「委派总览」—— 页面功能没变，身份归位
+（无 schema 变更、无新文件）。**
+
+- **起因**：用户连问「执行与通道，需要强调『编程』吗？」「最初 OpenCode/编程是明确
+  的一个功能，现在它成了编程底座，也有了独立的工作台，所以更多的编程需要调整」。
+  第一性原理：导航写人要干的活、不写底座术语；最佳实践：改名只动身份、不动接线。
+- **页面身份**：工作台（V1.114）接走了日常「说一句 → 交给它」的路径，旧「编程」页
+  真正独有的是**全局委派实时面板**（跨项目进度 / 授权卡 / 提问，工作台只看单轮）与
+  **四段选型配置**（与飞书共用）。名字停在「让引擎写代码」是旧身份，不是功能缺失。
+- **只改名与文案**：导航项 + 页内标题都叫「委派总览」；`data-view="oc"`、路由、页面
+  内容、执行与通道首位一律不动。不删两步委派卡，不升级角标（会和工作台授权卡成
+  第二个真源，违背 V1.136「底座不突出显示」）。
+- **裸 CLI 收口**：`delegate.py` / `engine_errors.py` 的页签指向改「委派总览」页；
+  `js_oc_cards.py` / `endpoints_oc_dispatch.py` 的「它得在跑（python -m ...）」改
+  「先在「后台服务」里确认它在跑」；`js_delegate_projects.py` 的重启提示改
+  「到「后台服务」里重启桥接与执行器」。裸 CLI 只留终端命令表与故障排查文档。
+- **注释同步**：直接称呼该页的注释 / docstring 改「委派总览页」；`js_workbench.py`
+  历史注释留旧名并注明「今委派总览」；`executors.py` / `opencode_server.py` 的
+  「编程」指任务类别、不是页面，原样保留。
+- **不动**：写入口、审批闸门、授权两档、schema（仍 35）、命令表、轮询机制、
+  `/api/oc/*` 形状、真机验收矩阵。
+- **测试**：`test_web_nav.py` 加 oc 入口名守卫；`test_usability.py` 加网页上屏串
+  守卫（无裸 CLI / `tools\run_feishu.bat`、错误文案指新页名）。
+- **未真机复验**：改名后未在真机 8770 点过；真机 W1–W5 引擎路径仍全 ⬜，真源只在
+  `docs/真机验收矩阵.md` 表 3。
+- **版本**：V1.145 → V1.146；无 schema 变更（仍 35）；无新文件。
+
+## 上一版（V1.145 完成 · 2026-11-22）
+
+**对话首屏重做 —— 空对话从「左上角一句 + 两排胶囊 + 黄色可关闭引导卡」改成居中欢迎区：
+招呼 / 能力边界 / 「试试这样问」/ 例子格（点一下填框，不发送）；无 schema 变更；
+新增 `web/style_chat.py`。**
+
+- **起因**：用户说「这第一个对话界面很不友好，你看看 opencode 和 workbuddy」，附了截图
+  （本会话看不到图）。核对现状：`renderChatShell` 空分支先 `addMsg(..., "kind-help")`
+  再 `addChips(menu.can_do)`，`js_onboard` 又往顶上插一张 `.note`（米黄警示底）的引导卡
+  —— 第一屏没有视觉重心，且那条黄底让人以为出错了。
+- **改成什么**：`.chat-welcome` 居中块 —— `.cw-hero`「你好，我是值守」/ `.cw-sub` 用
+  `menu.notice` 原文 / `.cw-label`「试试这样问」/ `.cw-grid` 把 `menu.can_do` 排成卡片。
+  点一下只填 `#chatinput` 并触发 `input`（与 V1.132 chips 同一条：填框可改，不替人发）。
+- **空对话才居中**：没有历史时给 `.chatlog` 加 `is-empty`，`.chatlog.is-empty` 纵向居中；
+  `addMsg` 一进来就摘掉 `is-empty` **并 `remove()` 掉 `.chat-welcome`** —— 两处必须在同一处
+  收口。浏览器走查抓到过初版只摘类、欢迎区仍堆在对话流顶部的真 bug；静态守卫只看
+  「渲染出来了」，看不出「状态切换后该走没走」。
+- **去掉可永久关闭的引导卡**：空对话本来就该友好，让人先点「不再显示」才肯给好界面是
+  反模式；欢迎区只在无历史时出现，发一句话自然消失，刷新回来还是它 —— 不需要 localStorage。
+- **规则层横幅改中性**：`.note` → 新 `.chat-status`（卡片底 + 细边），文案与「去配置模型」
+  不变；空对话时并进欢迎区底部，有历史才置顶。它说的是状态，不是「出事了」。
+- **落点**：新 `web/style_chat.py`（`STYLE_CHAT_CSS`；`style.py` 已贴 250 行、`style_usability`
+  是跨视图，故另立）；`web/js_onboard.py` 保留文件名与 `JS_ONBOARD`，内容换成
+  `renderChatWelcome(menu)`；`js_chat.py` 空分支改调它并管 `is-empty`、横幅改类名；
+  `js_boot.py` 删掉 `onboardMaybe()`；`page.py` 拼 `STYLE_CHAT_CSS`。
+- **不动**：写入口、审批闸门、授权两档、schema（仍 35）、命令表、轮询机制、`CAN_DO` /
+  `/api/chat` 形状、真机验收矩阵（不碰审批 / 停止 / 提问 / 超时）。
+- **测试**：`tests/test_usability_v133.py` 的 `TestOnboard` 改写为 `TestChatWelcome`
+  （招呼 / 用 `menu.can_do` 出例子 / 点一下只填框不发送 / `esc(menu.notice` / 由
+  `renderChatShell` 摆 / 发第一句话时欢迎区必须消失）；`test_chat_js` / `test_web` /
+  `test_web_usability_js` / `test_web_js_syntax` 全绿；`js_chat.py` 249 行（≤ 250）；
+  **全量回归 exit 0、20 skip，与基线一致**。
+- **互动浏览器走查（隔离库 8811 + 会话内浏览器）**：欢迎区渲染（7 张 `cw-card`、无
+  `#fa-onboard`、横幅中性）→ 点卡片只填 `#chatinput`、不新增消息 / 不发 POST → 发一句话
+  后 `welcome:0 / is-empty:false / msgs:2` → 清空历史后欢迎区回来；控制台 0 error、无
+  4xx/5xx。上面那个 bug 就是这一轮点出来的。
+- **未真机复验**：新首屏已在隔离库浏览器里点过，但真机 8770 未跑；真机 W1–W5 引擎路径
+  仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+- **版本**：V1.144 → V1.145；无 schema 变更（仍 35）；新增 `web/style_chat.py`
+  （已登记 §12.2）。
+
+## 上一版（V1.144 完成 · 2026-11-22）
+
+**Windows 桌面安装包第一层 —— 官方 embeddable Python 拼 `dist/Steward`，双击即用，
+不再需要装 Python / 开黑窗 / 记端口（无 schema 变更；新增 `desktop.py` 与
+`tools/pack/build_portable.py`）。**
+
+- **起因**：用户连问「所有人都做桌面客户端，我们为什么不做？符合人性吗？」
+  「能不能借鉴 CLOAK 把 OpenCode 和 Steward 打包成一个安装包」。承认过去的判断
+  用错了层：**「引入壳会破坏核心零依赖」只对 Electron 成立**，正确边界是
+  「核心零依赖，壳可以是可选 extra」。桌面客户端的产品价值 = 把「一个需要启动的
+  服务」变成「一个一直在的东西」（V1.142 那句「它在后台自己跑」就是缺这个壳的症状）。
+- **分层（用户已同意）**：① 本层只包 Steward，可真跑；② 安装器可选「一并装
+  OpenCode」官方 x64 独立二进制 + MIT 声明，**只当兜底**（未落）；③ 不做自动更新、
+  不做「OpenCode 官方壳」、不钉死单一引擎版本。放弃引擎可换是架构前提
+  （我们被其 V2 事件流绊过两次：V1.128 / V1.131）。
+- **产物形态**：`dist\Steward` = `runtime\`（embeddable 3.11.9，`python311._pth`
+  追加 `..\app`）+ `app\freeagent\`（src 副本）+ `desktop_main.pyw` + `install.cmd`
+  + `uninstall.cmd` + `VERSION.txt`，27.1 MB。装到 `%LOCALAPPDATA%\Steward`，
+  桌面 `Steward.lnk` 指向 `runtime\pythonw.exe`（指向 `python.exe` 会闪黑窗）。
+- **为什么不 PyInstaller**：单文件 exe 是杀软误报重灾区（重打包哈希一变就被拦），
+  且把运行时变成不可见的一坨。embeddable 里看得见 `python.exe` / `python311.zip`。
+- **`desktop.py` 五条纪律**：探活单实例（只认 `"ok": true`，端口上别的服务不算）/
+  窗口必须是独立浏览器进程（`--user-data-dir=<状态目录>\window`，否则 `--app` 只是
+  把 URL 交给已运行的 Edge、自身立刻退出，`wait()` 永远等不到人关窗口）/
+  窗口关 = 服务停（fail-closed，无托盘就没有第二个可见停止口，代价是在跑的那轮中断）/
+  `pythonw` 没有 stdout 故一切失败落 `desktop.log` / 打包版不含 Tcl-Tk 故不许 tkinter
+  （V1.143 留白的「原生选文件夹」在打包版直接失效）。
+- **三个真 bug（都是真跑才露的，已修 + 已加守卫）**：
+  ① `pythonw` 下 `sys.stdout/stderr` 是 `None`，`http.server` 每请求写访问日志 →
+  `None.write` 抛 `AttributeError` → 连接被关掉，curl 空回复（exit 52）而日志无线索；
+  `python.exe` 跑一辈子复现不了。修法 `_bind_stdio()` 把 None 流兜到 `desktop.log`。
+  ② PATH 被裁剪的机器上 `xcopy` / `powershell` 都不在 PATH → 两个 bat 里一律走
+  `%SystemRoot%\System32\...` 全路径（实测空 PATH 下装成功）。
+  ③ uninstall 直接 `rmdir` 自己所在目录 → cmd 读下一行失败报
+  「The system cannot find the path specified.」、收尾文案全丢 → 删除交给
+  `start /b` 起、脚本退出后才跑的 helper（PowerShell 延迟 900ms）。
+- **实测证据**：headless 与带窗口两条路径 `/api/health` 都 `ok`；杀窗口进程组 →
+  日志「窗口已关，停服务」+ 端口无响应 + pythonw 退出；`install.cmd`（空 PATH）→
+  快捷方式生成；按快捷方式的 TargetPath/Arguments 启动 → 8770 health ok；
+  `uninstall.cmd` → 程序目录与 lnk 消失、`~/.steward` 一行未动。
+- **代价照实说**：产物是「目录 + install.cmd」（不是 MSI，不是每天一版）；**未签名**，
+  网上下来的 zip 带 Mark-of-the-Web，解压后可能被 SmartScreen 拦一次，只有代码签名
+  能根治。
+- **刻意没做**：第二层（可选装 OpenCode）；托盘 / 通知 / 开机自启；把包放到
+  **另一台没装 Python 的机器**上跑（本轮只在本机验）；自动更新（第三层，不做）。
+- **不动**：schema（仍 35）、写入口、审批闸门、授权两档、步骤投影、轮询机制、
+  provider 协议、命令表、真机验收矩阵（不碰审批 / 停止 / 提问 / 超时），
+  `src` 里既有模块一行未改。
+- **测试**：`tests/test_desktop.py` 28 条（浏览器发现 / 窗口命令行四要素 /
+  探活只认 ok:true / 日志写不进去不抛 / `_bind_stdio` 重绑且写入可见 / 零依赖 AST
+  扫描含禁 tkinter / 构建脚本五个守卫含 ASCII 与系统全路径与「删除交给 helper」/
+  假 runtime zip 验组装与缺件 SystemExit）。**全量回归 exit 0、20 skip，与基线一致**
+  （3 条 `--deselect` 同前；注意本机 PATH 若缺 `System32\WindowsPowerShell\v1.0`，
+  `test_reset.py::test_detects_real_services_on_this_machine` 会假红 —— 那条真机测试
+  靠 PATH 里的 `powershell` 认进程，是既有弱点，非本轮引入）。
+- **版本**：V1.143 → V1.144；无 schema 变更（仍 35）；新增 `desktop.py`
+  （已登记 §12.2）与不同树的 `tools/pack/build_portable.py`（构建期工具，
+  不进 12.2 —— 那份树只收 `src/freeagent`）。
+
+## 上一版（V1.143 完成 · 2026-11-22）
+
+**Harness 统一入口 —— 一页看清「它为你累积了什么」：项目与规矩 / 记忆 /
+事务与承诺 / 能力与设置四块，全是已有事实的回显（无 schema 变更；新增三个模块）。**
+
+- **起因**：CLOAK 主线还剩 Harness 没做全。V1.139 只做了**工作区级**的累积块
+  （`#wb-harness`，标题「这个工作区累积了什么」），缺一处回答「换掉这个工作区之后，
+  它还记着我什么」。本版补全局那一页 —— 用户的「继续」即按「先 ② 聚合页、再 ③
+  原生选文件夹」执行。
+- **为什么不新增一张表**：Harness 的价值在「把散在四处的东西摆到一处」，不是再存一份。
+  再存一份必有漏写的写入口，两边数随后漂移（同 V1.115 不另存 `touched_files`、
+  V1.139 不给档案加 `turns` 列）。故四块各读各的真源，**零 schema 变更**。
+- **三条纪律（`services/harness.py` docstring）**：① 只读 —— 不写表、不建表、
+  不顺延事务，**不调 `today.view()`**（会顺延并往 `task_records` 留记录，V1.115 的坑）；
+  ② 一块读不出来不拖垮其它块 —— 失败进 `notes` 点名原因，**绝不把「读不出来」写成 0**；
+  ③ 不解析 `AGENTS.md` 内容 —— 只报在不在 / 行数 / 大小 / 何时改过，解释权在引擎。
+- **四块取舍里的具体判据**：行数只读前 8192 字节，超了 `lines=None` + note（报一个
+  「前 8KB 的行数」当全体行数等于编数）；记忆条数 `len < 200` 才精确，撞上限写「至少」
+  进 notes；三个计数**每项独立 try、失败就不给键**（缺键 ≠ 0，前端画「读不到」）；
+  能力面如实说「没有可反复调用的能力库（Skills）」，不凑数。
+- **落点**：`services/harness.py`（`RuleFact` / `ProjectFact` / `MemoryItem` /
+  `HarnessView` + `_rule_fact` / `_projects` / `_memory` / `_workload` / `_skills` /
+  `_settings`，`view(app, *, mode="")` → `_build`，`as_dict` 直出 `asdict`）；
+  `web/endpoints_harness.py`（`mode` 由端点用 `load_prefs` 取一次传入 —— 服务层
+  不读 web 偏好；补 `kind="harness"`）；`web/js_harness.py`（`harnessNum` 缺键→「读不到」、
+  `harnessSize`、`harnessRuleLine`、`renderHarness`）；接线四处：
+  `routes.py` 的 `/api/harness`、`markup.py` 的「我的事」组首 `data-view="harness"`
+  （文案「它记住了什么」）、`js_nav.py` 的 `MENU_VIEWS`、`js_boot.py` 的分发分支、
+  `page.py` 拼 `JS_HARNESS`（在 `JS_WEEK` 之后，只依赖 `JS_CORE`）。
+- **一处实现细节值得记**：`_settings` 的 `state_dir` 必须传 `config.home` ——
+  无参会按 `STEWARD_HOME` / 旧名 / `~/.steward` 解析，测试与多实例下就报错路径。
+  初版还留过一个 `... if False else _build(...)` 的三元残留，已去掉。
+- **刻意没做**：四块做成可编辑（这页是回显不是管理，改入口都在原处）；用一页替代
+  那些视图（各有动作）；解析 `AGENTS.md` 里的规矩条目；Skills 能力库本身（存储 +
+  注入 + 授权，新能力面，单独立项）。
+- **同轮留白（诚实记账）**：原计划同轮做「原生选文件夹」薄补丁（`tkinter` 的
+  `askdirectory`，替代磨了两版的目录浏览面板），**本版没落**。卡点是结构性的：
+  `web/server.py` 的 `do_POST` 整段持 `app.lock`，同步弹窗会冻结整个服务（停止按钮、
+  轮次轮询全停）直到人选完；tkinter 又必须在同一线程建全部对象，而 `serve_forever`
+  占着主线程。要么改锁粒度、要么两段式（`pick/start` + `pick/result` 轮询），
+  两条都要动 `server.py` 的结构 —— **等用户点头再动**，不夹带。
+- **不动**：schema（仍 35）、写入口、审批闸门、授权两档、步骤投影、轮询机制、
+  provider 协议、命令表、真机验收矩阵（不碰审批 / 停止 / 提问 / 超时）。
+- **测试**：`tests/test_harness.py`（18 条：规矩四态 / 记忆三态 / 事务缺键不给 0 /
+  Skills 说不有 / 设置三态 + `data_dir` / 只读纪律静态守卫 + 端点注册 / 前端四处接线
+  + 「读不到」文案）；`tests/test_web_nav.py` 的 `MENU_VIEWS` 与
+  `MENU_GROUPS["我的事"]` 同步登记 `harness`（菜单用正则反查 + 分组配平，不登记必红）；
+  `test_doc_contract.py` §12.2 登记三个新文件。**全量回归 exit 0、20 skip，与基线一致。**
+- **隔离库走查（8811）**：`tests/manual/ui_walkthrough.py` 17 视图（自动从导航枚举，
+  新增的 `harness` 直接覆盖）0 pageerror / 0 控制台 error / 0 坏响应；实测四块都渲染
+  （`AGENTS.md` 130 KB 时如实写「行数没数完」+ 原因）。走查顺手改一处文案重复：
+  规矩行原本前后各说一遍「行数没数完」，现在前缀只报大小、原因留给服务层的 note。
+- **未真机复验**：Harness 页只在隔离库的模拟浏览器里点过（真机 8770 未跑）；
+  真机 W1–W5 引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+- **版本**：V1.142 → V1.143；无 schema 变更（仍 35）；新增
+  `services/harness.py` / `web/endpoints_harness.py` / `web/js_harness.py`。
+
+---
+
+## 上一版（V1.142 完成 · 2026-11-22）
+
+**继续借鉴 CLOAK 落三件 —— 安静模式（一键收起外壳）、工作区文件清单（右栏只读
+一层）、「它在后台自己跑」那一句（把 V1.136 收过头的细节补回一句实话；无 schema
+变更；新增三个模块）。**
+
+- **起因**：用户说「继续借鉴CLOAK」。先核 CLOAK 官网能力清单（8 项：多任务并行 /
+  团队群聊 / 文件与图片 / Zen 模式与语音 / 多模型 / 微信接入 / Skills 与任务中心 /
+  产物与交付中心）与本仓现状，排除三类：团队向（群聊 / 团队后台 / 微信）、要动引擎
+  并发（多任务并行）、属新能力面（Skills 安装与授权、语音）。剩三条按「与已有改动
+  是否配套 + 成本」排序，用户回「都做」。
+- **① 安静模式**（`web/js_workbench_shell.py` 的 `wbZenBoot`）：收掉顶部配置表单
+  （`#wb-bar`）、左栏工作区、右栏产物（`.wb-view.is-zen` 三条 CSS），宽度还给正文
+  与输入框。**收掉不等于失明** —— 顶上留窄条写「安静模式 · 当前工作区」+ 退出按钮，
+  Esc 同退；状态存 `localStorage`（`wbZen`，存不下就按「没开」）；挂载在
+  `loadWorkbench` 末尾（页面重建必须重新挂）。
+- **② 工作区文件清单**（`web/endpoints_agent_files.py` + `web/js_workbench_files.py`）：
+  新 `GET /api/agent/files`，右栏拆两块 —— 上块 `#wb-side-turn` 归本轮产物（每轮清空
+  重画），下块 `#wb-files` 归「这个工作区有什么」（常驻）。三条约束：根**只能**来自
+  工作区档案或偏好目录（绝对路径与 `../` 一律拒绝，与「定位」端点同一套 `realpath` +
+  `relative_to`）；一层不递归、上限 300、超了如实给 `truncated` + `total`；**一个字节
+  都不读**（只 `scandir` + `stat`）。跳过的重解析点如实计数（`skipped_links`），判据
+  复用 `workspace._is_reparse`（只此一份）。
+- **③ 「它在后台自己跑」**（`wbRunNote`）：V1.136 把内部细节收干净，副作用是收过头 ——
+  人不知道关掉这一页之后那一轮还在不在跑。这句话恒显、不随引擎状态变（事实不是状态），
+  并指向停止口。
+- **顺带改正一句假声明**：`agent_dirs` 原 docstring 写「这是**唯一**能读到工作目录里
+  有什么的端点」，现在改成两条通道的分工（一条只列目录、一条连文件列）。
+- **刻意没做**：文件内容预览（编码 / 超大文件 / 二进制是另一件事）；`#wb-files` 的手输
+  路径入口（有它根就白收）；语音；用 `/api/delegate/browse` 顶替（它默认关闭、只列目录、
+  语义是委派白名单浏览）。
+- **不动**：schema（仍 35）、写入口、审批闸门、授权两档、步骤投影、轮询机制、provider
+  协议、命令表。
+- **测试**：`tests/test_agent_files.py`（14 条：没选工作区是 `state` 不是空列表 / 未知
+  project / 无目录 / 偏好回退 / 绝对路径拒绝 / `../` 拒绝 / 子目录不存在 / 目录在前 /
+  条目形状无内容字段 / 子目录 rel 与 parent / 根 parent 空 / 上限 truncated 且 total 如实
+  + 前端接线 6 条）；`test_usability.py::TestWorkbenchSide::test_fill_function` 的清空
+  目标换成 `#wb-side-turn`（容器契约变了，不是迁就实现）。**全量回归 exit 0、20 skip**
+  （`--deselect` 掉 3 条环境性真机测试，理由同 V1.139）。
+- **隔离库走查抓到一处真 bug（教训）**：新探针 `tests/manual/zen_files_probe.py`
+  （非交付物）40/40 通过、0 pageerror；`ui_walkthrough.py` 16 视图 0 error。第一遍
+  探针就红了 —— `wbFilesPaint` 开头把 `wbFilesPath` 重置成空，`wbFilesOpen` 刚设好的
+  层当场被抹掉，**点目录永远原地不动**。两边单看都对（一边设路径、一边重画），错在
+  **先后顺序**，只有真 DOM 点一遍才露。修法：`wbFilesPaint(at)` —— 「画哪一层」由
+  **调用点**说（切 / 建 / 删工作区传空回根），并加
+  `test_files_paint_takes_the_level_from_the_caller` 钉住「paint 里不许重置路径」。
+  教训：**「重画时顺手归一化状态」是反模式** —— 归一化属于触发点（切工作区），
+  写在重画函数里等于每次重画都推翻调用方的意图。
+- **未真机复验**：安静模式与文件清单只在隔离库的模拟浏览器里点过（真机 8770 仍是旧
+  进程，页面常量启动时拼装，要重启才见新界面）；真机 W1–W5 引擎路径仍全 ⬜，真源只在
+  `docs/真机验收矩阵.md` 表 3。
+- **版本**：V1.141 → V1.142；无 schema 变更（仍 35）；新增
+  `web/endpoints_agent_files.py` / `web/js_workbench_files.py` /
+  `web/js_workbench_shell.py`。
+
+---
+
+## 上一版（V1.141 完成 · 2026-11-22）
+
+**一句话起手 —— 工作台一句人话认出「改哪个项目 + 做什么」，预填表单，拿不准
+就追问、下一句即答案（借鉴飞书插件的对话式起手；复用已配文本模型；无 schema
+变更；新增三个模块）。**
+
+- **起因**：用户拿 `opencode-feishu-plugin` 问「飞书交互有没有可借鉴的」，明确
+  「按你的建议落地三件」（#5 失败可恢复 → #4 按钮粒度授权 → #1 对话式起手，
+  前两件已落在 V1.137 / V1.138）。插件的「一句话起手」= 一句话 → 定目录 →
+  预填表单 → 点创建，拿不准就追问、下一条消息即回答。本仓工作台本就有
+  「选目录 + 写一句话 + 交给它」这道表单，缺的只是「一句话把前两项一起填上」。
+- **AI 承接用哪个模型（用户拍板）**：复用**已配文本模型**（`app.llm`，与能力路由 /
+  表达层同一套接缝），落点是已有协议 `LLMProvider.parse_delegation(text,
+  known_projects) -> DelegationIntent`（契约本就是「抽不出就空串，上层追问」）。
+  规则层 `RuleBasedProvider.parse_delegation` 如实返回空意图 → 离线 fail-closed，
+  不猜项目、不预填。不给 provider 加新方法（一份能力一份实现）。
+- **追问补缺是规则，不调模型**：模型只在首次抽一次；「下一句 = 答案」是确定性的 ——
+  要 brief 就原样当 brief，要 project 就拿下一句去授权清单做大小写不敏感精确比对。
+  追问再调模型既多花计费，又把「人的回答」交给模型自由发挥，不划算。
+- **不变量**：项目名必须原样命中 `CapabilityView.labels()` 才认（猜错项目的代价是
+  在错误仓库里动手）；空字段是要追问不是失败；目录按 labels 与 projects 的下标
+  对齐回查；认不出 / 没连模型 / 没授权项目都如实说原因，绝不替人预填或起一轮。
+- **落点**：新 `services/delegate_intake.py`（`plan` 纯函数，carry 记住追问上下文）、
+  新 `web/endpoints_agent_intake.py`（POST `/api/agent/intake`，会花模型一次请求故
+  只 POST，进 agent_post 派发表）、新 `web/js_workbench_intake.py`（识别卡 + 追问
+  回答框）由 `js_workbench_page` 一行挂进正文，认出来后预填既有 `#wb-dir` /
+  `#wb-text` 与项目按钮，人确认后再点既有的「交给它」。动态文本一律 textContent / esc()。
+- **真机矩阵没动**：#1 是新 UI / 端点，不碰审批闸门、授权两档、停止 / 提问 / 超时，
+  矩阵表 1 各格「怎么验」仍成立。
+- **不动**：写入口、审批闸门、授权两档、步骤投影、schema、命令表、轮询机制、provider 协议。
+- **测试**：`test_delegate_intake.py`（首次解析各分支 + carry 追问不花钱）、
+  `test_agent_endpoints.py`（intake 已知动作 + 空文本拒绝）、`test_web_usability_js.py`
+  （模块进页面 / 挂卡片 / 调端点 / 预填 / 追问原样送回 / 动态文本不进 innerHTML）。
+  `test_web_js_syntax.py`（node --check）与 `test_doc_contract.py`（§12.2 三文件登记）均绿。
+  **全量回归 exit 0、20 skip（`--deselect` 掉 3 条环境性真机测试，理由同 V1.139）。**
+- **未真机复验**：#1 的识别 / 追问流程没在真机浏览器点过；真机 W1–W5 引擎路径仍全
+  ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+- **三项交付完成**：#5（V1.137）/ #4（V1.138）/ #1（本版）全部按序落地。
+
+---
+
+### 上一版 V1.140（同日完成）
+
+**改名 —— 产品名从 FreeAgent 改成「值守 / Steward」，三层一起换；包名不动
+（无 schema 变更、无新文件）。**
+
+- **起因与授权**：用户只说了「FreeAgent 改个名字吧」，没给名字。我先量影响面
+  （`FreeAgent` 590 / `from freeagent` 1044 / `freeagent` 任意大小写 2319 /
+  `FREEAGENT_` 145 / `.freeagent` 56 / `FreeAgentError` 281），再问两件：名字
+  （用户定 `Steward` / 值守）、层次（用户答「三层，做」）。
+- **「彻底」的边界**：用户能接触到的是**界面 / 命令 / 目录**三面；包名
+  `src/freeagent` 是内部实现，改它不增加任何用户可见的一致性，只断 1044 处
+  import，并把 13 版未提交的功能改动绞进同一个 diff。**这次不动包名。**
+- **展示层**：`markup.py`（title「值守 · 个人事务助手」、h1「值守」）、
+  `cli/app.py`（启动语 / 命令表标题 / `/ask` 帮助里的自称）、`web/serve.py`
+  横幅、`run_web.bat`（提示改 Steward；home 三行改成如实说法）、README
+  （标题 + Startup 名 `Steward-bridge.cmd`，并写明旧那份要先删）、
+  `pyproject.toml` description、三份文档的文件内标题。
+- **命令层**：`[project.scripts]` 加 `steward` / `steward-feishu` /
+  `steward-feishu-doctor`，旧三个 `freeagent*` **留成别名**。
+- **目录层（顺带还债）**：`paths.py` 变唯一解析点；`db.resolve_db_path` 与
+  `oc_selection._curated_path` / `_selection_path` 原本各写一遍
+  `Path.home()/".freeagent"`（三处重复，历史上漂移过一次），现在全改调
+  `state_dir`。`oc_selection` 顺带修掉「不认 HOME 环境变量、漏传 home 就写进
+  开发者真实目录」这个真 bug。
+- **旧名不静默**：`FREEAGENT_HOME` 仍认；`~/.freeagent` 有 `agent.db` 而
+  `~/.steward` 没有库时沿用旧目录。两种命中都往 stderr 打一行明示（只打一次）。
+  判据是「有没有 `agent.db`」而不是「目录在不在」—— `resolve_db_path` 会
+  `mkdir` 空目录，拿空目录当「已在用新的」会把旧库静默甩开。
+  **不自动迁移**：搬真库不可逆，搬不搬由用户下令。
+- **刻意没做**：包名；`docs/个人事务助手设计方案.md` 这类文件名（契约稳定路径，
+  改名断所有交叉引用，留结构刀）；`deepseek.py` 4 处「给一个个人事务助手做
+  分类」的模型指令措辞（改它是行为改动）。
+- **测试**：`test_config.py::TestHomeCompat` 5 条 + `TestHomeEnvWhitespace`
+  改按 `paths.DEFAULT_DIR_NAME` 并把 `Path.home` 钉到临时目录；
+  `test_manual_contract.py` 把 `LEGACY_HOME_ENV` 纳入手册必写集合。
+- **全量回归**：exit 0、20 skip，与基线一致（`--deselect` 掉 3 条环境性真机
+  测试，理由同上一版）。
+
+### 上一版 V1.139（同日完成）
+
+**借鉴 CLOAK 的「个人 Harness」落两件 —— 工作区常驻左栏、选中工作区摆出
+「它已经记住了什么」（纯读后端 + 前端；无 schema 变更；新增
+`web/js_workbench_rail.py`）。**
+
+- **起因**：用户先问「了解一下 cloak」，补一句「一个智能体」后锁定 43cloak.com
+  这支（桌面 Agent，底座无感跑，核心叙事是「用户级 Harness：你持续补充，它就
+  持续贴近你的工作方式」）。我列了「三条值得抄 / 两条别抄」，用户回「按你的
+  建议落地吧」。本轮落前两件；第三件（桌面客户端）**单独立项，不做**。
+- **① 工作区常驻左栏**：新 `web/js_workbench_rail.py` 的 `wbRailMount()` 由
+  `loadWorkbench` 一行接进 `.wb-cols` 的**最左**，两栏变三栏（工作区 220 /
+  正文 flex / 产物 280；1100px 收 172px，860px 折一列）。行 = 名 + 「N 轮 ·
+  目录」；选中态 `is-current` **加**一道左侧实心边（颜色只辅助，不单通道）；
+  搜索按名 / 目录筛；空态给「选本地文件夹」。**下拉保留**，两个入口共用同一份
+  `wbProjects`，选中与轮次数只在一处画（`wbLoadProjects` / `wbInitProjects` 里调）。
+- **② 累积块 `#wb-harness`**：四行都是已有事实的回显 —— 备注（原本前端没有
+  编辑入口，本版补上，走 `project_update`）、跑过几轮、本轮背景（读正文那一个
+  `#wb-inject`，**不在左栏另放开关**）、规则（项目里的 `AGENTS.md` 由后台引擎
+  自己读）。
+- **轮次数现算**（`WorkbenchTurnRepo.count_by_directory`），不给
+  `workbench_projects` 加列：轮次表是唯一真源，加一列必有漏加的写入路径，两个
+  数字随后漂移（同 V1.116 不另存 `touched_files`）。`agent_projects` 每项补
+  `turns`；**turn_repo 缺席 / 读失败回 `null` 并说「轮次读不到」，0 说「还没
+  跑过」** —— 把前者写成 0 是替人下结论。
+- **刻意不抄**：①「完全访问权限」默认放开 —— 抄的是「一处可见的档位切换」，
+  `ask` / `auto_dir` 与 fail-closed 一字不动；② 团队后台（成员 / 分组 / 额度 /
+  审计）—— 会引入服务端、账号与额度，破坏本地零依赖。桌面客户端单独立项。
+- **不动**：写入口、审批闸门、授权两档、步骤投影、轮次落库、schema、命令表、
+  轮询机制、真机验收矩阵。动态文本一律先 `esc()`。
+- **测试**：`test_workbench_projects.py::TestProjectCounts`（只数本目录 / 0 与
+  null 分开 / 无 turn_repo 回 null）、`test_web_usability_js.py::TestWorkbenchRail`
+  （拼装 / 三栏顺序 / 转义 / 读不到不说成 0 / 备注走 project_update / 样式只挂
+  `.wb-view`）、`test_web_js_syntax.py`。**定向 61 条绿**。
+- **全量回归**：除 3 条环境性真机测试外全绿（`test_opencode_projects_live.py::
+  test_can_really_query_opencode`、`test_prompt_payload.py` 两条 live —— 机器上
+  并行跑着 9 个 OpenCode 进程，测试起的发现服务 60s 起不来；这三条与本轮改动
+  无交集，`git` 未提交前如实记在这里）。
+- **浏览器走查**：隔离库 8811 跑 `tests/manual/ui_walkthrough.py`（16 视图 0
+  pageerror / 0 控制台 error / 0 坏响应）+ 新探针 `tests/manual/rail_probe.py`
+  （13/13：三栏顺序、220px、行数、点行选中三处同步、搜索筛、备注落库、关背景
+  当场改口、左栏没有第二个勾选框）。截图 `tests/manual/shots/rail/rail.png`。
+  走查改过一版：备注与「改」并排会把按钮顶到第二行 → 改成「键在上、值在下」。
+- **未真机复验**：真实引擎路径 W1–W5 仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.138 完成 · 2026-11-22）
+
+**按钮粒度授权 —— 授权卡加「本会话内允许此类」一枚按钮，同类动作本会话内免问，
+换动作 / 换一轮 / 换目录仍问（借鉴飞书插件的授权范围粒度；无 schema 变更、无新文件）。**
+
+- **起因**：用户拿 `opencode-feishu-plugin` 问「飞书交互有没有可借鉴的」，明确
+  「按你的建议落地三件」（#5 失败可恢复 → #4 按钮粒度授权 → #1 对话式起手）。
+  插件把授权范围做成按钮粒度（允许一次 / 始终允许 / 本会话内允许 / 拒绝）；本仓
+  此前只有「允许这一次 / 拒绝 / 停止」三枚，长任务里同类动作要反复点。本版落第二件（#4）。
+- **三轮 question 拍板**：① 纯内存、不加 schema ② 换档清除联动不做（保持现状）
+  ③ 飞书也做、复用字段传信号。**key 粒度 = 动作类型 `permission`**（点一次
+  「本会话内允许 edit」后本会话内所有 edit 免问，换 bash / write 仍弹卡）。
+- **信号落 `decided_via` 而非 `decision`（关键）**：`decision` 是 `Literal["allow","deny"]`
+  两值枚举，`approval.py` 的 `decide()` 把任何非 `"allow"` 归一成 `deny` —— 写第三值
+  会在第一次点击就被拒。故新档仍写 `decision="allow"`，把信号写进既有文本字段
+  `decided_via="card_session"`（原有 `"card"` / `"stop"`），零判据改动、不加列。
+- **「本会话」边界**：委派 = `run_with_tool_gate` 一次调用内局部变量
+  `session_allows: set[str]`，函数返回即失效；工作台 = `_Turn` 一轮内同名字段。
+  换授权档不清除；不做「永远允许」（换一轮 / 换目录即失效，面板 note 明说）。
+- **修法**：① 飞书 `_tool_card` 三按钮加第四枚「本会话内允许此类」（`type=default`，
+  不抢 primary / danger）；桥接白名单收 `allow_session`，落库写 `decision="allow"` +
+  `via="card_session"`，卡面回执写明范围；执行器 `_ask_one_tool` 发卡前查同类命中
+  直接返回 `("allow","")` 免问，拿到决策后只读 `decided_via=="card_session"` 才记入集合。
+  ② 工作台 `AskCard` 加 `permission` 字段（`label` 是展示文案不能当 key）；`decide()`
+  收 `scope="session"` 时记 `turn.ask.permission`（空不记，fail-closed）；`_handle_permission`
+  挂卡前查同类命中，命中则直接 `reply_permission(...,"allow")` 不挂卡、不置 WAITING；
+  面板按钮经 `/api/agent/decide` 的 `scope` 字段透传（该文件贴 250 行上限，改动只加 2 行）。
+- **真机矩阵动了**：表 1 新增 `A13`（飞书话题内点本会话内允许）/ `A14`（Web 面板点本会话内
+  允许）两验点，各写「怎么验」+「为什么不能顺带证明」，同步 `test_acceptance_matrix.py`
+  编号全集（A1–A14）。新按钮 = 新验点，旧格子「怎么验」仍成立。
+- **不动**：闸门判定、授权两档底层含义、步骤投影、schema、命令表、轮询机制。
+- **测试**：`test_card_action.py`（via 落 card_session / allow_once 仍 card）、
+  `test_user_stop.py`（第四按钮 type=default）、`test_agent_turn.py`（同类免问 / 换动作仍问 /
+  空 permission 不记）、`test_tool_gate.py`（`_ask_one_tool` 同类免问 / 换动作仍发卡 / 只认
+  card_session）、`test_agent_endpoints.py`（scope 透传）、`test_web_usability_js.py`（面板按钮
+  静态守卫）。**全量回归 exit 0，20 skip 与基线一致。**
+- **未真机复验**：A13/A14 及整套「同类免问」未在真机点过（新按钮 + 跨进程信号 + 内存集合
+  从没真跑）；真机 W1–W5 引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+- **后续一件**：#1 对话式起手（动手前先确认 AI 承接用哪个模型）。
+
+---
+
+## 上一版（V1.137 完成 · 2026-11-21）
+
+**失败可恢复 —— 人批了但结论没送回引擎时，有限重试后如实停住，不再假装成功
+（借鉴飞书插件「审批放行被静默吞掉」的修复；无 schema 变更；新增
+`services/permission_reply.py`）。**
+
+- **起因**：用户拿 `opencode-feishu-plugin` 问「飞书交互有没有可借鉴的」，明确
+  「按你的建议落地三件」（#5 失败可恢复 → #4 按钮粒度授权 → #1 对话式起手）。
+  插件 v0.2.22 修过一类故障：人点了「允许」、卡片也改了，但放行指令被静默吞掉，
+  会话卡到超时。本仓同一处两个形态：`delegate.py` 的 `oc.reply_permission(...)`
+  无 try/except，`agent_turn.py` 用 `contextlib.suppress(Exception)` 吞掉 ——
+  卡面显示「已允许」，引擎那边还挂着请求。本版落第一件（#5）。
+- **修法**：新 `services/permission_reply.py` 的 `deliver(send, ...)` 一份能力一处
+  实现（12.1.1）：零参 callable 把 rid / 决策绑好，有限重试（3 次、间隔 0.4s）、
+  `sleep` 可注入、失败回 `ReplyResult(ok=False, error=...)` 带原因。两个调用点各按
+  通道呈现：委派侧重试用尽 → 进度卡写「授权送回失败」+ 原因、abort 会话、收尾
+  `ok=False` 且摘要给「重新发起」这条出路；工作台侧重试失败 → 轮次 `FAILED`、
+  备注 + 原因、abort。自动档异常来卡的拒答与提问答复也走同一份 `deliver`，
+  不再静默。
+- **刻意不做卡片内「🔁 重试」按钮**：桥接是独立进程，只靠 `pending_approvals`
+  表与主进程通信；卡内按钮要加 schema 列 + 双向信号 + 主进程轮询，代价远超收益。
+  本版用自动重试 + 如实呈现 + 停住本轮替代，交付时如实说明这层形态差异。
+- **不动**：闸门判定、授权两档、步骤投影、schema、命令表、轮询机制、真机验收矩阵
+  （正常路径行为不变，表 1 允许/拒绝格「执行器按结论继续」仍成立，已核对）。
+- **测试**：`tests/test_permission_reply.py`（7）、`tests/test_agent_turn.py` 补授权与
+  提问 reply 失败两条、`tests/test_tool_gate.py` 补委派 reply 失败一条（失败时停住 +
+  摘要给出路）。目标文件 115 条全绿。
+- **文档同步**：设计文档头部 V1.137 变更块 + §12.2 登记 `permission_reply.py`；
+  使用说明书故障排查补「点了允许但卡面没生效」一条；现状速读委派行补一句。
+- **未真机复验**：reply 送不到引擎这条失败路径未在真机触发；真机 W1–W5 引擎路径
+  仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+- **后续两件**（按用户选的顺序）：#4 按钮粒度授权（动手前先确认「本会话内允许」
+  与 auto_dir 的边界）、#1 对话式起手（动手前先确认 AI 承接用哪个模型）。
+
+---
+
+## 上一版（V1.136 完成 · 2026-11-20）
+
+**底座不突出显示 —— 界面 / 飞书的用户可见文案不再点名引擎品牌，工作台顶栏收起
+pid / 会话 / 目录等内部细节（纯展示文案；无 schema 变更、无新文件）。**
+
+- **起因**：用户要「OpenCode 作为 Agent 底座不应突出显示，参考之前 WEB 界面的
+  设计文档」，并拿飞书截图点名「让 opencode 改代码」那枚入口按钮。核对第 21 章
+  （V1.114）与 12.6 Web UI 的规范性原文——「引擎藏到后台（用户无感）」「你不用懂
+  OpenCode」——当前把品牌名与内部细节摆前台与之自相矛盾，改造是对的。
+- **两项决策**（用户明确选）：① 界面 / 飞书用户可见文案里的品牌名一律换中性说法
+  （执行引擎 / 后台引擎 / 它 / 桌面端）；品牌名只留代码注释与故障排查文档，故障
+  说明保留语义但不点名、不给出 `opencode --version` 这类点名命令。② 工作台顶栏
+  收起 pid / 会话 ID / 目录，只留「就绪 / 在跑」+ 用量一行。
+- **落地**：`js_workbench` 引擎行删 pid/session/directory 三行，保留 `Token 读不到：`
+  分支与 `#wb-engine`；飞书入口「让 opencode 改代码」→「让它改代码」并与「照着发」
+  模板逐字同步；能力层「让 opencode 改 <项目>」指令模板改中性（router 的 `_VERBS`
+  含「改」仍触发）；oc_discovery / oc_selection / oc_cards / delegate_projects 等
+  故障与说明文案中性化；`_executors` 执行器事实名 `opencode` 保留（事实清单不是突出显示）。
+- **不动**：写入口、审批闸门、schema、命令表、轮询机制、真机验收矩阵（本轮只改展示
+  文案、不动闸门语义）；审批卡 subject（`opencode 想…`）与 CLI 命令表逐字对账不碰；
+  注释 / docstring 里的品牌名保留（lens L5 文案不是契约、L3 一份能力一份实现）。
+- **测试**：`tests/test_usability.py::TestEngineNotHighlighted`（剥注释后静态扫 JS 串 +
+  AST 取 Python 字符串字面量，禁旧文案、留保留项；该模块 25 条全绿）。
+- **文档同步**：设计文档头部 V1.136 变更块 + 第21章 / 12.6 补「底座不突出显示 /
+  用户无感」规范措辞；本文件同步。纯文档补记不占功能版本号。
+- **未真机复验**：真机 W1–W5 引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.135 完成 · 2026-11-19）
+
+**工作台右栏加「变更」视图 + 产物 / 变更文件行可「在系统文件管理器中定位」
+（复用 engine_ledger + 受控端点；无 schema 变更；新增 `web/endpoints_reveal.py`）。**
+
+- **起因**：用户拿 WorkBuddy / 豆包要「学习他们的易用性」，核对官方文档后
+  从 A–F 清单里选 A+B。真缺口不是从零造：`engine_ledger`（V1.110）早能读引擎
+  会话改动账（路径+次数），产物侧栏（V1.132）早列出碰过的文件，缺的是
+  把「改了什么」摆进右栏、以及从文件行一步跳到系统文件管理器。
+- **两处修法**（用户两问均明确选真实现，不选保守替代）：
+  ① **变更视图**：`EngineHost.ledger()` 读 `engine_ledger.read_session_ledger`
+  （15s TTL 缓存、换会话清缓存、读不到返回 `unreadable` 带原因，**不显示 0**），
+  `agent_state` 暴露 `ledger`，前端 `wbPaintLedger` 三态——`unreadable` 说原因 +
+  「别把「没记录」当成「没改」」、`none` 说「不等于没做事」、`changed` 逐文件
+  列路径+次数。`_ledger_dict` 故意返回结构化字段不拼人话（lens L5：文案不是契约）。
+  账里只有路径与次数没有逐行差异时**如实说**，不编 diff。
+  ② **定位**：新端点 `agent_reveal`（`web/endpoints_reveal.py`）走 win32 `explorer
+  /select,` / darwin `open -R` / 其他 `xdg-open` 目录，`subprocess.Popen` 参数数组
+  + `shell=False`；**验根内**（realpath + relative_to，同 delegate_browse），越界拒绝
+  且不起进程；失败说得清、给下一步。前端 `wbLocateRow` 把路径存 `dataset.path`
+  （不进 innerHTML），产物行与变更行都有「定位」按钮。
+- **为什么不复用 touched_files 当变更数据源**：那是 steps 现算的派生物、无次数、
+  无会话账语义；`engine_ledger` 才是 V1.110 验证过的真改动账（真机一会话 431 次调用可读），
+  一份能力一份实现（lens L3）。
+- **不动**：写入口、审批闸门、schema、轮询机制、真机验收矩阵；C（输入框 `/`
+  意图面板）单列下一刀。动态文本一律先 `esc()` 或走 `textContent`。
+- **测试**：`tests/test_engine_host.py::TestLedger`（读+TTL/无会话/无 call 接口/halt 清缓存）、
+  `tests/test_agent_endpoints.py::TestReveal`（验根内/越界拒绝/无根报错/state 带 ledger/
+  未知动作列 reveal）、`tests/test_usability.py` 三态文案与定位守卫（转义强度不降）。
+- **未真机复验**：真机 token / 改动账形状未在浏览器真机核实；`W1`–`W5` 真机引擎
+  路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.134 完成 · 2026-11-19）
+
+**实时面板不再挂幽灵行 —— 任务已删、进度行还在的孤儿投影读侧跳过
+（纯读侧；无 schema 变更、无新文件）。**
+
+- **起因**：真机面板出现一张「(事务已不存在) · 正在执行 · 18/18 次」的卡，
+  「已经 N 秒没动静」涨到 2789313（≈32 天）仍不动。查本机库确认：
+  `delegate_progress` 只剩一行，`updated_at` 冻结在 2026-10-18，对应
+  `tasks` 行已删 —— 执行器当年被强杀没走收口，任务后来被删，投影行没人清。
+- **为什么不自愈**：`delete_task` 虽在服务层清进度行，但强杀 + 老库留的孤儿
+  行绕过它；执行器启动恢复 `reclaim_abandoned` 明确跳过已删事务；实时面板
+  旧修法只是 `get()` 换 `find()`，坏行照常显示为「(事务已不存在)」且永远陈旧。
+- **修法**：`web/endpoints_delegate_live.py` 投影行循环里 `if task is None:
+  continue` —— 孤儿投影不显示、但**不删数据**（留取证）；待批项仍走
+  `by_task` 第二循环照常显示（不藏待批项）。一次性清理了本机那行幽灵数据。
+- **不动**：写入口、审批闸门、schema、轮询机制、真机验收矩阵。
+- **测试**：`tests/test_web_delegate_live.py` 改「坏行降级展示」为「孤儿行隐藏
+  + 好行照常」，补「藏进度行不连带藏待批卡」；单文件 58 条全绿。
+- **未真机复验**：面板里幽灵行消失已由本机库清理 + 代码守卫覆盖；
+  `W1`–`W5` 真机引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.133 完成 · 2026-11-18）
+
+**参考豆包专业版 / WorkBuddy / Today AI 的易用性四件套 —— 周回顾加厚并上 Web、
+产物一键复制 / 导出、零配置首句引导、引擎用量可见（加厚 `/week` + 纯前端 /
+服务层，无 schema 变更；新增 4 个模块）。**
+
+- **起因**：用户拿三家 Agent 对比表要「参考这 3 个 Agent」，四项全选并授权按
+  价值排序。核对后真缺口不是从零造：`/week` 早已存在（六分区），只差加厚 +
+  Web 视图；草稿 / 简报 / 答复只在库里，缺复制 / 导出；规则层本就能离线聊，
+  缺首访引导；引擎账（V1.110）只读改动、不报 token，缺用量可见。
+- **四处修法**（按价值排序，不碰写入口与闸门）：
+  ① **周回顾加厚 + Web**：`WeekView` 末尾加三个带默认值字段 `decisions` /
+     `promises` / `turn_count`（旧构造兼容），`WeekService` 接三 repo；
+     `render_week` 与 CLI 出「本周拍板 / 承诺 / 交给引擎 N 轮」三段；新
+     `web/serialize_week.py` + `web/js_week.py` 出 Web 视图，进「更多 → 我的事」。
+     拍板 / 承诺逐字冻结，不解析 `options_json`、不给建议。
+  ② **产物直接可交**：`js_artifact.artifactCopyBar` 对任何有正文的稿无条件给
+     「复制这一版 / 导出 .md」；`js_workbench_side` 产物栏给「复制答复 / 导出 .md」。
+     Blob 下载纯前端无端点；文件名逐字符白名单过滤，反斜杠 / 引号走
+     `String.fromCharCode`（V1.114 的坑，`test_web_js_syntax` 咬过）。
+  ③ **零配置首句引导**：新 `web/js_onboard.py`，首访插卡片，三个例子点一下
+     **填进输入框不发送**（与 chips 同交互）；「不再显示」写 localStorage
+     `fa_onboard`，读不到按首次显示处理（fail-closed 到引导）。
+  ④ **用量可见**：新 `services/engine_usage.py` 读 `GET /api/session/{sid}` 的
+     `tokens`，多形状兼容 + fail-closed（认不出报 unreadable 带原因，**绝不显示
+     0**）；`EngineHost.usage()` 加 15s TTL 缓存、换会话清缓存；`agent_state`
+     暴露 usage，`wbPaint` 显「Token 输入 / 输出」或「Token 读不到：原因」。
+     真机 token 形状未验，UI 如实标注。
+- **不动**：写入口、审批闸门、授权两档、步骤投影、schema、真机验收矩阵；
+  动态文本一律先 `esc()` 或走 `textContent`。
+- **测试**：新 `tests/test_engine_usage.py`（15）、`tests/test_usability_v133.py`
+  （14）、`tests/test_week.py::TestWeekTraces`（7）；`test_web_nav.py` 登记 week；
+  `node --check` 全过；全量回归 exit 0，20 skip 与基线一致。
+- **浏览器走查**：隔离库 8811 走 16 视图（加了周回顾页）+ onboard 卡片 / 周回顾
+  九分区 / 复制导出按钮 / 用量两种文案，16 项人工模拟全 PASS；0 pageerror /
+  0 控制台 error / 0 坏响应。探针 `tests/manual/v133_probe.py`（非交付物）。
+- **未真机复验**：真实引擎路径 `W1`–`W5` 仍全 ⬜，真源只在
+  `docs/真机验收矩阵.md` 表 3。
+- **补记（2026-11-19，纯文档，不占功能版本号）**：把当天三轮讨论的结论落进文档，
+  无代码与 schema 改动。①"完全本地化 = 自我封闭？"要拆两半——本地的是数据面
+  （记录 / 记忆 / 审批 / 账本在自有 SQLite + 环境变量），能力面一直借外部模型；
+  封闭"关于你的一切"、开放"关于世界的能力"是信任边界，不是关门。②"核心零依赖"
+  理由见设计文档 §12.1 / §19.2（隐私半径 / 断网可用 / 克隆即跑 / 零依赖是保证性质
+  不是护城河）；不变量是数据不出本机 / 断网 / 克隆即跑，不是零行库。③总判据
+  **守性质别守形式**：理由是信任 / 数据模型 / 失败行为→坚持，是当年只能这样→重问；
+  坚持不替用户做取舍 / 等候一等公民 / fail-closed / 一份能力一份实现 / 可查可改可删，
+  可重评的是零依赖表述、向量检索、CLI 中心、微信入口（都只是"该问"非决定）。
+  ④AgentCore 品类错位、借鉴价值低，唯一对得上的 token 可审计接 V1.133 用量可见，
+  台阶可见→归因→管控但 token 形状未真机核实仍不做闸门。落点：现状速读 §10.5、
+  设计方案 〇.7 元纪律后补记；使用说明书无使用动作不动；矩阵不动。
+
+---
+
+## 上一版（V1.132 完成 · 2026-11-18）
+
+**易用性向豆包 / WorkBuddy 靠拢五件套 —— 快捷提示词填框可改、简洁模式开关
+（默认开）、对话内搜索与跳转、设置按用途分组、工作台产物侧栏同屏
+（纯前端；无 schema 变更；新增 5 个 JS/style 模块）。**
+
+- **起因**：用户要「参考豆包和 WorkBuddy 提高 FreeAgent 的易用性」，五项全选
+  并授权我按价值排序。竞品共性是把「起头成本」与「信息过载」当成易用性主战场：
+  场景标签点一下填框（可改）、过程可折叠、长对话能搜、设置按用途分组、产物与
+  过程同屏。FreeAgent 已有 chips / 步骤清单 / 停止 / 轮次历史，缺的正是这五处。
+- **五处修法**（按风险顺序落）：
+  ① **chips 填框**：`addChips` 的 `b.onclick` 从 `sendChat(s)` 改成把原文填进
+     `#chatinput` + focus + 触发 `input`，人能改完再发（V1.130 的退役 chips
+     清理逻辑一字未动）。
+  ② **简洁模式**：新 `web/js_compact.py`（localStorage `fa_compact`，默认开，
+     fail-closed 到简洁）+ 新 `web/style_usability.py`；按钮由 JS 挂进 `#nav`
+     （不动 markup），`body.compact` 只折工作台的 `.wb-steps` / `.wb-step-more`
+     / `.wb-process` 足迹卡，步骤头「步骤（N）」保留 = 折叠而非删除。
+  ③ **对话搜索**：新 `web/js_chat_search.py`，Ctrl/Cmd+F 或「搜索」按钮开面板，
+     命中用 `<mark>` 包、逐条跳（Enter 下一条）+ 计数；高亮前用 `dataset.faOrig`
+     还原原文防 mark 嵌套，动态文本一律 `textContent`，不进 `innerHTML`。
+  ④ **设置分组**：新 `web/js_settings_groups.py` 一个 `section-label` helper，
+     `renderSettings` 在模型 / 超时 / 排序三处前各插一组标题，字段仍挂 `form.set`。
+  ⑤ **产物侧栏**：新 `web/js_workbench_side.py` 填 `#wb-side`（文件 / 命令 / 答复），
+     `js_workbench_page` 把原流搬进 `.wb-col-main` 并排右栏，窄屏 @media 折一列；
+     `wbPaint` 每次重画同步侧栏（无轮次也清残留）。
+- **不动**：写入口、审批闸门、授权两档、步骤投影、schema、真机验收矩阵；
+  命令列原文照旧先 `esc()` 再上屏。
+- **测试**：新 `tests/test_usability.py`（五件套接线 / 转义 / 顺序静态守卫）；
+  `test_chat_js.py::TestChipsFillInput` 钉填框不发送；`node --check` 全过。
+  全量回归 exit 0（基线 V1.131 全绿，20 skip 与基线一致）。
+- **浏览器走查**：隔离库 8811 走 15 视图，0 pageerror / 0 console error /
+  0 坏响应；简洁按钮 / 搜索面板 / 侧栏 / 分组标题逐项人工模拟通过。
+- **未真机复验**：真实引擎路径 `W1`–`W5` 仍全 ⬜，真源只在
+  `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.131 已完成 · 2026-11-18）
+
+**修工作台快失败轮次漏终态事件 —— 先订阅事件流再发指令；idle 按 `outcome`
+收口；停止标记当场收 stopped（纯服务层；无 schema 变更、无新文件）。**
+
+- **复现**：真机一轮 0.8s 内因 `provider.no-route`（模型不可路由）失败，
+  FreeAgent 轮次却一直 `running`：步骤空、正文空、状态条一直「引擎在跑」，
+  停止看不生效，干到 600s 超时才收口，还误报「它可能还在改文件」。引擎库
+  会话 `idle_outcome=failed`、没跑任何工具；隔离探针证实失败终态帧是
+  `session.execution.failed`（`data.error.message`），别名与错误提取链路
+  本身完好。
+- **根因**：`_run` 先 `prompt()` 后建事件流；V2 `/api/event` 是 volatile 流，
+  订阅前发出的帧直接丢。快失败的终态帧在指令后不到 1s 发出，流还没挂上，
+  于是收不到结束信号。
+- **修法**：① `ensure` → `events()`（当场 `urlopen` 建连）→ `prompt()`；
+  ② idle 读 `outcome`：`failed` 带引擎错误记 failed、`interrupted` 记
+  stopped、缺字段按完成兜底；别名补 `session.execution.interrupted` → idle；
+  ③ 循环每条事件先看停止标记，当场收 stopped，不等下一条事件。
+- **不动**：授权两档与闸门、步骤投影、40 工具上限、600s 超时兜底；模型
+  no-route 属选型/凭据层问题，不在本事件链路里改。
+- **已知边界**：volatile 流中段溢出丢帧仍靠 600s 超时兜底；按 durable
+  日志/消息端点回填终态的轮询未做，留下一刀。
+- **测试**：`test_agent_turn.py` 补订阅先于指令 / idle failed 带文案 /
+  idle interrupted 记 stopped；`test_executors.py` 补 interrupted 别名。
+  全量回归 exit 0，20 skip 与基线一致（19 变异探针 + 1 符号链接）。
+- **未真机复验**：no-route 快失败那轮的真实收口要在真机再起一次不可路由
+  模型观察；`W1`–`W5` 真机引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.130 已完成 · 2026-11-18）
+
+**修对话刷新后历史错乱 —— 发问时旧建议行只摘 DOM、没撤历史，刷新重放时退役
+chips 插回消息中间（纯前端；无 schema 变更、无新文件）。**
+
+- **修法**：`sendChat` 摘旧 `.chips` DOM 的同时，`history_` 过滤掉既有
+  `who === "chips"` 条目并 `chatSave` 落盘；回放路径 `addChips(..., false)`
+  不参与清理。
+- **测试**：`test_chat_js.py::TestChipsHistoryPurge`；探针
+  `tests/manual/chat_refresh_probe.py`（非交付物，未登记 §12.2）。
+
+---
+
+**工作台步骤清单呈现收口 —— 每条一张整宽 `.note` 卡片改成卡内紧凑行，状态颜色
+辅助文字、当前步高亮、超 8 步折叠（纯前端呈现层；无 schema 变更、无新文件）。**
+
+- **起因**：真机一轮 15 条步骤，每条都是整宽带边框底色的 pill 叠成灰墙，行内
+  只有「序号. 工具 · 状态」，视觉重量与信息量错配；长清单全展开把答复挤到屏外。
+- **前端**：渲染器收进 `js_workbench_card.py` 的 `wbStepsCard(steps)`（`js_workbench.py`
+  贴 250 行上限，只留调用）；行结构 `wb-step-idx / name / target / status`，目标
+  为空不拼双空格；最后一条 running 高亮 `is-current`，已执行弱化；超 8 步收起早期
+  步骤，「展开全部 N 步 / 收起」。
+- **不动**：`StepView(name, target, status)` 形状、服务层收口纪律（无完成证据不
+  替步骤判完成）、授权闸门；状态三值文字不变，颜色只辅助、不单通道传颜色。
+- **测试**：`test_web_usability_js.py::TestWorkbenchStepsList` 守拼装 / 行类名 /
+  折叠阈值与开关 / 样式作用域前缀；`test_web_escape.py` 守步骤名与目标过 `esc()`。
+- **未真机复验**：紧凑行与折叠的浏览器观感待隔离库走查；`W1`–`W5` 真机引擎路径
+  仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.128 已完成 · 2026-11-17）
+
+**真机 v2.0.29 工作台三处收口 —— 工具步骤按 `call_id` 四段合成一行、正文剥
+`@数字@` 残留标记、挂起授权兜底拉取（纯服务层；无 schema 变更、无新文件）。**
+
+- **起因**：真机一轮 15 条步骤目标全空且全卡「进行中」、正文漏出 `@17@`、最后
+  一条 shell 授权在 FreeAgent 侧没弹卡。隔离实例抓 SSE 帧 + OpenAPI schema 互证：
+  V2 工具四段（`input.started` / `called` / `success` / `failed`）同一 `id`
+  串联，name 只在 started、参数在 called、结果在 success/failed。旧适配器把 called
+  当内部 tool 却要 `data.name`（called 不带 name → 丢弃），success/failed 旧版没接。
+- **步骤投影**：别名表补 `success`/`failed` → `tool.done`；started 带
+  `call_id`+name，called 带 `call_id`+参数+显式 running，done 按事件名定
+  completed/error。轮次层内存 `call_index` 配对（不落库），命中早先行补目标 /
+  收终态；V1 形状退回同名同目标合并；丢开始帧又认不出名字不编名硬列行。预算
+  仍只数 `kind == "tool"`。
+- **收口兜底**：失败 / 停止把残留 running 记 failed；完成态无完成证据不往完成倒。
+- **标记清理**：`@纯数字@` 在替换前 / 落库前 / 旧库回读三处剥离；不误伤邮箱与
+  @提及。
+- **授权兜底**：起轮前 + 轮内 3 秒节流各拉一次 `pending_permissions`；同一
+  `parse_request` 判据，认不出跳过，rid 去重（实时 / 兜底共用 `seen_cards`）；
+  拉取失败回空，不在兜底层放行。**闸门判定未改**；最后一条授权未弹卡根因仍待
+  真机复验（事件丢失 / 前端未带出 / 会话沿用 saved 范围，三选一）。
+- **测试**：`test_agent_turn.py` 补三段合成一行 / failed / 不编名 / 标记剥离 /
+  兜底捞卡 / 去重坏载荷；`test_executors.py::TestV2ToolLifecycle` 守四段形状；
+  `test_engine_host.py::TestPendingPassthrough` 守透传与失败回空。
+- **未真机复验**：兜底能否兜住最后一条 shell 授权，要在真机 8770 再跑一轮观察；
+  `W1`–`W4` 真机引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.127 已完成 · 2026-11-17）
+
+**工作台目录选择器面板内重做 —— 行列表点行进入替代原生下拉、可见路径框可
+粘贴绝对路径回车校验、最近目录直达；后端列举跳重解析点、点目录排后
+（无 schema 变更、无新文件）。**
+
+- **起因**：旧面板把一整层目录塞进原生 `<select>`，选中即下钻，导航与选择挤在
+  一个控件；家目录首屏混着 Windows 遗留 junction 空壳与点目录；路径框隐藏不能
+  粘贴；没有最近用过的目录。口径已拍板：面板内重做（不做居中浮层）；跳重解析点，
+  点目录保留但排后。
+- **后端**：`agent_dirs` 用 `os.scandir` 枚举，跳过 symlink 与 Windows junction
+  （`FILE_ATTRIBUTE_REPARSE_POINT 0x400`；属性读不到按不列处理 fail-closed）；
+  普通目录在前、点目录在后；补 `recent`（项目档案最近使用倒序、去重、top 5）。
+- **前端**：`.dir-row` 行列表点行进入，底部「选用此目录」选定当前层；路径框
+  `#wb-dir-path` 粘贴绝对路径回车走同一道 `resolve_workdir()` 校验；最近目录
+  chips；面包屑 / 快捷位置 / 盘符 / 当前层过滤保留；行名先 `esc()` 再进 DOM。
+- **安全边界不动**：仍只列目录、不读内容、不递归、上限 300；枚举不是白名单；
+  选定前后同一道目录校验。
+- **测试**：`test_agent_endpoints.py::TestDirs` 补点目录排后 / 非重解析点 /
+  最近目录去重；`test_web_usability_js.py` 守行列表 / 路径框 / recent；
+  `test_web_escape.py` 转义断言改指新行结构。
+- **浏览器复验**：隔离库 8811 走查 15 视图 0 pageerror / 0 控制台 error / 0 坏
+  响应；行列表进入 / 上一级 / 过滤命中 / 路径回车跳转 / 坏路径就地报错均人工
+  模拟通过。`W1`–`W4` 真机引擎路径仍全 ⬜，真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.126 已完成 · 2026-11-17）
+
+**工作台界面视觉收口 —— 中性现代风：提示 / 空态 / 状态条改中性冷灰、主按钮
+实心、卡片轻阴影，米黄只留给真警示；先只改工作台一页（无 schema 变更；
+新增 `web/style_workbench.py`）。**
+
+- **起因**：工作台满屏复用 `.note`（`--warn-soft` 米黄底 + `--warn` 棕字），
+  提示条、授权代价说明、注入勾选行、路由 / 引擎状态、历史空态全是警示色；
+  主按钮浅绿描边，主次不清。
+- **作用域**：规则全部挂 `.wb-view` 容器，工作台 DOM 收进这一层；其余 14 个
+  视图本轮不动。颜色只复用现有 CSS 变量，不重写全局令牌；深色模式吃既有覆盖。
+- **拆块守 250 行**：`style.py` 已贴上限，工作台样式另立 `style_workbench.py`，
+  拼装接在 `STYLE_NAV_CSS` 之后；已登记 §12.2。类名与 id 不动（转义守卫钉住
+  `.note` 形状）；审批两档、后端、schema 一律不碰。
+- **走查顺手收两处**：空路由 / 引擎容器初始无内容时 `:empty` 隐藏，不留空
+  底色条；路由外层容器去掉 `.note`，不与内层提示条叠两层底色。
+- **测试**：`test_web_usability_js.py::TestWorkbenchVisualScope` 守样式块进
+  拼装、包裹层 / 标签类在位、每条规则都带 `.wb-view` 前缀（裸 `.note` /
+  `.btn.primary` 覆盖会染到别的视图）。
+- **浏览器复验**：全量回归后走隔离库有头走查；`W1`–`W4` 真机引擎路径仍全 ⬜，
+  真源只在 `docs/真机验收矩阵.md` 表 3。
+
+---
+
+## 上一版（V1.125 已完成 · 2026-11-17）
 
 **项目备注折进上下文 —— 选中项目的备注作为站立偏好随每轮带进引擎背景一行
 （无 schema 变更、无新文件）。**

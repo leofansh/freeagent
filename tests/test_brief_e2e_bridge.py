@@ -29,7 +29,7 @@
 ``bridge._oc_store`` 调 ``save_selection(selection)`` 时**不传 home**，
 而 ``oc_selection.save_selection`` 在 ``home`` 为 None 时写
 ``Path.home()/".freeagent"/"oc_selection.json"``（``oc_selection.py:591-593``）
-—— **真机上那份选型文件**。它不读 ``FREEAGENT_HOME``，只认显式参数。
+—— **真机上那份选型文件**。它不读 ``STEWARD_HOME``，只认显式参数。
 
 所以让四段点击走真 ``_oc_store`` 的测试，跑一次就把用户机器上的选型覆盖了。
 这不是测试该付的代价，故而 fixture 里把 ``_oc_options`` /

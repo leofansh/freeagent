@@ -9,7 +9,7 @@ REM directory follow the database's parent directory, so passing --db
 REM silently repoints the Feishu config page and the bridge status file at
 REM that directory, while the bridge and the executor keep reading the
 REM default home. The UI then reports an empty Feishu config even though
-REM ~\.freeagent\feishu.env is complete. One flag, two different homes.
+REM ~\.steward\feishu.env is complete. One flag, two different homes.
 REM See the build_app docstring in src/freeagent/app.py.
 setlocal
 cd /d "%~dp0.."
@@ -44,9 +44,9 @@ if errorlevel 1 goto bad_python
 
 echo.
 echo   Web UI:  http://127.0.0.1:8770/
-echo   Db:      %USERPROFILE%\.freeagent\agent.db   (your real data)
-echo   Config:  %USERPROFILE%\.freeagent\config.json
-echo   Feishu:  %USERPROFILE%\.freeagent\feishu.env
+echo   Home:    %USERPROFILE%\.steward   (fresh installs)
+echo            an existing %USERPROFILE%\.freeagent stays in use as-is
+echo   Files:   agent.db / config.json / feishu.env   under that home
 echo.
 echo   Port 8770 is shared with tools\run_demo_web.bat.
 echo   Close that one first, or this will fail to bind.
@@ -69,7 +69,7 @@ goto :eof
 
 :no_python
 echo.
-echo   FreeAgent needs Python 3.11 or newer, but no interpreter was found
+echo   Steward needs Python 3.11 or newer, but no interpreter was found
 echo   on PATH, in the py launcher, or in the standard install folders.
 echo   Install Python 3.11+ from https://www.python.org/downloads/, then run
 echo   this script again. The Web UI needs no extra pip install.
@@ -79,7 +79,7 @@ exit /b 1
 
 :bad_python
 echo.
-echo   The interpreter found could not run FreeAgent: it is either older
+echo   The interpreter found could not run Steward: it is either older
 echo   than Python 3.11, or it is the Microsoft Store placeholder that opens
 echo   the store instead of starting Python.
 echo   Install Python 3.11+ from https://www.python.org/downloads/, make sure

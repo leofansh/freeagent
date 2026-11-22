@@ -64,7 +64,7 @@ def home(tmp_path, monkeypatch):
     于是落回默认 8771 —— 而本机可能正跑着真桥接，撞成「端口已被占用」，
     于是「配置不足该报错」这条测试报出来的却是「端口被占」，断言全歪。
     """
-    monkeypatch.setenv("FREEAGENT_HOME", str(tmp_path))
+    monkeypatch.setenv("STEWARD_HOME", str(tmp_path))
     monkeypatch.setenv("FEISHU_LOCK_PORT", str(_free_port()))
     for key in (
         "FEISHU_APP_ID", "FEISHU_APP_SECRET",
@@ -127,7 +127,7 @@ def test_start_refuses_when_nothing_is_configured(home):
 
 def test_start_refuses_when_secret_missing(home, monkeypatch):
     """App ID 有了但 Secret 没有 —— 半个配置最容易被当成配好了。"""
-    monkeypatch.setenv("FREEAGENT_HOME", str(home))
+    monkeypatch.setenv("STEWARD_HOME", str(home))
     from freeagent.feishu.secret_store import write_env
 
     write_env({"FEISHU_APP_ID": "cli_x", "FEISHU_ALLOWED_USERS": "ou_a"}, home)

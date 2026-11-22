@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+from ..paths import HOME_ENV as DEFAULT_HOME_ENV
+from ..paths import state_dir
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -994,8 +996,10 @@ _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
     (30, _RETRIEVAL_LOG_SCHEMA),
 )
 
-#: 覆盖默认数据目录的环境变量名。
-DEFAULT_HOME_ENV = "FREEAGENT_HOME"
+#: 覆盖默认数据目录的环境变量名。**这是一个别名**：真值在
+#: :mod:`freeagent.paths`（``STEWARD_HOME``，旧名 ``FREEAGENT_HOME`` 仍认）。
+#: 保留这个名字是因为 ``storage`` 的公开接口与手册契约都按它取 ——
+#: 改名不该顺手改 API。
 
 #: **v1 基线，永远不再变。**
 #:
@@ -1102,19 +1106,16 @@ CREATE INDEX IF NOT EXISTS idx_deps_depends_on      ON task_dependencies(depends
 def resolve_db_path(home: str | Path | None = None) -> Path:
     """解析数据库文件路径。
 
-    优先级：显式 ``home`` 参数 > 环境变量 ``FREEAGENT_HOME`` > ``~/.freeagent``。
+    优先级：显式 ``home`` 参数 > ``STEWARD_HOME``（旧名 ``FREEAGENT_HOME``
+    仍认）> 「``~/.freeagent`` 里已有库就沿用旧目录」> ``~/.steward``。
     返回的路径父目录会被创建，文件本身不创建。
 
-    环境变量要 ``strip()``，理由同 :func:`freeagent.config.config_path`：
-    尾随空格会让 Windows 剥掉路径末尾，导致 ``mkdir`` 建的目录和实际用的
-    路径对不上，最后只抛一句 ``unable to open database file``。两处必须
-    一起改 —— 漏一处就会出现「库在 A 目录、配置在 B 目录」这种更怪的状态。
+    目录解析**只有一份**，在 :func:`freeagent.paths.state_dir`；这里只负责
+    挂 ``agent.db`` 与建目录。历史上这段自己拼过一遍 ``~/.freeagent``，
+    和 ``paths`` 那份漂移过一次，症状是「库在 A 目录、配置在 B 目录」——
+    两处各自 strip 尾随空格的道理也在这里一次性解决。
     """
-    if home is not None:
-        base = Path(home)
-    else:
-        env = (os.environ.get(DEFAULT_HOME_ENV) or "").strip()
-        base = Path(env) if env else Path.home() / ".freeagent"
+    base = state_dir(home)
     base.mkdir(parents=True, exist_ok=True)
     return base / "agent.db"
 

@@ -1,19 +1,12 @@
-"""工作台的「工作目录」与一次开跑（设计文档 21.4 / V1.114）。
+"""工作台的「工作目录」与一次开一轮（设计文档 21.4 / V1.114）。
 
-## 为什么从 :mod:`endpoints_agent` 拆出来
-
-那个文件已经顶到 web 包 250 行上限（``TestWebPackageStaysSmall`` 守着）。
-拆的口径是**职责**而不是行数：这里只碰两件与「目录」有关的事 ——
-列出目录、按这份选择开一轮。状态、答卡、停止在另一个文件里。
-
-## 项目档案在哪
-
-命名目录 + 备注 + 选中关系归 :mod:`endpoints_agent_projects`；这里只在
-``agent_start`` 起轮前复用它的仓储与偏好助手，不重复建档逻辑。
+目录列举与开一轮归这里；状态 / 答卡 / 停止在 ``endpoints_agent``；项目档案归
+``endpoints_agent_projects``，这里只复用其仓储与偏好助手，不重复建档逻辑。
 """
 
 from __future__ import annotations
 
+import os
 import pathlib
 import string
 import sys
@@ -26,6 +19,7 @@ from .endpoints_agent_projects import (
     _leaf_name,
     _project_repo,
     agent_project_delete,
+    agent_project_recent,
     agent_project_save,
     agent_project_select,
     agent_project_update,
@@ -41,26 +35,33 @@ __all__ = ["agent_dirs", "agent_start", "load_prefs", "save_prefs",
 #: 目录列表最多返回多少项。不设上限时，一个 ``node_modules`` 就能把一次
 #: GET 拖成几秒 —— 而人只需要知道「往下该点哪个」。
 _MAX_DIRS = 300
+#: Windows 文件属性：重解析点（junction / 符号链接 / 挂载点）。
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_reparse(path: pathlib.Path) -> bool:
+    # junction/符号链接不列：家目录遗留壳目录指向别处或空壳，还会把授权边界
+    # 引到软链身后；读不到属性按「不列」处理，fail-closed。
+    try:
+        if path.is_symlink():
+            return True
+        return sys.platform == "win32" and bool(
+            os.stat(path, follow_symlinks=False).st_file_attributes
+            & _FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return True
 
 
 def _available_roots() -> list[str]:
-    """能作为浏览起点的根：Windows 枚存在的盘符，其它平台就一个 ``/``。
-
-    这里只列**存在**的根；列出来的路径点下去仍走 :func:`resolve_workdir`
-    校验，枚举本身不是放行依据。
-    """
+    """浏览起点根：Windows 枚存在的盘符，其它平台就 ``/``。枚举不是放行依据。"""
     if sys.platform == "win32":
-        roots = [f"{letter}:\\" for letter in string.ascii_uppercase
-                 if pathlib.Path(f"{letter}:\\").is_dir()]
-        return roots
+        return [f"{letter}:\\" for letter in string.ascii_uppercase
+                if pathlib.Path(f"{letter}:\\").is_dir()]
     return ["/"]
 
 
 def _quick_places(home: pathlib.Path) -> list[dict[str, str]]:
-    """家目录与常见个人目录：只收**真实存在**的，缺哪个不列哪个。
-
-    这是浏览快捷入口，不是白名单 —— 点进去之后照旧过目录校验。
-    """
+    """家目录与常见个人目录：只收真实存在的；这是快捷入口，不是白名单。"""
     candidates = [
         ("家目录", home),
         ("桌面", home / "Desktop"),
@@ -74,9 +75,9 @@ def _quick_places(home: pathlib.Path) -> list[dict[str, str]]:
 def agent_dirs(app: App, q: dict[str, list[str]]) -> dict[str, Any]:
     """``GET /api/agent/dirs?path=`` —— 列出某个目录下的子目录。
 
-    这是**唯一**一个能读到工作目录里有什么的端点，所以两条约束写死：
-    只列**目录**（不读文件内容、不递归），且最多 :data:`_MAX_DIRS` 项。
-    它回答「往下该点哪个」，不是「这个目录里有什么」。
+    工作目录的列举有两条通道，约束写在同一处：这条只列**目录**（回答
+    「往下该点哪个」），``endpoints_agent_files`` 那条连文件一起列（回答
+    「这个工作区里有什么」，根收紧到工作区目录）。两条都只一层、都不读内容。
     """
     raw = (q.get("path") or [""])[0].strip()
     if not raw:
@@ -87,10 +88,13 @@ def agent_dirs(app: App, q: dict[str, list[str]]) -> dict[str, Any]:
         raise FreeAgentError(str(exc)) from exc
     path = pathlib.Path(resolved)
     try:
-        entries = [d.name for d in path.iterdir() if d.is_dir()]
+        entries = [de.name for de in os.scandir(path)
+                   if de.is_dir(follow_symlinks=False)
+                   and not _is_reparse(pathlib.Path(de.path))]
     except OSError as exc:
         raise FreeAgentError(f"读不出这个目录：{path}（{exc}）") from exc
-    entries.sort(key=str.lower)
+    # 普通目录在前、点目录在后；组内大小写不敏感 —— 找常用目录不必先翻过一堆隐藏项。
+    entries.sort(key=lambda n: (n.startswith("."), n.lower()))
     truncated = len(entries) > _MAX_DIRS
     return {
         "kind": "agent_dirs",
@@ -101,6 +105,7 @@ def agent_dirs(app: App, q: dict[str, list[str]]) -> dict[str, Any]:
         "total": len(entries),
         "drives": _available_roots(),
         "places": _quick_places(pathlib.Path.home()),
+        "recent": agent_project_recent(app),
     }
 
 

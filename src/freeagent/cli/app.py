@@ -214,7 +214,7 @@ def _readable_span(seconds: int) -> str:
 
 
 _HELP = """\
-个人事务助手 · 命令
+值守 · 命令
   ── 视图 ──
   /today              今天视图（含顺延标记与每条信号的理由）
   /weigh              代价对照：两件以上的事争同一天时，把各自的代价（带出处）摆出来供你拍板
@@ -516,7 +516,7 @@ class Repl:
 
     # -- 主循环 ------------------------------------------------------------- #
     def run(self) -> None:
-        self._say("个人事务助手原型 · 输入 /help 看命令，直接说话也行。")
+        self._say("值守 · 输入 /help 看命令，直接说话也行。")
         if self.app.llm_name != "RuleBasedProvider":
             self._say(f"智能层：{self.app.llm_name}（模型失败会自动退回规则推断）")
         while True:
@@ -1146,7 +1146,7 @@ class Repl:
         if brief:
             self._pending_delegate = (None, brief)
             self._say(f"要改什么？「{brief}」是要做的事，还是项目名？")
-            self._say("一句话说完就行，例如「FreeAgent 的 README 加一行说明」。")
+            self._say("一句话说完就行，例如「值守的 README 加一行说明」。")
             return True
         self._pending_delegate = (None, "")
         self._say(
@@ -2251,7 +2251,7 @@ class Repl:
             # 换到别的执行器更诚实（fail-closed + 说得清原因）。
             self._say("hermes 执行器已停用（V1.83）。它的审批闸是「按模式标记」"
                       "而非「每动作确认」，拦不住未标记的文件/终端操作，不能当"
-                      "受控执行器。知识问答请用 `/ask`（默认 opencode，FreeAgent "
+                      "受控执行器。知识问答请用 `/ask`（默认 opencode，值守 "
                       "全控）。代码保留作接缝，若 hermes 修好审批可重新启用。")
             return
         question = " ".join(args).strip()

@@ -61,7 +61,7 @@ CAPABILITY_TOPICS: tuple[tuple[str, str], ...] = (
         "executors",
         "**在问**接了哪些执行器 / worker / agent / 外部工具；问 opencode "
         "在不在、谁替我干活。"
-        "如果这句话是**要求执行器去干活**（让 opencode 改、在某项目里修），"
+        "如果这句话是**要求执行器去干活**（让它改、在某项目里修），"
         "不要选这里 —— 那是委派请求。",
     ),
     (
@@ -398,13 +398,13 @@ class CapabilityRouter:
             "我能做三件事：",
             "  记事 —— 直接说一句就行（「下周二交周报」）",
             "  查 —— 问我「今天」「在等什么」「提醒」「某条为什么排在这」",
-            "  改代码 —— 交给 opencode 做，它每动一次都问你批不批",
+            "  改代码 —— 交给引擎做，它每动一次都问你批不批",
         ]
         if view.enabled:
             lines.append(f"    现在授权的是：{'、'.join(view.labels())}")
         else:
             lines.append("    （还没授权项目，暂时不能改代码）")
-        lines.append("改代码的说法：「让 opencode 改 <项目> “要做的事”」。")
+        lines.append("改代码的说法：「让它改 <项目> “要做的事”」。")
         return ChatReply(ChatReplyKind.ANSWER, "\n".join(lines))
 
     def _how_to(self, view: CapabilityView) -> ChatReply:
@@ -421,7 +421,7 @@ class CapabilityRouter:
         return ChatReply(
             ChatReplyKind.ANSWER,
             "三步：\n"
-            "  1. 说「让 opencode 改 <项目> “要做的事”」（一整行，别换行）\n"
+            "  1. 说「让它改 <项目> “要做的事”」（一整行，别换行）\n"
             "  2. 我复述一遍，你确认\n"
             "  3. 执行器动手前，每一步都发卡问你批不批"
             "\n现在授权的是：" + "、".join(view.labels()),
@@ -466,7 +466,7 @@ class CapabilityRouter:
             "我能说的只有这些（这是授权给我改代码的项目，我**没读过**"
             "它们的内容）：\n"
             + "\n".join(f"  {l}" for l in view.labels())
-            + "\n想看某个项目具体是什么，直接让我读：「让 opencode 看看 "
+            + "\n想看某个项目具体是什么，直接让我读：「让我看看 "
             "<项目名> 是干嘛的」。",
             suggestions=("你能做什么", "今天该做什么"),
         )

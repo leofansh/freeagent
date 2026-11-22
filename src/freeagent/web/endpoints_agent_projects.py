@@ -79,11 +79,46 @@ def _leaf_name(directory: str) -> str:
     return pathlib.Path(directory).name or directory
 
 
-def agent_projects(app: App) -> dict[str, Any]:
-    """``GET /api/agent/projects`` —— 项目清单 + 当前选中的项目。只读。"""
+def agent_project_recent(app: App, limit: int = 5) -> list[dict[str, str]]:
+    """浏览面板的「最近目录」：档案按最近使用倒序，目录去重，只回名称与路径。
+
+    这是便利入口，不是白名单 —— 点下去仍走同一个目录校验端点。
+    """
     repo = _project_repo(app)
+    if repo is None:
+        return []
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for row in repo.list_all():
+        directory = str(row.get("directory") or "")
+        if not directory or directory in seen:
+            continue
+        seen.add(directory)
+        out.append({"label": str(row.get("name") or _leaf_name(directory)),
+                    "path": directory})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def agent_projects(app: App) -> dict[str, Any]:
+    """``GET /api/agent/projects`` —— 项目清单 + 当前选中的项目。只读。
+
+    每项多带一个 ``turns``：这个目录上一共跑过几轮（V1.139 左栏用）。
+    **读不到回 ``None`` 而不是 0** —— 「还没跑过」和「读不出来」在界面上
+    是两句话，把后者写成 0 就等于替人下了结论。
+    """
+    repo = _project_repo(app)
+    turns_repo = getattr(app, "turn_repo", None)
     prefs = load_prefs(app)
-    projects = [_project_out(r) for r in repo.list_all()] if repo else []
+    projects: list[dict[str, Any]] = []
+    for row in (repo.list_all() if repo else []):
+        out = _project_out(row)
+        out["turns"] = (
+            turns_repo.count_by_directory(str(out["directory"]))
+            if turns_repo is not None else None
+        )
+        projects.append(out)
     return {
         "kind": "agent_projects",
         "projects": projects,

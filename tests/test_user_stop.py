@@ -131,6 +131,17 @@ class TestCard:
         """允许仍是主按钮 —— 频率最高的那个该最显眼。"""
         assert self._buttons()["allow_once"]["type"] == "primary"
 
+    def test_allow_session_button_is_default(self):
+        """本会话内允许此类是 ``default`` —— 它扩大了授权范围，不该比
+        「允许这一次」更显眼（primary 留给频率最高、风险最低的那枚）。
+
+        与「停止」的 danger 也分开：扩大授权不是后果最重的选择，
+        但也不该被误当成默认的一次性放行。
+        """
+        buttons = self._buttons()
+        assert "allow_session" in buttons
+        assert buttons["allow_session"]["type"] == "default"
+
     def test_card_is_still_json_10(self):
         """仍是 JSON 1.0：与批准卡/选项卡同版本，否则 200830。"""
         card = _tool_card("s", "d", "c")

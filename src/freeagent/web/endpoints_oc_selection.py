@@ -18,7 +18,7 @@ web 包每个文件 ≤ 250 行。那条守卫的意义正是逼这种职责分�
 
 ## 为什么这个页签与飞书共用一份选项
 
-编程页签要的东西和飞书那四张卡**完全一样**，所以它必须走
+委派总览页要的东西和飞书那四张卡**完全一样**，所以它必须走
 :mod:`freeagent.services.oc_discovery` —— 那是两个前端共用的发现层。
 如果 Web 自己查一遍 OpenCode，就会变成两套实现，而它们的症状是
 「Web 上选得到、飞书里选不到」，且没人知道该信哪个。
@@ -114,7 +114,9 @@ def oc_options(app: App) -> dict[str, Any]:
     exec_rows = discovery.exec_world_agents(current.project)
 
     def stage(name: str) -> dict[str, Any]:
-        options, note = discovery.stage_options(name, home=home)
+        # 四段共用最上面那一份快照：失败快照不入缓存（见 snapshot()），
+        # 若这里各自重查，一次抖动会被放大成四次起进程。
+        options, note = discovery.stage_options(name, home=home, snap=snap)
         payload = {"options": _options_as_dict(options), "note": note}
         if name == "agent":
             payload["exec_world_ok"] = exec_rows is not None
@@ -142,7 +144,7 @@ def oc_options(app: App) -> dict[str, Any]:
         elif agent_rows and not sel.current_agent_is_valid(agent_rows, current.agent):
             agent_warning = (
                 f"工作模式「{current.agent}」已失效（该项目可能没有它，"
-                "或 OpenCode 已更新）。请在上方重选。"
+                "或后台引擎已更新）。请在上方重选。"
             )
     curated = sel.load_curated_models(home)
 

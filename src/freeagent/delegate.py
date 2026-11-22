@@ -83,6 +83,7 @@ from .services.engine_ledger import (
     render_ledger,
 )
 from .services.engine_verdict import disagreement_line, read_engine_verdict
+from .services.permission_reply import deliver as deliver_permission_reply
 from .services.opencode_projects import authorized_names
 from .services.tool_evidence import tool_evidence
 from .services.executors import (
@@ -1263,6 +1264,8 @@ def run_with_tool_gate(
     max_seconds: float = DEFAULT_MAX_DISPATCH_SECONDS,
     now: Callable[[], float] = time.monotonic,
     progress_repo: "ProgressRepo | None" = None,
+    # 「把答复送回引擎」的重试间隔可注入：失败路径的测试不真睡。
+    reply_sleep: Callable[[float], Any] = time.sleep,
 ) -> DispatchOutcome:
     """派一条委派，**执行期逐次授权**（设计文档 11.8.1）。
     与 :func:`_dispatch_one` 的分工：那是**无人值守**的老路（subprocess 一次
@@ -1340,6 +1343,14 @@ def run_with_tool_gate(
     #: 总时长超限。与 :data:`DEFAULT_MAX_TOOL_CALLS` **互补**：那个限次数，
     #: 这个限时长。一个一直有动静的 agent 次数上不去，但时间能拖很久。
     time_capped = False
+    #: 人批了但结论没能送回引擎。空串 = 没发生；非空存原因。
+    #: 与「已拒绝」/「已叫停」都不同：那两种引擎**收到了**一个明确的结论，
+    #: 这一种引擎还挂着那个请求 —— 不单列，就会被收尾算成「完成」。
+    reply_failed = ""
+    #: 本会话（= 这一次函数调用）内「点过本会话内允许此类」的动作类型集合
+    #: （V1.138，key 是 permission）。**函数返回即失效，跨委派不继承** ——
+    #: 「本会话」的边界就在这一层，扩大授权不能溢出到下一次委派。
+    session_allows: set[str] = set()
     #: 会话以 ``session.error`` 收场时的错误对象（``properties`` 原样）。
     #:
     #: 真机踩过（2026-10-10）：模型调用被拒（403 FreeTierError）时 opencode
@@ -1583,7 +1594,7 @@ def run_with_tool_gate(
                             ok=False,
                             summary=(
                                 f"工作模式「{policy.agent}」已失效：该项目可能没有它，"
-                                "或 OpenCode 已更新。请到「编程」页签重选工作模式后再派发。"
+                                "或后台引擎已更新。请到「委派总览」页重选工作模式后再派发。"
                             ),
                         )
             oc.prompt_async(session_id, brief, model=policy.model,
@@ -1748,14 +1759,47 @@ def run_with_tool_gate(
                     task_id=getattr(task, "id", "") or "",
                     # 滚动瘦身（V1.41）：发这张之前撤掉已定案的旧卡。
                     retired=retired,
+                    # 本会话内已放行的同类动作直接免问（V1.138）。
+                    session_allows=session_allows,
                 )
-                handled.append(f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}")
+                # 区分「点了一次性允许」与「本会话内此类不再问」，给用户的话
+                # 要说得清：后者扩大了范围，不该和前者长得一模一样。
+                _scope_note = (
+                    "（本会话内此类不再问）"
+                    if decision == "allow" and req.permission in session_allows
+                    else ""
+                )
+                handled.append(
+                    f"{req.summary} → {'允许' if decision == 'allow' else '拒绝'}"
+                    f"{_scope_note}"
+                )
                 tool_calls += 1
                 if decision == "allow":
                     granted += 1
                 # **先把答案回给 opencode，再考虑中止** —— 顺序反了会让
                 # 那个挂起的请求没人回，opencode 会一直等着。
-                oc.reply_permission(req.request_id, decision)
+                #
+                # 这一步失败 = 卡面已经显示「已允许」，人以为批完了，引擎那边
+                # 却还挂着同一个请求 —— 会话一路卡到 600s 超时。绝不能吞：
+                # 有限重试后仍送不到，就如实呈现并停住本轮（fail-closed）。
+                # 不在这里拼人话，只把原因交给通道呈现（12.1.1）。
+                _reply = deliver_permission_reply(
+                    lambda: oc.reply_permission(req.request_id, decision),
+                    sleep=reply_sleep,
+                )
+                if not _reply.ok:
+                    reply_failed = f"{req.summary}：{_reply.error}"
+                    handled.append(
+                        f"{req.summary} → 你批了，但没送回引擎（{_reply.error}）"
+                    )
+                    _update_progress(
+                        f"你批了「{req.summary}」，但没送回引擎（{_reply.error}）"
+                        " —— 已停住本轮，请重新发起这条委派",
+                        status="授权送回失败",
+                        force=True,
+                    )
+                    _abort_quietly(oc)
+                    break
                 # ── 进度卡片更新（设计文档 11.16）──────────────────────────
                 #
                 # 每次 permission.asked 都意味着 agent 做了一件工具调用。
@@ -1829,6 +1873,7 @@ def run_with_tool_gate(
     # 幂等：异常路径已在 except 里关过，这里是 no-op。
     _final_status = (
         "会话出错" if session_error is not None
+        else "授权送回失败" if reply_failed
         else "提问未答" if unanswered
         else "已叫停" if user_stopped
         else "步数超限" if step_capped
@@ -1861,6 +1906,7 @@ def run_with_tool_gate(
     # 记失败」—— 正是这个模块要防的那类错。
     ok_by_five = (
         session_error is None
+        and not reply_failed
         and not unanswered
         and not user_stopped
         and not step_capped
@@ -1944,6 +1990,21 @@ def run_with_tool_gate(
             tool_calls=tuple(handled),
         )
 
+    if reply_failed:
+        # 人已经批了、卡面也显示「已允许」，但引擎没收到结论。这一轮停在这里，
+        # 绝不能落到「完成」—— 那是「看起来在工作」的又一形态。
+        # 出路要具体：重新发起（那个挂起的请求多半已经过期或被 abort 掉了），
+        # 而不是含糊地说「再试一次」（人不知道试什么、在哪试）。
+        return DispatchOutcome(
+            ok=False,
+            summary=(
+                f"你批了，但结论没能送回引擎（{reply_failed}）—— 已停住本轮。\n"
+                "  卡面显示「已允许 / 已拒绝」不代表引擎收到了；这次没有继续。\n"
+                "  下一步：重新发起这条委派即可。\n"
+                f"  改动：{change_note}"
+            ),
+            session_id=session_id or None, tool_calls=tuple(handled),
+        )
     if unanswered:
         # 显式报失败。不把它装成「完成」—— 那会让一次
         # 无人答课的委派在记录里看起来和正常完成一样。
@@ -2327,8 +2388,14 @@ def _ask_one_tool(
     reply_to: str = "",
     task_id: str = "",
     retired: "set[str] | None" = None,
+    session_allows: "set[str] | None" = None,
 ) -> tuple[str, str]:
     """问一次，回 ``(结论, 凭据)``。**只回结论，不解释** —— 解释是卡片的事。
+
+    ``session_allows``（V1.138）是本会话（= 这一次 :func:`run_with_tool_gate`
+    调用）内「已对本类动作放行」的集合，key 是 ``permission``（动作类型）。
+    命中就直接放行、不落库、不发卡 —— 本会话内同类不再问；换一种动作仍会
+    弹卡。集合**由调用方持有**：函数返回即失效，跨委派不继承（安全边界）。
 
     **凭据为什么要带出来**：停止与拒绝在 :meth:`ApprovalStore.wait` 那里
     **都表现为 ``deny``** —— 那次动作确实没被批准，这一点两者是一样的。
@@ -2348,6 +2415,13 @@ def _ask_one_tool(
     而 ``store.wait()`` 又用自己默认的 600s，于是出现
     「卡上 0 秒、实际等了 10 分钟」这种自相矛盾的表现。
     """
+    # 本会话内同类动作已放行 → 直接放行，不发卡、不落库（V1.138）。
+    # 凭据给空串：没发卡也就没有「被叫停」这回事，调用方有 ``credential and``
+    # 守卫（见主循环的 is_stop_requested），空串不会误判成叫停。
+    if session_allows is not None and req.permission in session_allows:
+        log.info("【执行期】本会话已放行同类动作（%s）—— 免问，直接放行",
+                 req.permission)
+        return "allow", ""
     policy = context.policy
     pending = store.request_tool_call(
         permission=req.permission, paths=req.paths, diff=req.diff,
@@ -2385,6 +2459,13 @@ def _ask_one_tool(
         # poll_seconds 就返回，而不是干等到 TTL（委派档 1800s = 半小时）。
         should_stop=lambda: store.is_stop_requested(pending.credential),
     )
+    # 「本会话内允许此类」在库里是普通 allow，范围信号只在 decided_via。
+    # 只有人**明确点了那枚按钮**才记入集合；普通「允许这一次」不扩大范围。
+    # 读不出来不记（fail-closed 到「每次都问」），不猜。
+    if session_allows is not None and decision == "allow":
+        settled = store.get(pending.credential)
+        if settled is not None and settled.decided_via == "card_session":
+            session_allows.add(req.permission)
     return decision, pending.credential
 
 

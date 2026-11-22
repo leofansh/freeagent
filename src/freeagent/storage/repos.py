@@ -1778,6 +1778,22 @@ class WorkbenchTurnRepo(_RepoBase):
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def count_by_directory(self, directory: str) -> int:
+        """某个目录上一共跑过几轮（V1.139 左栏用）。
+
+        ## 为什么现算而不在档案里存一列
+
+        轮次表本身就是「跑过几轮」的唯一真源；在 ``workbench_projects`` 上
+        再存一个计数列，就得在每次落库时同步加一，而任何一条漏加的路径都会
+        让两处说出不同的数字（同 V1.116 不另存 touched_files 的理由）。
+        档案删掉也不影响这里 —— 轮次是人的历史，不归档案所有。
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM workbench_turns WHERE directory = ?",
+            (directory,),
+        ).fetchone()
+        return int(row["n"] or 0) if row is not None else 0
+
     def reap(self, now: datetime, *, reason: str) -> int:
         """把上次进程留下的 ``running`` / ``waiting`` 落成 ``failed``。
 

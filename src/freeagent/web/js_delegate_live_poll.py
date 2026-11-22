@@ -215,7 +215,7 @@ function bindLiveVisibility() {
   window.addEventListener("pageshow", (ev) => { if (ev.persisted) liveWake(); });
 }
 
-// 挂载。root 是编程页签的容器（切页签时会被 replaceChildren 换掉）。
+// 挂载。root 是委派总览页的容器（切页签时会被 replaceChildren 换掉）。
 function mountLivePanel(root) {
   const box = el("div", "");
   box.id = "livepanel";

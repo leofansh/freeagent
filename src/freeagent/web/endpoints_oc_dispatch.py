@@ -61,7 +61,7 @@ def oc_dispatch(app: App, body: dict[str, Any]) -> dict[str, Any]:
         raise FreeAgentError("先说要做什么 —— 一句话就行")
     if "\n" in brief or "\r" in brief:
         raise FreeAgentError(
-            "需求要写成一行。含换行时 opencode 会判成复杂任务、"
+            "需求要写成一行。含换行时会被判成复杂任务、"
             "升级到它自己的强模型并无视你选的模型，然后失败。"
         )
 
@@ -97,7 +97,7 @@ def oc_dispatch(app: App, body: dict[str, Any]) -> dict[str, Any]:
         "next": (
             note +
             "点「开始做」后，执行器（独立进程）才会接手 —— "
-            "它得在跑（python -m freeagent.delegate）。"
+            "得先在「后台服务」里确认它在跑。"
             "之后本页顶部那块面板会实时显示进度、每次动手要你批的授权卡，"
             "以及它反问你的问题（飞书那边是同一套卡）。"
         ),

@@ -239,23 +239,38 @@ class TestPendingPayload:
         _write_progress(app, clock, task.id)
         assert live.delegate_live(app)["items"][0]["pending"] == []
 
-    def test_zombie_row_for_a_deleted_task_does_not_poison_the_panel(self, env):
-        """真机 2026-10-18：进度行还在、事务已删 → 面板整体 400。
+    def test_zombie_row_for_a_deleted_task_is_hidden(self, env):
+        """真机 2026-10-18：进度行还在、事务已删 → 面板挂着一块永不更新的幽灵。
 
-        根因是端点按「``repo.get`` 返回 None」写的兜底，而 ``get()`` 的
-        契约是**抛** ``NotFoundError``（返回 None 的是 ``find()``）。一条
-        坏行毒死整个实时面板 —— 好委派的进度也跟着看不见。修法：改用
-        ``find()``，坏行降级显示「(事务已不存在)」。
+        第一版（V1.35）的修法只是把 ``get()`` 换成 ``find()``，坏行降级成
+        「(事务已不存在)」—— 不毒害面板了，但那行**永远陈旧**：updated_at
+        冻结在执行器被强杀那一刻，前端每 2 秒把「已经 N 秒没动静」往上加，
+        实测涨到 2789313 秒（≈32 天）还挂着，而它没有任务可重派 / 放弃。
+        所以读侧直接跳过孤儿投影 —— 藏幽灵，但**不删数据**（留作取证），
+        好行照常显示。
         """
         app, task, clock = env
-        # 一行**正常**的 + 一行事务已删的：坏行不许影响好行的显示。
         ghost_id = "task_deleted_with_progress_row_still_there"
         _write_progress(app, clock, task.id, tool_calls=2, allowed=2)
         _write_progress(app, clock, ghost_id, status="正在执行")
         items = live.delegate_live(app)["items"]
         by_id = {i["task_id"]: i for i in items}
         assert by_id[task.id]["title"], "好行必须照常显示"
-        assert by_id[ghost_id]["title"] == "(事务已不存在)"
+        assert ghost_id not in by_id, "孤儿进度行不该再挂在面板上"
+
+    def test_ghost_progress_row_does_not_hide_its_pending_card(self, env):
+        """藏的是幽灵**进度行**，不是它的待批项 —— 12.7.1「列出来但不藏」。"""
+        app, _task, clock = env
+        ghost_id = "deleted_task_with_pending"
+        store = _store(app, clock)
+        store.request_tool_call(permission="edit", paths=["a"], task_id=ghost_id)
+        _write_progress(app, clock, ghost_id, status="正在执行")
+        items = live.delegate_live(app)["items"]
+        ghosts = [i for i in items if i["task_id"] == ghost_id]
+        # 只该剩一张「等你决定」卡：幽灵进度行被藏，但它的待批项没被连带藏掉。
+        assert len(ghosts) == 1, "幽灵进度行与待批卡不该同时出现"
+        assert ghosts[0]["status"] == "等你决定"
+        assert ghosts[0]["pending"], "待批卡必须还在"
 
     def test_orphan_pending_is_still_shown(self, env):
         """没有归属的待批项（本地操作类）照样显示 —— 藏起来用户就以为

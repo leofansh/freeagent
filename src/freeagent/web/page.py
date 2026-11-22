@@ -24,12 +24,17 @@ from .js_chat_select import JS_CHAT_SELECT
 from .js_chat_store import JS_CHAT_STORE
 from .js_core import JS_CORE
 from .js_nav import JS_NAV
+from .js_compact import JS_COMPACT
+from .js_chat_search import JS_CHAT_SEARCH
 from .js_detail import JS_DETAIL
 from .js_contacts import JS_CONTACTS
 from .js_promises import JS_PROMISES
 from .js_pending import JS_PENDING
 from .js_nudge import JS_NUDGE
 from .js_model import JS_MODEL
+from .js_week import JS_WEEK
+from .js_harness import JS_HARNESS
+from .js_onboard import JS_ONBOARD
 from .js_artifact import JS_ARTIFACT
 from .js_feishu import JS_FEISHU
 from .js_feishu_config import JS_FEISHU_CONFIG
@@ -41,21 +46,32 @@ from .js_oc_cards import JS_OC_CARDS
 from .js_oc_selection import JS_OC_SELECTION
 from .js_settings import JS_SETTINGS
 from .js_settings_llm import JS_SETTINGS_LLM
+from .js_settings_groups import JS_SETTINGS_GROUPS
 from .js_vision import JS_VISION
 from .js_workbench import JS_WORKBENCH
 from .js_workbench_card import JS_WORKBENCH_CARD
 from .js_workbench_dirs import JS_WORKBENCH_DIRS
 from .js_workbench_projects import JS_WORKBENCH_PROJECTS
 from .js_workbench_page import JS_WORKBENCH_PAGE
+from .js_workbench_intake import JS_WORKBENCH_INTAKE
+from .js_workbench_rail import JS_WORKBENCH_RAIL
+from .js_workbench_side import JS_WORKBENCH_SIDE
+from .js_workbench_files import JS_WORKBENCH_FILES
+from .js_workbench_shell import JS_WORKBENCH_SHELL
 from .markup import PAGE_MARKUP
 from .style import STYLE_CSS
 from .style_nav import STYLE_NAV_CSS
+from .style_workbench import STYLE_WORKBENCH_CSS
+from .style_usability import STYLE_USABILITY_CSS
+from .style_chat import STYLE_CHAT_CSS
 
 __all__ = ["INDEX_HTML"]
 
 INDEX_HTML = (
     PAGE_MARKUP
-    + "<style>\n" + STYLE_CSS + "\n" + STYLE_NAV_CSS + "\n</style>\n"
+    + "<style>\n" + STYLE_CSS + "\n" + STYLE_NAV_CSS + "\n"
+    + STYLE_WORKBENCH_CSS + "\n" + STYLE_USABILITY_CSS + "\n"
+    + STYLE_CHAT_CSS + "\n</style>\n"
     + "<script>\n"
     # 顺序要紧：core 提供 helper，vision/chat 依赖它，boot 最后接线并启动。
     + "\n\n".join(
@@ -64,12 +80,22 @@ INDEX_HTML = (
             # nav 提供「更多」下拉开合与 MENU_VIEWS；boot 的 load() 引用
             # closeMore / MENU_VIEWS，所以排在 boot 之前（同一块脚本内运行期调用）。
             JS_NAV,
+            # compact 提供简洁模式开关；模块加载时 compactInit() 就把按钮挂进
+            # nav（脚本在 body 之后，DOM 已就绪），只依赖 core 的 $/el。
+            JS_COMPACT,
             JS_VISION,
             # chat_store 提供 chatDay/chatLoad/chatSave/clearHistory 与
             # lastItemIds —— JS_CHAT 与 JS_CHAT_SELECT 都直接用它们，
             # 所以排在 chat 之前。
             JS_CHAT_STORE,
             JS_CHAT,
+            # chat_search 提供 chatSearchOpen（buildBar 的搜索按钮 onclick 用），
+            # 依赖 JS_CHAT 建立的 #chatlog / .msg .bubble 结构。
+            JS_CHAT_SEARCH,
+            # onboard 提供 renderChatWelcome（renderChatShell 空对话时调）。
+            # 只依赖 core 的 $/el/esc 与 chat 建立的 #chatlog；声明提升让
+            # 顺序无关，仍按依赖写在 chat 之后。
+            JS_ONBOARD,
             # chat_select 只依赖 JS_CHAT 的 history_/chatSave 与 JS_CORE 的
             # el/toast/load；loadChat 末尾会调它的 chatPickPaint，所以必须
             # 在 JS_BOOT 之前进页面。
@@ -77,6 +103,8 @@ INDEX_HTML = (
             # settings_llm 在 settings 之前：后者要调前者的 renderLlmSection。
             # （函数声明会提升，所以其实反了也能跑，但顺序按依赖写，别让人猜。）
             JS_SETTINGS_LLM,
+            # settings_groups 提供分组标题 helper（renderSettings 里调）。
+            JS_SETTINGS_GROUPS,
             JS_SETTINGS,
             JS_DETAIL,
             # contacts 提供 renderContacts/openContact（关系视图，boot 分发
@@ -99,6 +127,12 @@ INDEX_HTML = (
             # 只用 JS_CORE 的 helper + js_contacts 的 openContact，必须在
             # JS_BOOT 之前进页面。
             JS_MODEL,
+            # week 提供 renderWeek（boot 分发 data-view=week 用）。只用 JS_CORE
+            # 的 el/esc/api，但必须在 JS_BOOT 之前进页面。
+            JS_WEEK,
+            # harness（V1.143）提供 renderHarness（boot 分发 data-view=harness
+            # 用）。只依赖 JS_CORE 的 el/esc/api，必须在 JS_BOOT 之前进页面。
+            JS_HARNESS,
             # artifact 提供 artifactBar（验收按钮），由 JS_DETAIL 的
             # renderTask 调用 —— 用的是 js_detail 里的 post/toast/openTask。
             # 声明提升让顺序无关，写成依赖序。
@@ -114,7 +148,7 @@ INDEX_HTML = (
             # 两块之间顺序按依赖写（声明会提升，反了也能跑，别让人猜）。
             JS_OC_CARDS,
             JS_OC_SELECTION,
-            # delegate_live 提供 mountLivePanel（编程页签最上面那块面板）。
+            # delegate_live 提供 mountLivePanel（委派总览页最上面那块面板）。
             # 它只用 JS_CORE 的 el/esc/api/toast，但 oc_selection 会调它 ——
             # 声明提升让顺序无关，这里按依赖写在 oc_selection 之后。
             JS_DELEGATE_LIVE,
@@ -130,9 +164,24 @@ INDEX_HTML = (
             # el/esc/api/toast 与 JS_DETAIL 的 post，必须在 JS_BOOT 之前
             # （boot 会调 wbStopPoll / loadWorkbench）。
             JS_WORKBENCH,
+            # workbench_side 提供 wbSidePaint（wbPaint 末尾会调它填 #wb-side），
+            # 只依赖 core 的 $/el/esc；放在 workbench 之后、page 装配之前。
+            JS_WORKBENCH_SIDE,
             JS_WORKBENCH_CARD,
             JS_WORKBENCH_DIRS,
             JS_WORKBENCH_PROJECTS,
+            # workbench_rail（V1.139）读 projects 那四个状态变量，画左栏与
+            # 「累积了什么」，故排在它后面、装配页之前。
+            JS_WORKBENCH_RAIL,
+            # workbench_intake 提供 wbIntakeMount（page 装配时调），只依赖
+            # core 的 el/$/toast 与 detail 的 post；排在 rail 之后、装配页之前。
+            JS_WORKBENCH_INTAKE,
+            # workbench_files（V1.142）提供 wbSideMount（把右栏拆成产物块与
+            # 文件块）与 wbFilesPaint（wbLoadProjects 末尾调）；shell 提供
+            # wbRunNote / wbZenBoot（装配末尾调）。两者都只依赖 core 的
+            # $/el/esc/api 与 side 的 wbReveal，排在装配页之前。
+            JS_WORKBENCH_FILES,
+            JS_WORKBENCH_SHELL,
             JS_WORKBENCH_PAGE,
             JS_BOOT,
         )

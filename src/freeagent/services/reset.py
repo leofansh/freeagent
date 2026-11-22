@@ -84,7 +84,7 @@ WIPE_ORDER: tuple[str, ...] = (
 )
 
 #: 备份文件名后缀。跟随用户机器上已有的 ``.bak-*`` 习惯
-#:（``~/.freeagent`` 下一批 agent.db.bak-*）。
+#:（状态目录下一批 agent.db.bak-*，默认 ``~/.steward``）。
 _BACKUP_TAG = "bak-factory"
 
 #: 每日滚备的文件名后缀（12.11.2 / V1.39）。**独立于 bak-factory**：

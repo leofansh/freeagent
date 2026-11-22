@@ -30,7 +30,7 @@ from __future__ import annotations
 __all__ = ["JS_DELEGATE_LIVE"]
 
 JS_DELEGATE_LIVE = r"""
-// 轮询句柄与签名。**模块级**是有意的：页面只有一个「编程」页签，
+// 轮询句柄与签名。**模块级**是有意的：页面只有一个「委派总览」页，
 // 而计时器必须活过一次 render（render 返回后 root 里才有那个盒子）。
 let liveTimer = null;
 let liveSig = "";

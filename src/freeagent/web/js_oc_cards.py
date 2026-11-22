@@ -1,4 +1,4 @@
-"""编程页签的两张动作卡：日常可选模型清单 + 派发事务。
+"""委派总览页的两张动作卡：日常可选模型清单 + 派发事务。
 
 ## 为什么从 :mod:`js_oc_selection` 拆出来
 
@@ -54,7 +54,7 @@ function ocCurationView(curated, repaint) {
   box.innerHTML = head;
   if (!available.length) {
     box.appendChild(el("div", "note",
-      "现在读不到可用的模型（OpenCode 没起来，或没有已连接凭据的 provider）。"));
+      "现在读不到可用的模型（后台引擎没起来，或没有已连接凭据的 provider）。"));
     return box;
   }
 
@@ -100,12 +100,12 @@ function ocCurationView(curated, repaint) {
   box.appendChild(details);
   box.appendChild(el("div", "hint",
     "清单<strong>只影响 FreeAgent 的选择器</strong>（飞书 + 这里）。" +
-    "OpenCode Desktop 里仍然是你自己的那份 —— 两边各管各的，" +
-    "FreeAgent 不会去改 OpenCode 的配置（那是 Desktop 的文件，" +
+    "桌面端里仍然是你自己的那份 —— 两边各管各的，" +
+    "FreeAgent 不会去改引擎的配置（那是桌面端的文件，" +
     "两个进程抢一个配置文件迟早互相覆盖）。<br>" +
     "「连接提供商 / 配 API Key」也不在这里做：" +
-    "OpenCode 那个接口会返回明文 Key，而这个页面没有鉴权（只监听回环）。" +
-    "配凭据请在 OpenCode 里做。"));
+    "引擎那个接口会返回明文 Key，而这个页面没有鉴权（只监听回环）。" +
+    "配凭据请在引擎的桌面端里做。"));
   return box;
 }
 
@@ -129,7 +129,7 @@ function ocDispatchView(data, root, repaint) {
     if (!brief) { toast("先说一句要做的事"); return; }
     if (/[\r\n]/.test(brief)) {
       // 服务端也会挡，但这里先说 —— 免得用户莫名其妙看到失败。
-      toast("需求要写成一行（换行会让 opencode 判成复杂任务然后失败）");
+      toast("需求要写成一行（换行会被判成复杂任务然后失败）");
       return;
     }
     btn.disabled = true;
@@ -165,7 +165,7 @@ function ocDispatchView(data, root, repaint) {
             // 成功分支同样要防抛：两支互不兜底，抛了就是「点了没反应」。
             try {
               go.textContent = "已开始";
-              st.textContent = "执行器会接手（它得在跑：python -m freeagent.delegate）";
+              st.textContent = "执行器会接手（先在「后台服务」里确认它在跑）";
               toast("已开始 —— 进度与授权卡会出现在本页顶部的面板里");
             } catch (err2) {
               st.textContent = "开始失败：" + err2.message;
@@ -196,7 +196,7 @@ function ocDispatchView(data, root, repaint) {
 
   box.appendChild(el("div", "hint",
     "<strong>建了事务 ≠ 已经在跑。</strong> 建好后点「开始做」，执行器（独立进程）" +
-    "才会接手 —— 它得在跑（python -m freeagent.delegate）。<br>" +
+    "才会接手 —— 先在「后台服务」里确认它在跑。<br>" +
     "开始之后，上面那块面板会实时显示进度、每次动手要你批的授权卡、" +
     "以及它反问你的问题。飞书那边是同一套卡（两个界面互不干扰）。<br>" +
     "<strong>授权不会因为你没看面板就通过</strong> —— 沉默按拒绝算，" +

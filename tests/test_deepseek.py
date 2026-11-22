@@ -603,7 +603,7 @@ class TestConfigTakesEffect:
         (data_dir / "config.json").write_text(
             json.dumps({"energy_windows": False}), encoding="utf-8"
         )
-        monkeypatch.setenv("FREEAGENT_HOME", str(home_dir))
+        monkeypatch.setenv("STEWARD_HOME", str(home_dir))
         app = build_app(data_dir / "agent.db")
         try:
             assert app.energy_windows is None, "库旁的配置应覆盖 HOME 的"

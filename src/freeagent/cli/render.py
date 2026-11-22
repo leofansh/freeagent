@@ -229,6 +229,35 @@ def render_week(view: WeekView, names: dict[str, str]) -> str:
     else:
         lines.append("成长目标：还没记过 —— 用 /remember 记一条（如「今年把英语练到能开会」）。")
 
+    # V1.133：拍板 / 承诺 / 工作台痕迹。三项都是「本周做过的事」，
+    # 刻意放在事务分区之后 —— 它们回答的不是「还有什么没做」，而是
+    # 「这一周我实际做了什么决定、许了什么诺、动过几次手」。
+    # 拍板只摆**逐字冻结**的 conflict_text / reason_text，不解析 options_json
+    # （解析结构化快照 = 把字段名变成契约，且会随格式变动而漂）。
+    lines.append("")
+    if view.decisions:
+        lines.append(f"本周拍板 {len(view.decisions)} 件（当时记下的原话）:")
+        for d in view.decisions:
+            why = f" —— 因为：{d.reason_text}" if d.reason_text else ""
+            lines.append(f"  · {d.conflict_text}{why}")
+    else:
+        lines.append("本周拍板：没有拍过板。")
+
+    lines.append("")
+    if view.promises:
+        lines.append(f"本周许下的承诺 {len(view.promises)} 件（仍未兑现）:")
+        for promise in view.promises:
+            due = f" —— 承诺 {promise.promised_for}" if promise.promised_for else ""
+            lines.append(f"  · {promise.statement}{due}")
+    else:
+        lines.append("本周承诺：没有新许下的承诺。")
+
+    lines.append("")
+    lines.append(
+        f"本周交给引擎 {view.turn_count} 轮"
+        if view.turn_count else "本周没有交给引擎的轮次。"
+    )
+
     lines.append("")
     lines.append("这些是事实，不是建议 —— 要改什么，由你决定。")
     return "\n".join(lines)

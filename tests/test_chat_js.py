@@ -185,6 +185,48 @@ class TestStaleDateRefreshOnReplay:
         )
 
 
+class TestChipsHistoryPurge:
+    """新消息发出时，退役的建议行必须从历史里一起撤（V1.130）。
+
+    复现：上一轮答复的建议按钮在发问时被从 DOM 摘掉，但 ``history_`` 里
+    那条 ``chips`` 没撤；点「刷新」整段重放，退役建议行按老位置插回消息
+    中间，历史看上去乱了。DOM 与 history_ 必须保持 1:1。
+    """
+
+    def test_send_purges_old_chips_from_history(self):
+        body = _body("sendChat")
+        assert 'history_.filter((m) => m.who !== "chips")' in body, (
+            "发新消息时应把旧 chips 条目从 history_ 撤掉"
+        )
+        assert "chatSave(history_)" in body, "撤掉后必须落盘，否则刷新又读回旧行"
+
+    def test_send_still_clears_chips_dom(self):
+        body = _body("sendChat")
+        assert 'querySelectorAll(".chips")' in body, (
+            "旧建议按钮仍要从 DOM 摘掉（历史撤掉是配套，不是替代）"
+        )
+
+
+class TestChipsFillInput:
+    """快捷提示词点一下应填进输入框供人改，而不是直接发出去（V1.132）。
+
+    豆包/WorkBuddy 的场景标签是「起个头」——点完还能编辑再发。旧实现
+    ``b.onclick = () => sendChat(s)`` 一点就发，人来不及改，也体会不到
+    「这是给我填的模板」。改填框后必须 focus 并触发 input，让后续依赖
+    textarea 内容的逻辑（如发送按钮置灰）同步刷新。
+    """
+
+    def test_chip_fills_input_instead_of_sending(self):
+        body = _body("addChips")
+        assert 'b.onclick = () => { const ta = $("#chatinput")' in body, (
+            "建议按钮应把文字填进 #chatinput，而不是直接发"
+        )
+        assert "ta.value = s" in body, "要把建议原文填进输入框"
+        assert "ta.focus()" in body, "填完要聚焦，人才知道接着能改"
+        assert 'new Event("input")' in body, "触发 input 让按钮状态等联动逻辑刷新"
+        assert "sendChat(s)" not in body, "填框路径不得顺手把消息发出去"
+
+
 # =============================================================================
 # 对话多选删除（js_chat_select.py）
 # =============================================================================

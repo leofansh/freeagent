@@ -25,10 +25,18 @@ window.addEventListener("unhandledrejection", (ev) => {
 async function refreshHeader() {
   try {
     const h = await api("/api/health");
-    $("#hdr").textContent =
-      "智能层 " + h.llm + (h.key_configured ? "（已配 Key）" : "（规则层）") +
-      (h.energy_windows ? " · 精力档位已启用" : "");
-  } catch (e) { /* 状态栏失败不影响主功能 */ }
+    // 头部只说"降级"这一件值得占首屏的事：全绿时留空。
+    // "已配 Key / 精力档位已启用"是配一次就不再变的静态回显，
+    // DeepSeekProvider 更是内部实现类名（且名字本身是历史遗留错名），
+    // 都不该常驻头部。判据用实现名不用 key_configured：Ollama 这类本机
+    // 服务不需要 Key，凭据判据为真会把它误报成"未配置"。
+    $("#hdr").textContent = h.llm === "RuleBasedProvider"
+      ? "当前规则层（离线）：角色判断与草稿为模板"
+      : "";
+  } catch (e) {
+    // 读不到状态就留空，不把上一次的降级告警当成当前事实继续挂着。
+    $("#hdr").textContent = "";
+  }
   await refreshBadges();
 }
 
@@ -89,8 +97,9 @@ async function load(next) {
     if (view === "chat") {
       await loadChat();
       if (superseded()) return;
-      // 首屏也要刷头部状态：规则层 / 已配 Key 与其它视图一致可见，
-      // 不能只有进了设置页才知道自己在降级。
+      // 首屏欢迎区由 renderChatShell 直接摆（V1.145），这里不再单独插引导卡。
+      // 首屏也要刷头部状态：规则层降级与其它视图一致可见，
+      // 不能只有进了设置页才知道自己在降级（全绿时头部留空）。
       await refreshHeader();
       return;
     }
@@ -102,7 +111,7 @@ async function load(next) {
       return;
     }
     if (view === "oc") {
-      // 编程页签：四段选择 + 日常可选模型。选项来自 /api/oc/options，
+      // 委派总览页：四段选择 + 日常可选模型。选项来自 /api/oc/options，
       // 与飞书那四张卡同一个来源（services/oc_discovery）。
       loadOcSelection(root);
       return;
@@ -184,6 +193,14 @@ async function load(next) {
       // 画像视图：节奏 / 关系 / 承诺 三面（11.17 / V1.59）。
       // 提前 return，不加新建表单 —— 只读聚合，只摆事实。
       await renderModel(root);
+      if (superseded()) return;
+      return;
+    }
+    // 周回顾（V1.133）与 Harness（V1.143）同构：都只读摆事实、提前 return
+    // 不加新建表单 —— 这一页不是事务入口。合并成一条分支是因为本文件撞
+    // 250 行上限（TestWebPackageStaysSmall 守着），不是两页有别的共性。
+    if (view === "week" || view === "harness") {
+      await (view === "week" ? renderWeek(root) : renderHarness(root));
       if (superseded()) return;
       return;
     }

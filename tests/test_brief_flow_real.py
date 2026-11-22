@@ -219,7 +219,7 @@ def test_project_outside_whitelist_is_refused(wired):
 
 
 def test_selection_drift_blocks_create(wired):
-    """arm 之后选型被别处改掉（Web 编程页）→ 提示重选，**不建**。
+    """arm 之后选型被别处改掉（Web 委派总览页）→ 提示重选，**不建**。
 
     确认卡上回显的模型必须是**真正会用的那个**；两者不一致却照建，
     用户点的是 A、系统干的是 B。

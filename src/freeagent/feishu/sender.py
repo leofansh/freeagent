@@ -1046,18 +1046,27 @@ def _tool_card(subject: str, detail: str, credential: str) -> dict[str, Any]:
             # plain_text 不解析 markdown，原来的「**这一个**」会原样印出来。
             {"tag": "note", "elements": [{"tag": "plain_text", "content":
                   "不点就算拒绝 —— 沉默不等于同意。"}]},
-            # 三个按钮，**顺序与语义都要说清**（设计文档 12.7.2）：
-            #   允许 / 拒绝 —— 只针对**这一个动作**，agent 还能换个方向继续
+            # 四个按钮，**顺序与语义都要说清**（设计文档 12.7.2）：
+            #   允许这一次 / 拒绝 —— 只针对**这一个动作**，agent 还能换个方向继续
+            #   本会话内允许此类 —— 本会话（= 这一次委派，函数返回即失效）内
+            #     同种动作（permission）不再问；换一种动作仍会弹卡。V1.138。
             #   停止这条委派 —— 中止**整条**，会话作废
             #
             # 「拒绝」与「停止」是两件事，混为一谈会让用户以为自己已经
             # 停掉了，而 agent 还在继续改代码 —— 那比没有这个按钮糟得多。
-            # 所以第三个按钮**必须有**。
+            # 所以「停止」这个按钮**必须有**。
+            #
+            # 「本会话内允许」用 default 而非 primary：它是**扩大授权**的那枚，
+            # 不该比「允许这一次」更显眼 —— 默认朝拒绝倒（12.7.2）。
             {"tag": "action", "actions": [
                 {"tag": "button",
                  "text": {"tag": "plain_text", "content": "允许这一次"},
                  "type": "primary",
                  "value": {"action": "allow_once", "id": credential}},
+                {"tag": "button",
+                 "text": {"tag": "plain_text", "content": "本会话内允许此类"},
+                 "type": "default",
+                 "value": {"action": "allow_session", "id": credential}},
                 {"tag": "button",
                  "text": {"tag": "plain_text", "content": "拒绝这一步"},
                  "type": "default",
@@ -1746,7 +1755,7 @@ def brief_prompt_card(subject: str, *, chat_id: str) -> dict[str, Any]:
             {"tag": "div", "text": {"tag": "lark_md", "content": (
                 "请用**一句话**说清要做的事，例如：\n"
                 "「修一下登录页在窄屏下的按钮错位」。\n"
-                "必须是**单行** —— 多行简报会被 opencode 判成复杂任务，"
+                "必须是**单行** —— 多行简报会被判成复杂任务，"
                 "升级到强模型、无视你选的模型，必然失败。")}},
             {"tag": "action", "actions": [
                 {"tag": "button",

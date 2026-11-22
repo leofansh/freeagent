@@ -2,7 +2,7 @@
 
 时间必须可注入，否则顺延、提醒、排序全都无法确定性测试。
 
-## 为什么要全局隔离 ``FREEAGENT_HOME``（回归）
+## 为什么要全局隔离 ``STEWARD_HOME``（回归）
 
 配置现在有**文件兜底**（``merged_env()``：环境变量优先，``feishu.env`` 补缺）。
 在那之前配置只来自环境变量，所以测试天然封闭。现在不隔离就会读到开发者
@@ -73,14 +73,14 @@ def _isolate_feishu_config(tmp_path_factory: pytest.TempPathFactory):
     import os
 
     home = tmp_path_factory.mktemp("feishu_home")
-    old_home = os.environ.get("FREEAGENT_HOME")
+    old_home = os.environ.get("STEWARD_HOME")
     old_port = os.environ.get("FEISHU_LOCK_PORT")
-    os.environ["FREEAGENT_HOME"] = str(home)
+    os.environ["STEWARD_HOME"] = str(home)
     os.environ["FEISHU_LOCK_PORT"] = str(_free_port())
     try:
         yield home
     finally:
-        for key, value in (("FREEAGENT_HOME", old_home),
+        for key, value in (("STEWARD_HOME", old_home),
                            ("FEISHU_LOCK_PORT", old_port)):
             if value is None:
                 os.environ.pop(key, None)
@@ -119,7 +119,7 @@ def _no_online_search_leg(monkeypatch: pytest.MonkeyPatch):
     这条腿读**进程环境变量**（每次检索现读，故意不缓存）。于是开发者本机
     一旦配了 ``FREEAGENT_ONLINE_SEARCH_URL``，所有走 ``/memory search`` 的
     测试都会真的往外发一次查询 —— 症状是测试变慢、依赖网络，而在没配的
-    机器上（CI）**永远看不出来**。与 ``FREEAGENT_HOME`` 那条同一个理由：
+    机器上（CI）**永远看不出来**。与 ``STEWARD_HOME`` 那条同一个理由：
     要等真的配过才发作的坑，就该在默认状态里堵掉。
 
     要测这条腿的用例自己 ``setenv`` 并注入 transport（永不联网）。

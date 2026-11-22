@@ -20,9 +20,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +32,7 @@ from ..domain import new_id
 from .clock import Clock, SystemClock
 from .engine_host import ENGINE_ASK, ENGINE_AUTO_DIR, one_line
 from .opencode_server import current_adapter
+from .permission_reply import deliver as deliver_reply
 from .tool_evidence import tool_evidence
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,9 @@ DEFAULT_MAX_TOOL_CALLS = 40
 #: 一轮最多跑多久（秒）。超了会**真的**叫停 —— 只报「超时」而不停的，
 #: 是把一个还在改文件的进程留在后台。
 DEFAULT_MAX_SECONDS = 600.0
+#: 挂起授权兜底拉取的间隔（秒）。主路径是实时事件流，轮询只兜「事件漏了」
+#: 这一种情况；间隔不用短 —— 真漏了，晚两三秒摆出来也比卡住没人管强。
+_RECOVER_INTERVAL = 3.0
 
 #: 步骤的三种状态。与一轮的五态**刻意不是同一套**：一轮是「这件事成没成」，
 #: 一步是「这个动作走完没有」。合并会让「读文件失败了但这一轮还活着」这种事
@@ -101,6 +105,11 @@ class AskCard:
     kind: str
     label: str
     detail: str = ""
+    #: 原始动作名（如 ``edit``）。「本会话内允许此类」用它当免问的 key
+    #: （V1.138）—— 不能用 ``label``，那是给显示的兜底文案（「请求授权」），
+    #: 拿它当 key 会把所有认不出动作名的请求归成一类，扩大授权就失控了。
+    #: 空串 = 认不出动作名，此时**不记入**免问集合（fail-closed 到每次都问）。
+    permission: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +179,12 @@ class _Turn:
         "context", "context_note",
         "answer", "decision", "stop_requested", "gate", "done", "ask_event",
         "started_dt", "started_at", "started_mono", "finished_mono",
+        #: call_id → steps 下标。**只在内存里配对，不落库**：步骤持久化只有
+        #: name/target/status 三字段（StepView.to_dict），id 是内部串联坐标。
+        "call_index", "seen_cards", "last_recover",
+        #: 本轮内「点过本会话内允许此类」的动作名集合（V1.138）。挂 _Turn
+        #: 上 = 一轮有效，与飞书「一次委派」边界对齐；换一轮重新问。
+        "session_allows",
     )
 
     def __init__(self, *, turn_id: str, text: str, directory: str, model: str,
@@ -215,6 +230,10 @@ class _Turn:
         self.started_at = started_dt.isoformat(timespec="seconds")
         self.started_mono = started_mono
         self.finished_mono = 0.0
+        self.call_index: dict[str, int] = {}
+        self.seen_cards: set[str] = set()
+        self.last_recover = 0.0
+        self.session_allows: set[str] = set()
 
 
 class AgentTurnService:
@@ -233,6 +252,8 @@ class AgentTurnService:
         max_seconds: float = DEFAULT_MAX_SECONDS,
         now: Callable[[], float] | None = None,
         clock: Clock | None = None,
+        # 「把答复送回引擎」的重试间隔可注入：失败路径的测试不真睡。
+        reply_sleep: Callable[[float], Any] | None = None,
     ) -> None:
         self._host = host
         self._repo = repo
@@ -240,6 +261,7 @@ class AgentTurnService:
         self._max_seconds = max_seconds
         self._now = now or time.monotonic
         self._clock = clock or SystemClock()
+        self._reply_sleep = reply_sleep or time.sleep
         self._lock = threading.RLock()
         self._turns: dict[str, _Turn] = {}
         self._active: str = ""
@@ -393,12 +415,17 @@ class AgentTurnService:
         """有没有「可以回访的历史」这件能力（而不是「历史里有没有东西」）。"""
         return self._repo is not None
 
-    def decide(self, turn_id: str, *, allow: bool, answer: str = "") -> bool:
+    def decide(self, turn_id: str, *, allow: bool, answer: str = "",
+               scope: str = "") -> bool:
         """人点了授权卡 / 答了提问。**只记账，不在这里发请求**。
 
         为什么不在 HTTP 线程里直接调 ``reply_permission``：那会把一次网络
         往返挂在服务端锁上，而"点了没反应"正是本仓反复防的那种症状。
         记录结论 + 唤醒执行线程，后者负责发。
+
+        ``scope="session"``（V1.138）表示人点的是「本会话内允许此类」：
+        在唤醒执行线程前先把这张卡的动作名记进本轮免问集合。只在 ``allow``
+        且动作名认得出（非空）时记 —— 空动作名不记，fail-closed 到每次都问。
         """
         with self._lock:
             turn = self._turns.get(turn_id)
@@ -406,6 +433,8 @@ class AgentTurnService:
                 return False
             turn.decision = "allow" if allow else "deny"
             turn.answer = answer
+            if allow and scope == "session" and turn.ask.permission:
+                turn.session_allows.add(turn.ask.permission)
             turn.gate.set()
             return True
 
@@ -452,19 +481,37 @@ class AgentTurnService:
                 directory=turn.directory, mode=turn.mode,
                 model=turn.model, agent=turn.agent, variant=turn.variant,
             )
+            # **先挂事件流，再发指令**：SSE 是 volatile 的，订阅前发出的帧会丢。
+            # 启动瞬间就失败（模型不可路由 / 额度没了）那一轮，终态帧在指令后
+            # 不到一秒就发出来；流要是 prompt 之后才建，这一帧就漏了，轮次只能
+            # 干等到总时长超时 —— 界面上一直「在跑」、步骤与正文全空、也停不掉。
+            budget = max(5.0, deadline - self._now())
+            events = self._host.events(timeout=budget)
             self._host.prompt(
                 one_line(_prompt_text(turn)), model=turn.model, agent=turn.agent,
                 variant=turn.variant,
             )
-            budget = max(5.0, deadline - self._now())
+            # 先发指令再捞一次挂起：起轮次前就等着的请求，事件流可能漏带。
+            turn.last_recover = self._now()
+            self._recover_pending(turn)
             reached_end = False
-            events = self._host.events(timeout=budget)
             try:
                 for kind, props in events:
                     self._on_event(turn, kind, props)
+                    with self._lock:
+                        stopped = turn.stop_requested
+                    if stopped:
+                        # 人点了停止：当场收成 stopped，不等到下一条事件 ——
+                        # 否则挂起答复把状态退回 running 后，收口会误判成 failed。
+                        self._set(turn, STOPPED, "你点了停止")
+                        reached_end = True
+                        break
                     if turn.status not in (RUNNING, WAITING):
                         reached_end = True
                         break
+                    if self._now() - turn.last_recover >= _RECOVER_INTERVAL:
+                        turn.last_recover = self._now()
+                        self._recover_pending(turn)
                     if self._now() >= deadline:
                         self._fail(turn, "总时长超限 —— 已叫停（它可能还在改文件，所以必须真的停）")
                         self._host.abort()
@@ -492,11 +539,28 @@ class AgentTurnService:
             self._fail(turn, _error_text(props))
             return
         if kind == "session.idle":
+            # idle 不是一律「完成」：V2 的 idle 消息带 ``outcome``，failed /
+            # interrupted 都混在这个事件族里。不看 outcome 就把失败报成完成，
+            # 正是「它说做完了、其实没做完」那一类静默失效。
+            outcome = _idle_outcome(props)
+            if outcome == "failed":
+                self._fail(turn, _error_text(props))
+                return
+            if outcome == "interrupted":
+                self._set(turn, STOPPED, "引擎被中断")
+                return
             self._set(turn, DONE, "完成")
             return
         # 工具步骤**先认**：``message.part.updated`` 既可能是文本块，也可能是
         # 一个 tool part —— 先按文本处理的话，带 ``part.type=="tool"`` 的
         # 事件会被当成「没有正文」，步骤就永远记不上（静默丢）。
+        #
+        # 内部工具事件名（``tool`` / ``tool.started`` / ``tool.done``）先按
+        # 路由走：V2 的 called / done 帧不带工具名、没有 part，靠
+        # ``tool_evidence`` 认形状会被挡在门外，那三段只能按事件名进来。
+        if kind in ("tool", "tool.started", "tool.done"):
+            self._on_tool(turn, kind, props, tool_evidence(kind, props))
+            return
         evidence = tool_evidence(kind, props)
         if evidence is not None:
             self._on_tool(turn, kind, props, evidence)
@@ -516,9 +580,13 @@ class AgentTurnService:
                  evidence: Any) -> None:
         """记一步。
 
-        **数调用次数只认 ``tool``**：``tool.started`` / ``message.part.updated``
-        描述的是同一次调用的另两个时点，一起数会让 40 次上限提前用完——
-        症状是「活干到一半被叫停」，而日志里看着像真超了。
+        **数调用次数只认 ``tool``**：``tool.started`` / ``tool.done`` /
+        ``message.part.updated`` 描述的是同一次调用的另两个时点，一起数会让
+        40 次上限提前用完——症状是「活干到一半被叫停」，而日志里看着像真超了。
+
+        **配对优先按 ``call_id``**（V2 真机 2.0.29：name 只在 started、参数在
+        called、结果在 success/failed，三段各带同一个 ``id``）。没有 id 的 V1
+        形状才退回「最后一行同名同目标」合并。
         """
         over = ""
         if kind == "tool":
@@ -533,25 +601,46 @@ class AgentTurnService:
             self._fail(turn, over)
             self._host.abort()
             return
-        name = evidence.tool
-        with self._lock:
-            if not turn.tools or turn.tools[-1] != name:
-                turn.tools.append(name)
-        target = evidence.target
+
+        call_id = props.get("call_id") if isinstance(props, dict) else None
         status = _step_status(kind, props)
+
         with self._lock:
+            idx = turn.call_index.get(call_id) if isinstance(call_id, str) else None
+            if idx is not None and idx < len(turn.steps):
+                # 同一次调用的后段（called 补目标 / done 收终态）：回到早先那行。
+                row = turn.steps[idx]
+                name = evidence.tool if evidence is not None else ""
+                name = name or row.name
+                merged = dict(props)
+                merged.setdefault("tool", name)
+                ev = tool_evidence(kind, merged)
+                target = (ev.target if ev else "") or row.target
+                turn.steps[idx] = StepView(name=name, target=target, status=status)
+                return
+
+            name = evidence.tool if evidence is not None else ""
+            if not isinstance(name, str) or not name:
+                # 完成态丢了开始帧、又认不出名字：不编一个名字硬列一行。
+                return
+            merged = dict(props)
+            merged.setdefault("tool", name)
+            ev = tool_evidence(kind, merged)
+            target = ev.target if ev else ""
+
             same = (
-                turn.steps
+                bool(turn.steps)
                 and (turn.steps[-1].name, turn.steps[-1].target) == (name, target)
             )
+            if not turn.tools or turn.tools[-1] != name:
+                turn.tools.append(name)
             step = StepView(name=name, target=target, status=status)
             if same:
-                # 同一个（名字, 目标）连着来两次 = 同一次调用的开始与结束。
-                # **更新状态而不是再记一行** —— 否则界面上会出现两条一样
-                # 的步骤，人以为它把同一件事做了两遍。
                 turn.steps[-1] = step
             else:
                 turn.steps.append(step)
+                if isinstance(call_id, str) and call_id:
+                    turn.call_index[call_id] = len(turn.steps) - 1
 
     def _apply_text(self, turn: _Turn, kind: str, props: Any) -> None:
         if not isinstance(props, dict):
@@ -568,7 +657,7 @@ class AgentTurnService:
             # 整块替换而不是拼接：``message.part.updated`` 给的是**整段**，
             # 拼接会让同一段出现两遍（V1 踩过，症状是正文越来越长）。
             with self._lock:
-                turn.text = whole
+                turn.text = _strip_reference_markers(whole)
 
     def _handle_permission(self, turn: _Turn, props: Any) -> None:
         request = current_adapter().parse_request(props)
@@ -579,9 +668,37 @@ class AgentTurnService:
             self._host.abort()
             return
         detail = "、".join(request.paths[:3]) if request.paths else ""
+        with self._lock:
+            if request.request_id in turn.seen_cards:
+                return
+            turn.seen_cards.add(request.request_id)
+            session_hit = bool(
+                request.permission and request.permission in turn.session_allows
+            )
+        if session_hit:
+            # 本轮内此类动作已放行 → 直接送 allow 回引擎，不挂卡、不置 WAITING
+            # （V1.138）。**必须真的回一句 allow**：只跳过不回，引擎那边仍挂着
+            # 请求，又变成「点了没反应」卡到超时 —— 与 #5 同一类失效。
+            self._note(
+                turn,
+                f"本会话内已放行同类动作（{request.permission}）—— 直接放行，不再问",
+            )
+            _reply = deliver_reply(
+                lambda: self._host.reply_permission(request.request_id, "allow"),
+                sleep=self._reply_sleep,
+            )
+            if not _reply.ok:
+                self._note(
+                    turn,
+                    f"自动放行没能送回引擎（{_reply.error}）—— 已停住本轮",
+                )
+                self._fail(turn, f"授权结论没能送回引擎：{_reply.error}")
+                self._host.abort()
+            return
         card = AskCard(
             request_id=request.request_id, kind="permission",
             label=request.permission or "请求授权", detail=detail,
+            permission=request.permission or "",
         )
         if turn.mode == ENGINE_AUTO_DIR:
             # 自动档下**本该一条都不来**。来了说明覆盖层没生效 ——
@@ -590,8 +707,19 @@ class AgentTurnService:
                 turn,
                 "本目录自动档下引擎仍来问了一次 —— 权限配置可能没生效，已按拒绝处理",
             )
-            with contextlib.suppress(Exception):
-                self._host.reply_permission(request.request_id, "deny")
+            # 自动档下这条授权本就不该来。拒答要真的送回去 —— 吞掉异常等于
+            # 引擎还挂着请求，而界面上「已按拒绝处理」是本轮唯一的说法。
+            _reply = deliver_reply(
+                lambda: self._host.reply_permission(request.request_id, "deny"),
+                sleep=self._reply_sleep,
+            )
+            if not _reply.ok:
+                self._note(
+                    turn,
+                    f"自动档下拒答也没能送回引擎（{_reply.error}）—— 已停住本轮",
+                )
+                self._fail(turn, f"授权结论没能送回引擎：{_reply.error}")
+                self._host.abort()
             return
         self._ask_and_reply(turn, card, permission_reply=request.request_id)
 
@@ -612,8 +740,42 @@ class AgentTurnService:
             self._fail(turn, "引擎在等你回答问题，但没有拿到答案 —— 已中止")
             self._host.abort()
             return
-        with contextlib.suppress(Exception):
-            self._host.reply_question(question.request_id, [[answer]])
+        # 回答送不到 = 引擎还挂着那个问题。此前 suppress 吞掉，界面上却是
+        # 「已答复」—— 与授权那侧同一种「看起来在工作」的失效。
+        _reply = deliver_reply(
+            lambda: self._host.reply_question(question.request_id, [[answer]]),
+            sleep=self._reply_sleep,
+        )
+        if not _reply.ok:
+            self._note(turn, f"你的回答没能送回引擎（{_reply.error}）—— 已停住本轮")
+            self._fail(turn, f"回答没能送回引擎：{_reply.error}")
+            self._host.abort()
+
+    def _recover_pending(self, turn: _Turn) -> None:
+        """兜底：把实时事件漏掉的挂起授权捞出来摆成卡。
+
+        与事件流走同一份 ``parse_request`` 判据；认不出的挂起项在这里跳过
+        （不在兜底里 Fail 整轮 —— 那是主路径收到坏载荷时的处置）。已挂过卡 /
+        已应答过的 rid 不重复摆。
+        """
+        if turn.status not in (RUNNING, WAITING):
+            return
+        try:
+            pending = self._host.pending_permissions(directory=turn.directory)
+        except Exception:  # noqa: BLE001 - 兜底查询失败不阻断这一轮
+            return
+        adapter = current_adapter()
+        for props in pending:
+            request = adapter.parse_request(props)
+            if request is None:
+                continue
+            rid = request.request_id
+            with self._lock:
+                if rid in turn.seen_cards:
+                    continue
+            # 登记进 seen_cards 由 ``_handle_permission`` 统一做；这里先登记
+            # 会让内部去重把刚要摆的卡自己跳过。
+            self._handle_permission(turn, props)
 
     def _ask_and_reply(self, turn: _Turn, card: AskCard,
                        *, permission_reply: str | None = None) -> str:
@@ -648,8 +810,20 @@ class AgentTurnService:
             turn.ask = None
             turn.status = RUNNING
         if permission_reply is not None:
-            with contextlib.suppress(Exception):
-                self._host.reply_permission(permission_reply, decision)
+            # 卡面已经画了「已允许 / 已拒绝」，这是人能看到的唯一结论；
+            # 若它没送回引擎，引擎会一直等 —— 必须让这一轮停在这里并说出来，
+            # 不能让「点过了」变成「生效了」。
+            _reply = deliver_reply(
+                lambda: self._host.reply_permission(permission_reply, decision),
+                sleep=self._reply_sleep,
+            )
+            if not _reply.ok:
+                self._note(
+                    turn,
+                    f"你批了，但没能送回引擎（{_reply.error}）—— 已停住本轮",
+                )
+                self._fail(turn, f"授权结论没能送回引擎：{_reply.error}")
+                self._host.abort()
             return decision
         return answer if decision == "allow" else ""
 
@@ -671,6 +845,22 @@ class AgentTurnService:
             if note not in turn.notes:
                 turn.notes.append(note)
 
+    def _close_steps_locked(self, turn: _Turn) -> None:
+        """轮次收口时把还停在 running 的步骤补终态。
+
+        真机 2.0.29 曾出现：完成事件一条都没被认到，15 条步骤全卡「进行中」，
+        而轮次已经是完成。但**完成态没有完成证据不往完成倒**（本仓纪律：往
+        「还没完」倒）——所以只在失败 / 停止时把未竟步骤记 failed；正常完成
+        仍停在 running 的步骤，说明我们没看到它收尾，不替它判完成。
+        """
+        if turn.status not in (FAILED, STOPPED):
+            return
+        turn.steps = [
+            StepView(name=s.name, target=s.target,
+                     status=STEP_FAILED if s.status == STEP_RUNNING else s.status)
+            for s in turn.steps
+        ]
+
     def _finish(self, turn: _Turn) -> None:
         with self._lock:
             if turn.status in (RUNNING, WAITING):
@@ -682,6 +872,7 @@ class AgentTurnService:
                 turn.status = STOPPED
                 turn.reason = turn.reason or "你点了停止"
             turn.finished_mono = self._now()
+            self._close_steps_locked(turn)
         # 先落库再放信号：``wait()`` 返回时，库里已经是终态 —— 否则测试与
         # 「点开最近那件事」会读到一个还在 running 的旧行（看起来在工作）。
         self._persist_finish(turn)
@@ -715,7 +906,8 @@ class AgentTurnService:
         elapsed = round(max(0.0, turn.finished_mono - turn.started_mono), 1)
         try:
             self._repo.finish(
-                turn.turn_id, status=turn.status, text=turn.text,
+                turn.turn_id, status=turn.status,
+                text=_strip_reference_markers(turn.text),
                 reason=turn.reason, notes=list(turn.notes),
                 tools=list(turn.tools),
                 steps=[s.to_dict() for s in turn.steps],
@@ -738,7 +930,7 @@ class AgentTurnService:
             return TurnView(
                 turn_id=turn_id,
                 status=str(row.get("status") or FAILED),
-                text=str(row.get("text") or ""),
+                text=_strip_reference_markers(str(row.get("text") or "")),
                 brief=str(row.get("brief") or ""),
                 tools=tuple(tools or ()),
                 steps=tuple(steps or ()),
@@ -785,6 +977,8 @@ def _step_status(kind: str, props: Any) -> str:
     """
     part = props.get("part") if isinstance(props, dict) else None
     state = part.get("state") if isinstance(part, dict) else None
+    if state is None and isinstance(props, dict):
+        state = props.get("state")
     raw = state.get("status") if isinstance(state, dict) else None
     if isinstance(raw, str):
         mapped = _STEP_STATUS_ALIASES.get(raw.strip().lower())
@@ -805,6 +999,22 @@ def _prompt_text(turn: _Turn) -> str:
     if not turn.context:
         return turn.brief
     return f"{turn.brief} [上下文] {turn.context}"
+
+
+#: 引擎正文里残留的孤立引用编号标记（形如 ``@17@``）。真机 2.0.29 上模型把
+#: 消息 / 部件序号写成这个串透出来，界面上没有对应链接，纯噪音。只剥
+#: ``@纯数字@``，不误伤正文里的邮箱或 @提及。
+_REF_MARKER = re.compile(r"@\d+@")
+
+
+def _strip_reference_markers(text: str) -> str:
+    """剥掉正文里的 ``@数字@`` 占位标记，并清掉残留的空行 / 行尾空格。"""
+    if not text:
+        return text
+    cleaned = re.sub(rf"[ \t]*{_REF_MARKER.pattern}[ \t]*", "", text)
+    cleaned = re.sub(r"[ \t]+(\n)", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _decode_steps(raw: Any) -> list[StepView] | None:
@@ -853,6 +1063,18 @@ def _decode_list(raw: Any) -> list[str] | None:
     if not isinstance(loaded, list):
         return None
     return [str(x) for x in loaded]
+
+
+def _idle_outcome(props: Any) -> str:
+    """读 idle 事件的 ``outcome``（``succeeded`` / ``failed`` / ``interrupted``）。
+
+    认不出 / 没带时返回空串：旧版本与 V1 的 idle 不带这个字段，按「完成」
+    兜底；不把缺字段猜成 failed。
+    """
+    if not isinstance(props, dict):
+        return ""
+    value = props.get("outcome")
+    return str(value).strip().lower() if isinstance(value, str) else ""
 
 
 def _error_text(props: Any) -> str:
