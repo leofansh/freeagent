@@ -133,8 +133,9 @@ function renderChatShell(menu) {
   chatToolsMount();
   chatShellMount();  // V1.154：左工作区 / 右产物三栏外壳
   // wrap 早就挂到 root 上了（见上面那行），这里只补输入框。
-  // 页脚只留契约要求的免责标记；能力边界已在欢迎区说过，不必每行重复。
-  $("#foot").textContent = "启发式提示，不是评分 —— 助手不替你决定先做哪个。";
+  // 页脚不摆这两句话（V1.158）：能力边界在欢迎区（menu.notice），免责标记
+  // 只在真正排序的「今天 / 事务」页脚出现（renderList 用 data.disclaimer）。
+  // 都不是关键动作信息，放在输入栏下面只是噪音。
   $("#chatinput").focus();
 }
 
