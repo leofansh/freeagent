@@ -81,6 +81,22 @@ class TestPrefsSaveEndpoint:
         saved = endpoints_agent._prefs_save(app, {"model": "m1", "evil": "x"})
         assert saved["kind"] == "agent_prefs_saved"
 
+    def test_single_field_save_does_not_wipe_selected_project(self, tmp_path):
+        """V1.174：动一个下拉不许冲掉选中项目的目录 / project_id。
+
+        save_prefs 是全量覆盖写；_prefs_save 若只写 body 出现的键，动一下模型/
+        授权档就会把 directory 抹掉 —— 于是「明明选了项目却提示还没选工作目录」。
+        这里先记下选中态，再单字段保存，钉住它仍在。
+        """
+        app = _app(tmp_path)
+        endpoints_agent_workspace.save_prefs(
+            app, {"directory": "D:/proj", "project_id": "pid-1", "mode": "ask"})
+        endpoints_agent._prefs_save(app, {"model": "m2"})
+        prefs = endpoints_agent_workspace.load_prefs(app)
+        assert prefs["directory"] == "D:/proj"
+        assert prefs["project_id"] == "pid-1"
+        assert prefs["model"] == "m2"
+
 
 class TestIntakeReadinessEndpoint:
     def test_reports_both_prerequisites_without_touching_the_model(self):

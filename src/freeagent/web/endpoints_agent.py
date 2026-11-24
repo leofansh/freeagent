@@ -22,6 +22,7 @@ from ..services import agent_turn, engine_host
 from . import endpoints_agent_workspace as workspace
 from . import endpoints_agent_intake
 from . import endpoints_reveal
+from . import endpoints_agent_sessions as sessions
 
 __all__ = ["agent_state", "agent_turn_get", "agent_turns_list", "agent_decide",
            "agent_stop", "agent_post", "engine_dict", "turn_dict"]
@@ -74,8 +75,7 @@ def turn_dict(view: agent_turn.TurnView | None) -> dict[str, Any] | None:
         "status": view.status,
         "text": view.text,
         "brief": view.brief,
-        # 这一轮带了什么背景（V1.115）：界面要能说「它知道我今天有 3 件事」，
-        # 否则「它怎么没看见我刚记的承诺」永远没有答案。
+        # 这一轮带了什么背景（V1.115），否则「它怎么没看见我刚记的承诺」没答案。
         "context_note": view.context_note,
         "tools": list(view.tools),
         # 逐步清单（V1.115）：``name`` / ``target`` / ``status`` 三样够了 ——
@@ -124,6 +124,7 @@ def agent_state(app: App) -> dict[str, Any]:
         "ledger": _host(app).ledger(),
         "turn": turn_dict(_turns(app).latest()),
         "projects": projects["projects"],
+        "sessions": sessions.sessions_for_prefs(app),  # 左栏两级会话，fail-closed
         "prefs": {
             "directory": prefs.get("directory", ""),
             "project_id": prefs.get("project_id", ""),
@@ -154,11 +155,8 @@ def agent_turn_get(app: App, q: dict[str, list[str]]) -> dict[str, Any]:
 def agent_turns_list(app: App, q: dict[str, list[str]]) -> dict[str, Any]:
     """``GET /api/agent/turns`` —— 最近若干轮，供「最近的活」列表。
 
-    只给**列表需要的字段**（正文不进列表：一页二十条的长文本会把列表变成
-    一堵墙）。点开某一条时再由 ``/api/agent/turn?id`` 取全文。
-
-    ``available`` 是「这台机器上有没有历史能力」，不是「历史里有没有东西」：
-    前者缺了要说清（没落库的装配下重启就丢），后者空着只是还没干过活。
+    只给列表需要的字段（正文不进列表），点开某条再由 ``/api/agent/turn?id`` 取全文。
+    ``available`` 说的是这台机器有没有历史能力，不是历史里有没有东西。
     """
     turns = _turns(app)
     try:
@@ -214,9 +212,15 @@ def agent_stop(app: App, body: dict[str, Any]) -> dict[str, Any]:
 #: ``POST /api/agent/<动作>`` 的派发表。做成表而不是三段 if：动作会继续加
 #: （将来还要「接着上一句说」），而 ``routes_write.py`` 已经贴着行数上限。
 def _prefs_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
-    """输入框下方那排选择器写偏好（V1.156）：只认白名单键，不接收任意字段。"""
-    keys = ("directory", "project_id", "model", "agent", "variant", "mode")
-    workspace.save_prefs(app, {k: str(body[k]) for k in keys if k in body})
+    """输入框下方那排选择器写偏好（V1.156）：只认白名单键，不接收任意字段。
+
+    V1.174：先 load 再合并 —— 下拉 onchange 只传一个键，而 save_prefs 全量覆盖写，
+    不合并就会冲掉选中项目的 directory / project_id（「选了项目却说没选工作目录」）。
+    """
+    keys = ("directory", "project_id", "model", "agent", "variant", "mode", "session_id")
+    prefs = workspace.load_prefs(app)
+    prefs.update({k: str(body[k]) for k in keys if k in body})
+    workspace.save_prefs(app, prefs)
     return {"kind": "agent_prefs_saved"}
 
 
@@ -232,6 +236,7 @@ _ACTIONS: dict[str, Callable[[App, dict[str, Any]], dict[str, Any]]] = {
     "project_delete": lambda app, body: workspace.agent_project_delete(app, body),
     # 在系统文件管理器中定位（V1.135）：会起本地进程，单独模块实现。
     "reveal": endpoints_reveal.agent_reveal,
+    **sessions.ACTIONS,
 }
 
 
@@ -241,7 +246,5 @@ def agent_post(app: App, action: str, read_body: Callable[..., dict[str, Any]]
     handler = _ACTIONS.get(action)
     if handler is None:
         raise FreeAgentError(
-            f"不认识的动作：{action!r}"
-            "（可选：prefs_save/start/intake/decide/stop/project_save/project_select/"
-            "project_update/project_delete/reveal）")
+            f"不认识的动作：{action!r}（可选：{'/'.join(_ACTIONS)}）")
     return handler(app, read_body())

@@ -147,4 +147,6 @@ class TestMigration:
         # （单语句 ADD COLUMN）。
         # v35（workbench_projects，V1.124）：工作台项目档案（命名目录 + 备注），
         # 单语句 CREATE TABLE，目录唯一约束。
-        assert SCHEMA_VERSION == 35
+        # v36（chat_sessions + workbench_turns.session_id，V1.176）：多会话
+        # （项目→会话两级）；建表走 _DOMAIN_STEPS、加列走 _MIGRATIONS。
+        assert SCHEMA_VERSION == 36

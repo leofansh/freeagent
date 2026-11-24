@@ -718,10 +718,14 @@ class OpenCodeServer:
         self._auth = "Basic " + base64.b64encode(
             f"opencode:{self._password}".encode()
         ).decode()
-        #: 本实例建过的那个会话 id。**只用于拼 V2 的答复路径**
+        #: 本实例当前指向的会话 id。**只用于拼 V2 的答复路径**
         #: （``/api/session/{sid}/permission/{pid}/reply``）—— V1 的答复路径不带
-        #: 会话，所以那边取到空串也无所谓。一个实例只建一个会话（``create_session``
-        #: 在 delegate 与 /ask 里都只调一次），所以这个状态是良定义的。
+        #: 会话，所以那边取到空串也无所谓。
+        #:
+        #: 多会话（V1.176）后一个实例要**在多个会话间切换**（``use_session``），
+        #: 不再「一个实例只建一个会话」。这里记的是「此刻 prompt / reply 打给谁」，
+        #: 由 ``create_session`` 建新会话或 ``use_session`` 切既有会话时改写。
+        #: 切会话**不重建服务** —— 重建会丢同进程里其它会话的上下文。
         self._session_id: str = ""
 
     # -- 生命周期 -------------------------------------------------------- #
@@ -1308,6 +1312,19 @@ class OpenCodeServer:
             raise ServerError(f"建会话没拿到 sessionID：{body!r}")
         self._session_id = sid
         return sid
+
+    def use_session(self, sid: str) -> None:
+        """把本实例指向一个**已存在**的会话（同进程切换，不重建服务）。
+
+        多会话的切会话走这里：会话 id 是 ``chat_sessions`` 表里的主键，
+        跨进程仍有效（V1.97 实测旧 id 在新进程里被接受），所以这里只换一个
+        字符串、不 POST /api/session —— 那会**建一个新会话**，把上一会话的
+        上下文丢掉。不做合法性探测：id 来自库里经目录校验的会话，探测要
+        多打一次引擎，而这里出错也会在下一次 prompt 如实暴露。
+        """
+        if not sid:
+            raise ServerError("会话 id 不能为空 —— 不猜，也不悄悄退回默认会话")
+        self._session_id = sid
 
     def list_projects(self) -> list[dict[str, Any]]:
         r"""项目列表（V1 ``GET /project`` / V2 ``GET /api/project``）。

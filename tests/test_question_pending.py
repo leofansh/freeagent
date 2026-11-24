@@ -134,7 +134,9 @@ class TestMigration:
         # 出现两种形状。
         # v35（workbench_projects，V1.124）：项目档案，单语句 CREATE TABLE，
         # 目录唯一。
-        assert SCHEMA_VERSION == 35
+        # v36（chat_sessions + workbench_turns.session_id，V1.176）：多会话，
+        # 建表走 _DOMAIN_STEPS、加列走 _MIGRATIONS。
+        assert SCHEMA_VERSION == 36
 
     def test_columns_exist(self, conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_approvals)")}

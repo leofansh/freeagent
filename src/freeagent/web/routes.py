@@ -19,6 +19,7 @@ from . import (
     endpoints_agent,
     endpoints_agent_files,
     endpoints_agent_intake,
+    endpoints_agent_sessions,
     endpoints_agent_workspace,
     endpoints_delegate_browse,
     endpoints_delegate_live,
@@ -109,6 +110,9 @@ READ_ROUTES: dict[str, Callable[..., Any]] = {
     "/api/agent/turn": endpoints_agent.agent_turn_get,
     # 最近的活（21.4 / V1.115）。同样只读：列一张表不该起引擎。
     "/api/agent/turns": endpoints_agent.agent_turns_list,
+    # 会话列表（多会话 / V1.176）：只读，列当前工作目录的会话。q 可带 directory
+    # 覆盖，供两级栏列别的项目；服务端只列不读内容，不拖垮状态接口。
+    "/api/agent/sessions": endpoints_agent_sessions.agent_sessions,
     "/api/agent/dirs": endpoints_agent_workspace.agent_dirs,
     # 这个工作区里有什么（V1.142 / 借鉴 CLOAK 的「文件管理」）：只读、一层、
     # 不读内容。根由工作区档案取（不收绝对路径），越界 fail-closed。

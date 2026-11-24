@@ -69,7 +69,10 @@ __all__ = [
 #:      改它的历史会让「同一个版本号两种形状」，而那种漂移查不出来。
 #: 35 → workbench_projects（工作台项目档案：命名目录 + 可选备注，V1.124）。
 #:      目录唯一约束：同一个本地文件夹不重复建档；删项目只删档案，不碰磁盘。
-SCHEMA_VERSION = 35
+#: 36 → chat_sessions + workbench_turns.session_id（多会话，V1.176）。
+#:      一个会话 = 对话消息 + 该会话的委派轮次；切会话换引擎 session 真隔离。
+#:      新表走 _DOMAIN_STEPS（与 15 同款：一版两条语句）；加列走 _MIGRATIONS。
+SCHEMA_VERSION = 36
 
 #: 按版本递增的迁移。**这里是「库的形状」唯一的写入口**：
 #: 新库也是从 v1 基线开始、逐版本重放这一串（见 :data:`_SCHEMA` 的注释），
@@ -686,6 +689,13 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
         )
         """,
     ),
+    (
+        "35 → 36：workbench_turns.session_id（这一轮属于哪个会话，V1.176）",
+        # 与 chat_sessions 建表同版；建表走 _DOMAIN_STEPS keyed-36（一版两条
+        # 语句，先例是 v15 的 ALTER + CREATE）。空串 = 老轮次（迁移前）或
+        # 没关联会话，界面按「历史会话」处理，不把「没有」读成 0。
+        "ALTER TABLE workbench_turns ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+    ),
 )
 
 
@@ -994,6 +1004,29 @@ _DOMAIN_STEPS: tuple[tuple[int, str], ...] = (
     # 时已有同款建表，重复执行无害。为什么必须留痕见 _RETRIEVAL_LOG_SCHEMA
     # 的注释（没有它，「哪条记忆 90 天没被用上」无法回答）。
     (30, _RETRIEVAL_LOG_SCHEMA),
+    # 36 → chat_sessions（多会话，V1.176）：会话 = 对话消息 + 委派轮次的归属。
+    #
+    # 走多语句通道的原因同 v15：这一版要建这张表 + 给 workbench_turns 加列
+    # （加列那条在 _MIGRATIONS keyed-35→36）。整表新建走 CREATE TABLE
+    # IF NOT EXISTS，本身幂等；新库重放时无害。
+    #
+    # ## 为什么是「每目录多会话」而不是全局会话表
+    #
+    # 会话归属一个工作目录：切项目 = 换一组会话（与引擎 server 实例按目录
+    # 复用同一条纪律）。`directory` 存解析后的绝对路径，写入口在端点侧
+    # 现校验（同 workbench_projects）；一张表里按目录过滤即可，量小无需索引。
+    (
+        36,
+        """
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id         TEXT PRIMARY KEY NOT NULL,
+            directory  TEXT NOT NULL,
+            title      TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    ),
 )
 
 #: 覆盖默认数据目录的环境变量名。**这是一个别名**：真值在

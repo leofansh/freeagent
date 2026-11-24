@@ -18,7 +18,8 @@ from freeagent.web.js_chat import JS_CHAT
 from freeagent.web.markup import PAGE_MARKUP
 from freeagent.web.js_chat_search import JS_CHAT_SEARCH
 from freeagent.web.js_chat_shell import JS_CHAT_SHELL
-from freeagent.web.js_compact import JS_COMPACT
+from freeagent.web.js_chat_projects import JS_CHAT_PROJECTS
+from freeagent.web.js_chat_intake import JS_CHAT_INTAKE
 from freeagent.web.js_settings import JS_SETTINGS
 from freeagent.web.js_vision import JS_VISION
 from freeagent.web.js_settings_groups import JS_SETTINGS_GROUPS
@@ -26,6 +27,8 @@ from freeagent.web.js_workbench import JS_WORKBENCH
 from freeagent.web.js_workbench_page import JS_WORKBENCH_PAGE
 from freeagent.web.js_workbench_side import JS_WORKBENCH_SIDE
 from freeagent.web.page import INDEX_HTML
+from freeagent.web.style_chat import STYLE_CHAT_CSS
+from freeagent.web.style_contrast import STYLE_CONTRAST_CSS
 from freeagent.web.style_nav import STYLE_NAV_CSS
 from freeagent.web.style_usability import STYLE_USABILITY_CSS
 from freeagent.web.style_workbench import STYLE_WORKBENCH_CSS
@@ -46,41 +49,26 @@ def _body(source: str, fn_name: str) -> str:
     raise AssertionError(f"{fn_name} 的大括号不配平")
 
 
-class TestCompactMode:
-    """简洁模式：默认开、可切、状态持久化、只折叠工作台过程。"""
+def _css_rule(source: str, selector: str) -> str:
+    """取一条 CSS 规则的声明体（从选择器到配平的右大括号）。"""
+    start = source.index(selector)
+    end = source.index("}", start)
+    return source[start:end + 1]
 
-    def test_defaults_on_and_persists(self):
-        assert 'const FA_COMPACT_KEY = "fa_compact"' in JS_COMPACT
-        body = _body(JS_COMPACT, "compactOn")
-        # 只有显式存成 "0" 才是关；读不到按默认开（fail-closed 到简洁）。
-        assert 'getItem(FA_COMPACT_KEY) !== "0"' in body
-        assert "return true" in body
-        toggle = _body(JS_COMPACT, "compactToggle")
-        assert 'setItem(FA_COMPACT_KEY, next ? "1" : "0")' in toggle
 
-    def test_applies_body_class_and_wires_button(self):
-        apply = _body(JS_COMPACT, "compactApply")
-        assert 'classList.toggle("compact", on)' in apply
-        init = _body(JS_COMPACT, "compactInit")
-        assert 'b.id = "compact-btn"' in init
-        assert "b.onclick = compactToggle" in init
-        assert 'appendChild(b)' in init  # 按钮真的挂进 nav
-        assert 'nav.appendChild(b)' in init
+class TestCompactModeRemoved:
+    """V1.159：简洁模式已删 —— 它在对话页没有 .wb-view 作用域，点下去毫无效果。
 
-    def test_css_hides_only_process(self):
-        assert "body.compact .wb-view .wb-steps" in STYLE_USABILITY_CSS
-        assert "body.compact .wb-view .wb-process" in STYLE_USABILITY_CSS
-        # 答复正文（.msg .bubble / pre）不在折叠名单里 —— 折叠的是过程不是结论。
-        assert ".msg .bubble" not in STYLE_USABILITY_CSS
+    工作台步骤清单自带「展开全部 N 步 / 收起」的局部开关（V1.130），
+    全局 toggle 是冗余的第二真源；连同 localStorage 偏好一起拆干净。
+    """
 
-    def test_process_class_on_footprint_cards(self):
-        assert JS_WORKBENCH.count('card wb-process') == 2, (
-            "文件 / 命令两张足迹卡都要打 wb-process 标记，简洁模式一起折"
-        )
-
-    def test_scripts_assembled(self):
-        assert JS_COMPACT in INDEX_HTML
-        assert STYLE_USABILITY_CSS in INDEX_HTML
+    def test_no_compact_button_or_state_in_the_page(self):
+        assert "compact-btn" not in INDEX_HTML
+        assert "fa_compact" not in INDEX_HTML
+        assert "body.compact" not in INDEX_HTML
+        assert "body.compact" not in STYLE_USABILITY_CSS
+        assert not (_SRC / "web" / "js_compact.py").exists()
 
 
 class TestChatSearch:
@@ -125,6 +113,23 @@ class TestChatSearch:
         bar = _body(JS_CHAT, "buildBar")
         assert "搜索" not in bar, "搜索不再是输入栏上的独立按钮"
 
+    def test_close_listeners_read_live_dom_not_captured_nodes(self):
+        """V1.160 补记：关闭监听只绑一次，回调里必须现查 DOM。
+
+        renderChatShell 每次重建 .chat，闭包捕获的 menu/btn 重绘后已不在文档里，
+        Esc / 点外关闭会永久失效（V1.142 文件清单同一类坑）。静态守卫钉住
+        「回调里现查 #chat-tool-menu / #chat-more-btn」，防以后改回捕获旧节点。
+        """
+        tools = _body(JS_CHAT_SEARCH, "chatToolsMount")
+        bound = tools[tools.index("if (!chatToolsBound)"):]
+        # 两个关闭回调各自现查当前 DOM，不直接用外层的 menu / btn。
+        assert bound.count('const m = $("#chat-tool-menu"), mb = $("#chat-more-btn")') == 2
+        assert bound.count("if (m) m.hidden = true") == 2
+        assert bound.count('if (mb) mb.setAttribute("aria-expanded", "false")') == 2
+        # 回调里不许直接改外层捕获的 menu / btn。
+        keydown = bound[bound.index('"keydown"'):]
+        assert "menu.hidden" not in keydown and "btn.setAttribute" not in keydown
+
     def test_scripts_assembled_in_order(self):
         assert JS_CHAT_SEARCH in INDEX_HTML
         # 搜索依赖 chat 建立的 #chatlog / .msg .bubble 结构，必须排在 chat 之后。
@@ -132,7 +137,7 @@ class TestChatSearch:
 
 
 class TestChatShell:
-    """对话页三栏外壳（V1.154）：左工作区 / 中对话 / 右产物，两侧可收。"""
+    """对话页三栏外壳（V1.159）：中栏为主，两侧默认收起、按需从「…」打开。"""
 
     def test_shell_wraps_center_and_is_wired(self):
         shell = _body(JS_CHAT_SHELL, "chatShellMount")
@@ -150,17 +155,223 @@ class TestChatShell:
 
     def test_bar_has_project_model_mode_selectors(self):
         fn = _body(JS_CHAT_SHELL, "chatBarControls")
-        for sel in ("chat-ctrl-project", "chat-ctrl-model", "chat-ctrl-mode"):
+        # 项目是按钮（豆包式面板挂载点），其余三个仍是原生 select（V1.165）。
+        for sel in ("chat-ctrl-project", "chat-ctrl-model", "chat-ctrl-mode",
+                    "chat-ctrl-variant"):
             assert f'"{sel}"' in fn
+        assert 'el("button", "chat-ctrl chat-proj-btn")' in fn
+        assert "chatProjMount(proj" in fn, "项目选择器交给面板模块挂载"
         assert '"/api/agent/prefs_save"' in fn and '"/api/oc/options"' in fn
-        assert '"/api/agent/project_select"' in fn
         shell = _body(JS_CHAT_SHELL, "chatShellMount")
         assert "chatBarControls()" in shell
 
-    def test_toggle_buttons_hide_panels(self):
+    def test_bar_order_puts_variant_next_to_model(self):
+        """V1.164：都插在箭头前，声明顺序即显示顺序——推理档紧跟模型、授权档收尾。
+
+        项目是按钮（el），其余是 select（mk），故按各声明行的特征串定位；
+        不能用 "chat-ctrl-project" 裸串——幂等守卫那行也含它，会取到错误位置。
+        """
+        fn = _body(JS_CHAT_SHELL, "chatBarControls")
+        markers = ('const proj = el(', 'const model = mk("chat-ctrl-model"',
+                   'const variant = mk("chat-ctrl-variant"',
+                   'const mode = mk("chat-ctrl-mode"')
+        order = [fn.index(m) for m in markers]
+        assert order == sorted(order), "显示顺序须为 项目 / 模型 / 推理档 / 授权档"
+
+    def test_variant_selector_cascades_and_has_no_fake_choice(self):
+        """V1.163：推理档常驻，但无可用档位时置灰、不造假选择；换模型清档。
+
+        对齐豆包 / OpenCode 的「推理强度常驻输入栏」形态，又守住
+        「多数模型 variants=[]」的现实——只有「不指定」一项时就是禁用。
+        """
+        fn = _body(JS_CHAT_SHELL, "chatBarControls")
+        # 选项依附 oc.variant 段；空值项恒在，靠是否有非空档决定是否禁用。
+        assert "oc.variant && oc.variant.options" in fn
+        assert "usableVariants = variantOpts.filter((o) => o.value)" in fn
+        assert "variant.disabled = usableVariants.length === 0" in fn
+        assert '"当前模型没有可选推理档"' in fn
+        # 重填前清空，换模型重列不堆积旧档位。
+        assert "sel.textContent = \"\"" in fn
+        # 换模型：保存时带 variant:"" 清档，并重拉该模型档位重填。
+        assert "await save({ model: model.value, variant: \"\" })" in fn
+        assert "const fresh = await api(\"/api/oc/options\")" in fn
+        assert "variant.onchange = () => save({ variant: variant.value })" in fn
+        assert '"/api/agent/prefs_save"' in fn, "推理档走既有白名单写路径"
+
+    def test_panels_start_hidden_and_toggle_has_one_source(self):
+        """V1.159：第一眼只有对话；栏内按钮与「…」菜单共用同一开合函数。"""
         shell = _body(JS_CHAT_SHELL, "chatShellMount")
-        assert "left.hidden = !left.hidden" in shell
-        assert "right.hidden = !right.hidden" in shell
+        assert "left.hidden = true" in shell and "right.hidden = true" in shell
+        toggle = _body(JS_CHAT_SHELL, "chatPanelToggle")
+        assert "panel.hidden = !open" in toggle
+        assert 'chatPanelToggle("rail", false)' in shell
+        assert 'chatPanelToggle("side", false)' in shell
+        assert "left.hidden = !" not in shell and "right.hidden = !" not in shell
+
+    def test_chat_tools_menu_can_open_both_panels(self):
+        tools = _body(JS_CHAT_SEARCH, "chatToolsMount")
+        assert 'chatPanelToggle("rail")' in tools and 'chatPanelToggle("side")' in tools
+        assert "打开工作区" in tools and "打开产物" in tools
+        # 菜单文案每次打开都按当前状态刷新，不能写着"打开"点了却关掉。
+        assert "railItem.textContent = rail.hidden" in tools
+        assert "sideItem.textContent = side.hidden" in tools
+
+    def test_shell_fills_the_window(self):
+        """撑满靠 CSS :has，不靠 JS 切视图；不支持时静默保持旧宽度。"""
+        assert ".wrap:has(.chat-shell)" in STYLE_CHAT_CSS
+        assert "max-width: none" in STYLE_CHAT_CSS
+        # 面板按钮是栏内标题，不再用虚线 ghost 当占位符。
+        assert ".chat-panel-close" in STYLE_CHAT_CSS
+
+    def test_narrow_window_opens_one_panel_at_a_time(self):
+        """V1.160：窄屏开一侧自动收另一侧，阈值按视口宽算、不记"后开哪个"。"""
+        assert "const CHAT_NARROW = 1000" in JS_CHAT_SHELL
+        toggle = _body(JS_CHAT_SHELL, "chatPanelToggle")
+        assert "window.innerWidth < CHAT_NARROW" in toggle
+        assert "if (open &&" in toggle, "只在打开时互斥，关闭不影响另一侧"
+        assert "other.hidden = true" in toggle
+        assert 'which === "rail" ? $("#chat-side") : $("#chat-rail")' in toggle
+
+    def test_center_can_shrink_without_overflow(self):
+        """V1.160：min-width:0 是 flex 子项不撑破视口的根因修复。"""
+        assert ".chat-shell > .chat" in STYLE_CHAT_CSS
+        assert "min-width: 0" in STYLE_CHAT_CSS
+
+    def test_paint_clears_data_area_not_toggle_buttons(self):
+        """V1.170：paint 前清空数据区容器，不连收起按钮一起清。"""
+        shell = JS_CHAT_SHELL
+        mount = _body(shell, "chatShellMount")
+        assert "chat-rail-body" in mount
+        assert "chat-side-body" in mount
+        assert "left.appendChild(railBody)" in mount
+        assert "right.appendChild(sideBody)" in mount
+        for fn, box_id in (("chatRailPaint", "#chat-rail-body"),
+                           ("chatSidePaint", "#chat-side-body")):
+            body = _body(shell, fn)
+            assert f'$("{box_id}")' in body
+            clear = body.index('box.textContent = "";')
+            assert clear < body.index("appendChild")
+
+
+class TestChatProjects:
+    """V1.165：对话页豆包式项目面板——选项目 + 创建项目，共用同一写入口。"""
+
+    def test_module_is_assembled(self):
+        # 拼进页面的是 JS 源码内容，不是 Python 变量名。
+        assert "function chatProjMount(" in INDEX_HTML, "模块须拼进页面才生效"
+
+    def test_panel_has_two_entries_and_search(self):
+        # V1.167 简化：只剩「不使用项目」+「选择本地文件夹」两条入口，
+        # 删掉「＋创建新项目」表单路径（最终都走 project_save）。
+        assert '"📁 选择本地文件夹"' in JS_CHAT_PROJECTS
+        assert '"不使用项目"' in JS_CHAT_PROJECTS
+        assert '"＋ 创建新项目"' not in JS_CHAT_PROJECTS, "表单路径已删"
+        assert 'id = "chat-proj-filter"' in JS_CHAT_PROJECTS, "有搜索框"
+
+    def test_reuses_same_endpoints_not_a_second_write_path(self):
+        assert '"/api/agent/project_select"' in JS_CHAT_PROJECTS
+        assert '"/api/agent/project_save"' in JS_CHAT_PROJECTS
+        assert '"/api/agent/dirs?path="' in JS_CHAT_PROJECTS, "目录浏览复用既有端点"
+
+    def test_close_listeners_read_live_dom(self):
+        """V1.160 教训：重绘后节点不在文档里，回调不能捕获旧节点。"""
+        bind = _body(JS_CHAT_PROJECTS, "chatProjBindClose")
+        assert 'const p = $("#chat-proj-panel")' in bind
+        assert "chatProjBound" in bind, "监听只绑一次"
+
+    def test_dynamic_text_is_escaped(self):
+        assert "esc(it.name" in JS_CHAT_PROJECTS
+        assert "esc(it.directory" in JS_CHAT_PROJECTS
+        assert "esc(data.path" in JS_CHAT_PROJECTS
+        assert "esc(name)" in JS_CHAT_PROJECTS
+
+    def test_dir_browser_has_quick_places_and_drives(self):
+        """V1.168：跨盘纯点击——后端早返回 places/drives，轻量面板也须画。"""
+        fn = _body(JS_CHAT_PROJECTS, "chatProjDirsLoad")
+        assert "data.places" in fn, "画快捷位置"
+        assert "data.drives" in fn, "画盘符（跨盘痛点的根因）"
+        assert fn.count("chatProjDirsLoad(pl.path)") == 1, "快捷位置点下去仍走同一校验"
+        assert fn.count("chatProjDirsLoad(d)") == 1, "盘符点下去仍走同一校验"
+        assert "esc(pl.label" in fn and "esc(d)" in fn, "动态文本仍转义"
+
+    def test_panel_inner_clicks_do_not_bubble_to_close_listener(self):
+        """点目录 chip/行会重绘 area 把 e.target 移出 DOM，冒泡到 document 的
+        关闭监听里 wrap.contains(e.target) 就成 false → 面板被误关（真实鼠标点击才暴露）。
+        故面板内点击统一拦在 panel 层，不冒泡到 document。"""
+        mount = _body(JS_CHAT_PROJECTS, "chatProjMount")
+        assert 'panel.addEventListener("click"' in mount, "面板内点击拦在 panel 层"
+        assert "ev.stopPropagation()" in mount, "不冒泡到 document 关闭监听"
+
+
+class TestChatIntake:
+    """V1.171：对话页「派活」按钮 —— 显式入口，确认闸门不绕过。"""
+
+    def test_module_is_assembled(self):
+        assert "function chatIntakeMount(" in INDEX_HTML
+
+    def test_dispatch_button_is_wired_in_toolbar(self):
+        shell = JS_CHAT_SHELL
+        assert "chat-ctrl-dispatch" in shell
+        assert "派活" in shell
+        assert "chatIntakeMount(dispatch)" in shell
+
+    def test_reuses_existing_endpoints_not_a_second_write_path(self):
+        src = JS_CHAT_INTAKE
+        assert 'post("/api/agent/intake"' in src
+        assert 'api("/api/agent/projects")' in src
+        assert 'post("/api/agent/prefs_save"' in src
+
+    def test_progress_query_no_longer_blocked_and_confirm_gate_untouched(self):
+        src = JS_CHAT_INTAKE
+        # V1.173：点派活 = 明确派遣意图，含进度词也照派——不再拦。
+        assert "CHAT_INTAKE_PROGRESS" not in src
+        assert "这是查进度" not in src
+        assert "V1.173" in src
+        # 判非委派也照派：chatDelegate 出现 2 次（apply 里 + else 里）。
+        assert src.count("await chatDelegate();") == 2
+        # 确认闸门仍交 chatDelegate —— 本模块不复制 确认弹窗 / 不直接 post start。
+        assert "window.confirm" not in src
+        assert 'post("/api/agent/start"' not in src
+
+    def test_carry_survives_redraw(self):
+        # 追问上下文留模块级（V1.142 教训：跟着 DOM 走会点一下就没了）。
+        assert "let chatIntakeCarry = null;" in JS_CHAT_INTAKE
+        assert "chatIntakeCarry = res.carry" in JS_CHAT_INTAKE
+
+    def test_dispatch_sits_last_before_arrow(self):
+        """V1.172 人性布局：派活是动作、紧挨发送箭头，排在四个配置下拉之后。"""
+        fn = _body(JS_CHAT_SHELL, "chatBarControls")
+        mode = fn.index('const mode = mk("chat-ctrl-mode"')
+        dispatch = fn.index("const dispatch = el(")
+        insert = fn.index("tools.insertBefore(dispatch, arrow)")
+        assert mode < dispatch < insert, "派活须在授权档之后创建、并插在发送箭头前"
+
+
+class TestChatStaysOnDispatch:
+    """V1.175：派活后留对话页，右栏接住进度 / 答复 / 改动，不跳工作台。"""
+
+    def test_delegate_no_longer_jumps_to_workbench(self):
+        fn = _body(JS_CHAT_SEARCH, "chatDelegate")
+        assert 'load("workbench")' not in fn
+        assert 'chatPanelToggle("side", true)' in fn
+        assert "chatSidePaint()" in fn
+
+    def test_side_panel_shows_answer_commands_and_polls(self):
+        fn = _body(JS_CHAT_SHELL, "chatSidePaint")
+        assert "turn.text" in fn and "chat-side-answer" in fn
+        assert "turn.commands" in fn and "chat-side-lbl" in fn
+        assert 'turn.status === "running"' in fn
+        assert "chatSideArm()" in fn
+        arm = _body(JS_CHAT_SHELL, "chatSideArm")
+        assert "setInterval" in arm and 'indexOf(st.turn.status) < 0' in arm
+        assert "clearInterval(chatSideTimer)" in arm
+
+    def test_ask_card_is_a_signpost_not_a_fake_button(self):
+        fn = _body(JS_CHAT_SHELL, "chatSidePaint")
+        assert "turn.ask" in fn and "chat-side-ask" in fn
+        assert "委派总览" in fn
+        # 授权闸门没搬：右栏不直接 post decide / 不放允许拒绝按钮。
+        assert "/api/agent/decide" not in fn
 
 
 class TestButtonHierarchy:
@@ -185,11 +396,36 @@ class TestButtonHierarchy:
 
     def test_nav_uses_the_same_button_language(self):
         assert 'class="btn ghost">刷新' in PAGE_MARKUP
-        assert 'el("button", "btn ghost", "简洁")' in JS_COMPACT
 
-    def test_ghost_css_is_global_and_shows_toggle_state(self):
+    def test_ghost_css_is_global(self):
         assert ".btn.ghost {" in STYLE_NAV_CSS, "ghost 不能只认 nav，要跨区域一致"
-        assert '.btn.ghost[aria-pressed="true"]' in STYLE_NAV_CSS
+
+    def test_ghost_button_is_solid_not_dashed(self):
+        """V1.162：虚线像没填完的占位符；次级按钮改实线 + 字色提一档。"""
+        ghost = _css_rule(STYLE_NAV_CSS, ".btn.ghost {")
+        assert "dashed" not in ghost, "虚线像占位符，已改实线"
+        assert "color: var(--ink-2)" in ghost, "字色从 ink-3 提到 ink-2"
+        assert "border-style" not in ghost, "button 默认即实线，不必再声明 border-style"
+
+
+class TestContrastCSS:
+    """V1.162：正文里真正要读的弱文本从 ink-3 提一档到 ink-2。"""
+
+    def test_contrast_module_is_assembled(self):
+        assert STYLE_CONTRAST_CSS in INDEX_HTML
+
+    def test_readable_text_lifted_without_touching_global_token(self):
+        assert "color: var(--ink-2)" in STYLE_CONTRAST_CSS
+        for sel in (".meta", ".empty", ".disclaimer", ".acts .lbl",
+                    ".section-label", "dt"):
+            assert sel in STYLE_CONTRAST_CSS, f"{sel} 是正文要读的文本，应提一档"
+        # 不全局改 --ink-3：那会抹平层级（导航分组 / 米黄警示仍用它）。
+        assert "--ink-3:" not in STYLE_CONTRAST_CSS
+
+    def test_contrast_comes_after_base_style(self):
+        # 靠拼装顺序覆盖 style.py 里的 ink-3 规则（style.py 已满 250 行不能加）。
+        from freeagent.web.style import STYLE_CSS
+        assert INDEX_HTML.index(STYLE_CSS) < INDEX_HTML.index(STYLE_CONTRAST_CSS)
 
     def test_attachment_plus_replaces_the_lone_vision_pill(self):
         load = _body(JS_VISION, "loadVisionBar")

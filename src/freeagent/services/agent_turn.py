@@ -129,6 +129,8 @@ class TurnView:
     #: 这一轮带了什么上下文（21.5 / V1.115）。空串 = 什么都没带。
     #: **它是说明不是原文**：原文在发给引擎的那一行里，界面要的是「带了什么」。
     context_note: str = ""
+    #: 这一轮属于哪个会话（V1.176）。空串 = 老轮次，界面按历史会话兜底展示。
+    session_id: str = ""
     tool_calls: int = 0
     reason: str = ""
     notes: tuple[str, ...] = ()
@@ -177,6 +179,9 @@ class _Turn:
         "turn_id", "brief", "text", "directory", "model", "agent", "variant",
         "mode", "status", "reason", "notes", "tools", "steps", "tool_calls", "ask",
         "context", "context_note",
+        #: 这一轮属于哪个会话（V1.176）：切会话后历史按此过滤，不串味。
+        #: 空串 = 老轮次 / 没有会话表时落的那轮，读侧按「历史会话」兜底。
+        "session_id",
         "answer", "decision", "stop_requested", "gate", "done", "ask_event",
         "started_dt", "started_at", "started_mono", "finished_mono",
         #: call_id → steps 下标。**只在内存里配对，不落库**：步骤持久化只有
@@ -190,7 +195,7 @@ class _Turn:
     def __init__(self, *, turn_id: str, text: str, directory: str, model: str,
                  agent: str, variant: str, mode: str, started_dt: Any,
                  started_mono: float, context: str = "",
-                 context_note: str = "") -> None:
+                 context_note: str = "", session_id: str = "") -> None:
         self.turn_id = turn_id
         #: 发出去的那一句（**已折成单行**）。``text`` 是引擎回的话，
         #: 两者刻意分开：界面上的正文只能是**引擎说的**，不能混进用户的问题，
@@ -201,6 +206,7 @@ class _Turn:
         #: 上下文是系统加的，混在一起会让人以为那句话是自己说的。
         self.context = context
         self.context_note = context_note
+        self.session_id = session_id
         self.text = ""
         self.directory = directory
         self.model = model
@@ -295,6 +301,7 @@ class AgentTurnService:
         mode: str = ENGINE_ASK,
         context: str = "",
         context_note: str = "",
+        session_id: str = "",
     ) -> TurnView:
         """开一轮。**立即返回**，真正的执行在后台线程。"""
         if mode not in (ENGINE_ASK, ENGINE_AUTO_DIR):
@@ -317,6 +324,7 @@ class AgentTurnService:
                 model=model, agent=agent, variant=variant, mode=mode,
                 started_dt=self._clock.now(), started_mono=self._now(),
                 context=context.strip(), context_note=context_note,
+                session_id=session_id,
             )
             self._turns[turn_id] = turn
             self._active = turn_id
@@ -362,6 +370,7 @@ class AgentTurnService:
                 tools=tuple(turn.tools),
                 steps=tuple(turn.steps),
                 context_note=turn.context_note,
+                session_id=turn.session_id,
                 tool_calls=turn.tool_calls,
                 reason=turn.reason,
                 notes=tuple(turn.notes),
@@ -894,7 +903,7 @@ class AgentTurnService:
                 directory=turn.directory, mode=turn.mode,
                 started_at=turn.started_dt, model=turn.model,
                 agent=turn.agent, variant=turn.variant,
-                context_note=turn.context_note,
+                context_note=turn.context_note, session_id=turn.session_id,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("【工作台】这一轮没能落库：%s", exc)
@@ -935,6 +944,7 @@ class AgentTurnService:
                 tools=tuple(tools or ()),
                 steps=tuple(steps or ()),
                 context_note=str(row.get("context_note") or ""),
+                session_id=str(row.get("session_id") or ""),
                 tool_calls=int(row.get("tool_calls") or 0),
                 reason=str(row.get("reason") or ""),
                 notes=tuple(notes or ()) + (

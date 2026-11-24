@@ -8,13 +8,17 @@
 
 from __future__ import annotations
 
+import inspect
 import types
 import threading
 
 import pytest
 
+from freeagent.config import load_config
 from freeagent.domain import FreeAgentError
 from freeagent.web import endpoints_agent, endpoints_agent_projects as ep
+from freeagent.web.endpoints_delegate_projects import _norm
+from freeagent.web.endpoints_feishu import state_home_for
 
 
 class TestProjectRepo:
@@ -132,6 +136,52 @@ class TestProjectEndpoints:
         assert len(state["projects"]) == 1
         assert state["prefs"]["project_id"]
         assert state["prefs"]["directory"] == str(tmp_path)
+
+
+class TestSelectionAuthorizes:
+    """选项目即授权（V1.169）：界面选中的项目，能力路由当场认、重启后仍在。
+
+    起因是用户截图里项目按钮显示已选「freeagent 本体」，对话却回「没有授权
+    任何项目」。根因是两套"项目"—— 工作台档案与委派白名单 —— 不一致。
+    这里守住选 / 建档都写白名单（唯一真源）并即时刷新运行时能力视图。
+    """
+
+    def _authorized(self, app, directory: str) -> bool:
+        cfg = load_config(state_home_for(app))
+        return any(_norm(p) == _norm(directory) for p in cfg.delegate_projects)
+
+    def test_save_authorizes_and_refreshes(self, app, tmp_path):
+        ep.agent_project_save(app, {"directory": str(tmp_path)})
+        # 白名单是重启后的真源：写进 config.json，不只是刷运行时内存。
+        assert self._authorized(app, str(tmp_path))
+        caps = app.chat.capabilities
+        assert caps is not None
+        assert any(_norm(p) == _norm(str(tmp_path)) for p in caps.projects)
+
+    def test_select_authorizes_and_refreshes(self, app, tmp_path):
+        # 直接建档案（绕过 save 的授权），单独验 select 这一条路径。
+        row = app.project_repo.register(directory=str(tmp_path), name="甲",
+                                        note="", now=app.clock.now())
+        assert not self._authorized(app, str(tmp_path))
+        ep.agent_project_select(app, {"id": row["id"]})
+        assert self._authorized(app, str(tmp_path))
+        caps = app.chat.capabilities
+        assert caps is not None
+        assert any(_norm(p) == _norm(str(tmp_path)) for p in caps.projects)
+
+    def test_deselect_keeps_authorization(self, app, tmp_path):
+        saved = ep.agent_project_save(app, {"directory": str(tmp_path)})
+        ep.agent_project_select(app, {"id": saved["project"]["id"]})
+        ep.agent_project_select(app, {"id": ""})
+        # 黏性：取消选中只清工作目录，不撤销白名单 —— 那条可能是飞书页
+        # 单独授权的，顺手删会误伤；撤销仍走飞书页显式动作。
+        assert self._authorized(app, str(tmp_path))
+
+    def test_helper_persists_and_refreshes(self):
+        src = inspect.getsource(ep._authorize_and_refresh)
+        assert "save_config(cfg, home)" in src, "白名单必须落盘，重启后仍在"
+        assert "_capability_view(cfg)" in src, "用更新后的 cfg 重建视图"
+        assert "chat._capabilities" in src, "当场刷新运行时视图，不必重启"
 
 
 class TestProjectCounts:

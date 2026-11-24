@@ -39,6 +39,7 @@ from .storage.repos import (
     ArtifactRepo,
     CapturedRepo,
     CareRepo,
+    ChatSessionRepo,
     ContactRepo,
     DailyDigestRepo,
     DecisionLogRepo,
@@ -140,6 +141,9 @@ class App:
     turn_repo: Any = None
     #: 工作台项目档案（V1.124）：命名目录 + 备注。声明成 ``Any`` 同 ``turn_repo``。
     project_repo: Any = None
+    #: 对话会话（V1.176 / 多会话）：一个会话 = 对话消息 + 该会话的委派轮次。
+    #: 声明成 ``Any`` 同上：端点负责类型，装配只保证建一次。
+    chat_session_repo: Any = None
 
     @property
     def llm_name(self) -> str:
@@ -309,6 +313,7 @@ def build_app(
     #: 落库与回读，重启后的「收口」（残留 running → failed）也由它做。
     turn_repo = WorkbenchTurnRepo(conn)
     project_repo = WorkbenchProjectRepo(conn)
+    chat_session_repo = ChatSessionRepo(conn)
 
     role_service = RoleService(conn, role_repo, task_repo, record_repo, the_clock)
     # has_pending 只给一个「有没有未决待批项」的答案：待批行的过滤口径
@@ -445,6 +450,7 @@ def build_app(
         daily_digests=daily_digest_repo,
         turn_repo=turn_repo,
         project_repo=project_repo,
+        chat_session_repo=chat_session_repo,
         energy_windows=energy_windows,
         quiet_hours=quiet_hours,
         config=the_config,

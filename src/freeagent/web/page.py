@@ -24,9 +24,11 @@ from .js_chat_select import JS_CHAT_SELECT
 from .js_chat_store import JS_CHAT_STORE
 from .js_core import JS_CORE
 from .js_nav import JS_NAV
-from .js_compact import JS_COMPACT
 from .js_chat_search import JS_CHAT_SEARCH
 from .js_chat_shell import JS_CHAT_SHELL
+from .js_chat_sessions import JS_CHAT_SESSIONS
+from .js_chat_projects import JS_CHAT_PROJECTS
+from .js_chat_intake import JS_CHAT_INTAKE
 from .js_detail import JS_DETAIL
 from .js_contacts import JS_CONTACTS
 from .js_promises import JS_PROMISES
@@ -61,6 +63,8 @@ from .js_workbench_files import JS_WORKBENCH_FILES
 from .js_workbench_shell import JS_WORKBENCH_SHELL
 from .markup import PAGE_MARKUP
 from .style import STYLE_CSS
+from .style_contrast import STYLE_CONTRAST_CSS
+from .style_layout import STYLE_LAYOUT_CSS
 from .style_nav import STYLE_NAV_CSS
 from .style_workbench import STYLE_WORKBENCH_CSS
 from .style_usability import STYLE_USABILITY_CSS
@@ -70,7 +74,7 @@ __all__ = ["INDEX_HTML"]
 
 INDEX_HTML = (
     PAGE_MARKUP
-    + "<style>\n" + STYLE_CSS + "\n" + STYLE_NAV_CSS + "\n"
+    + "<style>\n" + STYLE_CSS + "\n" + STYLE_CONTRAST_CSS + "\n" + STYLE_LAYOUT_CSS + "\n" + STYLE_NAV_CSS + "\n"
     + STYLE_WORKBENCH_CSS + "\n" + STYLE_USABILITY_CSS + "\n"
     + STYLE_CHAT_CSS + "\n</style>\n"
     + "<script>\n"
@@ -81,9 +85,6 @@ INDEX_HTML = (
             # nav 提供「更多」下拉开合与 MENU_VIEWS；boot 的 load() 引用
             # closeMore / MENU_VIEWS，所以排在 boot 之前（同一块脚本内运行期调用）。
             JS_NAV,
-            # compact 提供简洁模式开关；模块加载时 compactInit() 就把按钮挂进
-            # nav（脚本在 body 之后，DOM 已就绪），只依赖 core 的 $/el。
-            JS_COMPACT,
             JS_VISION,
             # chat_store 提供 chatDay/chatLoad/chatSave/clearHistory 与
             # lastItemIds —— JS_CHAT 与 JS_CHAT_SELECT 都直接用它们，
@@ -94,6 +95,16 @@ INDEX_HTML = (
             # 依赖 JS_CHAT 建立的 #chatlog / .msg .bubble 结构。
             JS_CHAT_SEARCH,
             JS_CHAT_SHELL,
+            # chat_sessions 提供 chatSessionsPaint/chatSessionsBoot（两级会话栏与
+            # 历史迁移），chatRailPaint 转调它；只依赖 core helper 与会话端点，
+            # 声明提升让顺序无关，仍按依赖写在 chat_shell 之后。
+            JS_CHAT_SESSIONS,
+            # chat_projects 提供 chatProjMount（chatBarControls 挂载项目按钮时调），
+            # 与工作台共用端点、只另画视图层；声明提升让顺序无关，仍按依赖写。
+            JS_CHAT_PROJECTS,
+            # chat_intake 提供 chatIntakeMount（chatBarControls 挂派活按钮时调），
+            # 复用 /api/agent/intake 认项目+brief，确认闸门仍交 chatDelegate。
+            JS_CHAT_INTAKE,
             # onboard 提供 renderChatWelcome（renderChatShell 空对话时调）。
             # 只依赖 core 的 $/el/esc 与 chat 建立的 #chatlog；声明提升让
             # 顺序无关，仍按依赖写在 chat 之后。

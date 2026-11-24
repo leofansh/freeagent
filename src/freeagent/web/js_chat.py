@@ -217,6 +217,8 @@ async function sendChat(preset) {
 }
 
 async function loadChat() {
+  // 多会话（V1.176）：先恢复 chatSessionId 再对账/迁移，赶在 renderChatShell → chatLoad 之前，否则读错 key。
+  if (typeof chatSessionsBoot === "function") await chatSessionsBoot();
   renderChatShell(null);
   try {
     const menu = await api("/api/chat");

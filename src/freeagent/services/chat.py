@@ -315,7 +315,14 @@ class ChatService:
         # 教训：**问「谁调用了我」而不是「我以为谁调用我」。** 三个入口
         # （终端 / 飞书 / Web）里，只有一个走 Repl。
         router = self._capability_router
-        if router is not None:
+        # 事务查询让路（V1.170）：「了解项目开发进度」这类含进度词的话是
+        # 查事务，不是问能力。能力路由若先接走就答成项目清单（答非所问）。
+        # 负向排除——只把含进度词的句子让给事务层，不正向匹配能力话题
+        # （正向匹配=本仓反对的「自信错误答案」）。这道判断只决定「谁答」，
+        # 不碰数据写入 / 白名单 / 授权；read_intent 对这类句子判 QUESTION
+        # （_QUESTION_WORDS 含「进度」），不会建垃圾事务。
+        progress_query = any(w in text for w in _PROGRESS_WORDS)
+        if router is not None and not progress_query:
             cap = router.try_route(text, self._capabilities)
             if cap is not None:
                 return cap

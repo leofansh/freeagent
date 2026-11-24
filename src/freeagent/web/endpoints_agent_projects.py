@@ -79,6 +79,39 @@ def _leaf_name(directory: str) -> str:
     return pathlib.Path(directory).name or directory
 
 
+def _authorize_and_refresh(app: App, directory: str) -> None:
+    """选中的项目即视为已授权：写白名单 + 当场重建能力视图（V1.169）。
+
+    ## 为什么写白名单而不只刷内存
+
+    ``delegate_projects`` 是「能改哪些目录」的唯一真源（飞书授权页与能力路由
+    都读它）。只刷内存，重启后又退回「没授权」—— 那是把故障延后，不是修好。
+
+    ## 为什么当场刷新
+
+    ``CapabilityView`` 是启动快照，但路由每次读 ``app.chat._capabilities``
+    的**当前对象**；重写它就能让服役中的服务当场认这个项目，不必重启。
+    项目名查不到时 ``_capability_view`` 退回路径，不静默变空。
+
+    ## 为什么只增不减
+
+    「不使用项目」只清工作目录，不等于撤销授权 —— 那条可能是飞书页单独
+    授权的，顺手删会误伤；撤销仍走飞书页的显式动作。
+    """
+    from ..app import _capability_view
+    from ..config import load_config, save_config
+    from .endpoints_delegate_projects import _add
+
+    home = state_home_for(app)
+    cfg = load_config(home)
+    cfg, changed = _add(cfg, directory)
+    if changed:
+        save_config(cfg, home)
+    chat = getattr(app, "chat", None)
+    if chat is not None:
+        chat._capabilities = _capability_view(cfg)
+
+
 def agent_project_recent(app: App, limit: int = 5) -> list[dict[str, str]]:
     """浏览面板的「最近目录」：档案按最近使用倒序，目录去重，只回名称与路径。
 
@@ -145,12 +178,14 @@ def agent_project_save(app: App, body: dict[str, Any]) -> dict[str, Any]:
         # 没有仓储的装配下，至少把目录记进偏好；档案能力如实缺席。
         prefs = load_prefs(app)
         save_prefs(app, {**prefs, "directory": resolved})
+        _authorize_and_refresh(app, resolved)
         return {"kind": "agent_project", "project": None, "directory": resolved}
     row = repo.register(directory=resolved, name=name, note=note,
                         now=app.clock.now())
     prefs = load_prefs(app)
     save_prefs(app, {**prefs, "directory": resolved,
                      "project_id": str(row["id"])})
+    _authorize_and_refresh(app, resolved)
     return {"kind": "agent_project", "project": _project_out(row)}
 
 
@@ -173,6 +208,7 @@ def agent_project_select(app: App, body: dict[str, Any]) -> dict[str, Any]:
     repo.touch(project_id, app.clock.now())
     save_prefs(app, {**prefs, "directory": str(row["directory"]),
                      "project_id": project_id})
+    _authorize_and_refresh(app, str(row["directory"]))
     return {"kind": "agent_project", "project": _project_out(row)}
 
 

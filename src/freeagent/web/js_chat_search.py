@@ -40,7 +40,10 @@ async function chatDelegate() {
     });
     addMsg("bot", "已交给引擎：" + (r.reason || "正在后台跑"), "kind-answer", null, false);
     ta.value = ""; ta.style.height = "auto";
-    load("workbench");  // 进度 / 授权卡都在那边看
+    // 不跳工作台（V1.175）：进度 / 答复 / 改动就在对话页右栏看，人才不离开这一轮。
+    // 宽屏直接开右栏；逐次授权要弹卡时右栏会给「去工作台决定」入口（授权闸门没动）。
+    if (typeof chatPanelToggle === "function") chatPanelToggle("side", true);
+    if (typeof chatSidePaint === "function") chatSidePaint();
   } catch (e) { toast("派发失败：" + e.message); }
 }
 
@@ -63,9 +66,14 @@ function chatToolsMount() {
       menu.hidden = true; btn.setAttribute("aria-expanded", "false"); fn();
     };
     menu.appendChild(b);
+    return b;
   };
   // 对话是唯一入口：一句话在这里说完，"交给它"也在这里（V1.152）。
   add("交给它执行", chatDelegate);
+  // 工作区 / 产物默认收起（V1.159）：开合统一走 chatPanelToggle，
+  // 菜单文案每次打开都按当前状态刷新，免得写着"打开"点了却关掉。
+  const railItem = add("打开工作区", () => chatPanelToggle("rail"));
+  const sideItem = add("打开产物", () => chatPanelToggle("side"));
   add("查找对话内容（Ctrl+F）", chatSearchOpen);
   if (history_.length) {
     add("清空对话", clearHistory);
@@ -73,6 +81,9 @@ function chatToolsMount() {
   }
   btn.onclick = (e) => {
     e.stopPropagation();
+    const rail = $("#chat-rail"), side = $("#chat-side");
+    if (rail && railItem) railItem.textContent = rail.hidden ? "打开工作区" : "收起工作区";
+    if (side && sideItem) sideItem.textContent = side.hidden ? "打开产物" : "收起产物";
     menu.hidden = !menu.hidden;
     btn.setAttribute("aria-expanded", String(!menu.hidden));
   };
@@ -80,14 +91,24 @@ function chatToolsMount() {
   chat.appendChild(box);
   if (!chatToolsBound) {
     chatToolsBound = true;
+    // 监听只绑一次，但不能捕获当次的 menu/btn —— renderChatShell 每次
+    // root.innerHTML="" 重建 .chat，被捕获的节点重绘后就不在文档里了，
+    // Esc / 点外关闭会永久失效（同 V1.142 文件清单"状态绑旧节点"的教训）。
+    // 现查现用，监听活的 DOM。
     document.addEventListener("click", (e) => {
       const b = $("#chat-tools");
       if (b && !b.contains(e.target)) {
-        menu.hidden = true; btn.setAttribute("aria-expanded", "false");
+        const m = $("#chat-tool-menu"), mb = $("#chat-more-btn");
+        if (m) m.hidden = true;
+        if (mb) mb.setAttribute("aria-expanded", "false");
       }
     });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { menu.hidden = true; btn.setAttribute("aria-expanded", "false"); }
+      if (e.key === "Escape") {
+        const m = $("#chat-tool-menu"), mb = $("#chat-more-btn");
+        if (m) m.hidden = true;
+        if (mb) mb.setAttribute("aria-expanded", "false");
+      }
     });
   }
 }

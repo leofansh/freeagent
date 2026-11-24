@@ -19,7 +19,7 @@ import pytest
 
 from freeagent.app import build_app
 from freeagent.domain import TaskKind, WaitingKind, WaitingOn
-from freeagent.services.chat import CAN_DO, ChatReplyKind
+from freeagent.services.chat import CAN_DO, ChatReply, ChatReplyKind
 from freeagent.services.clock import FrozenClock
 
 #: 2026-09-26 是周六，本周一是 09-21。
@@ -93,6 +93,7 @@ class TestQuestionsGetRealAnswers:
         "我在等什么",
         "有什么提醒",
         "周报进展怎么样",
+        "了解项目开发进度",
     ])
     def test_never_refused_and_never_creates(self, chat, text):
         before_tasks = len(chat.tasks.list_all())
@@ -423,3 +424,42 @@ class TestGeneratedAt:
         reply = chat.chat.respond("今天该做什么")
         assert reply.generated_at == "2026-09-27"
         assert reply.text.startswith("2026-09-27")
+
+
+class TestProgressQueryYieldsToTransactions:
+    """含进度词的话是查事务，不是问能力（V1.170 让路）。
+
+    之前「了解项目开发进度」被能力路由接走答成项目清单（答非所问）。
+    让路判断只决定「谁答」——不碰数据写入 / 白名单 / 授权。
+    """
+
+    class _FakeRouter:
+        def __init__(self):
+            self.called = False
+
+        def try_route(self, text, capabilities):
+            self.called = True
+            # 非 None 哨兵：若让路失效就会命中它、被当成能力答复返回。
+            return ChatReply(ChatReplyKind.ANSWER, "哨兵：被能力路由接走了")
+
+    def test_progress_query_skips_capability_router(self, chat):
+        router = self._FakeRouter()
+        original = chat.chat._capability_router
+        try:
+            chat.chat._capability_router = router
+            reply = chat.chat.respond("了解项目开发进度")
+            assert router.called is False, "进度查询不该进能力路由"
+            assert "能改这" not in reply.text, "不该答成项目清单"
+            assert "哨兵" not in reply.text
+        finally:
+            chat.chat._capability_router = original
+
+    def test_non_progress_query_still_uses_capability_router(self, chat):
+        router = self._FakeRouter()
+        original = chat.chat._capability_router
+        try:
+            chat.chat._capability_router = router
+            chat.chat.respond("有哪些项目")
+            assert router.called is True, "不含进度词的能力问题仍该进能力路由"
+        finally:
+            chat.chat._capability_router = original

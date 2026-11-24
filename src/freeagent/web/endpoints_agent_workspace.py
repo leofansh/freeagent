@@ -157,6 +157,11 @@ def agent_start(app: App, body: dict[str, Any], turns: Any) -> dict[str, Any]:
     directory = str(body.get("directory") or "").strip()
     mode = str(body.get("mode") or engine_host.ENGINE_ASK).strip()
     force = bool(body.get("force"))
+    # 会话归属（V1.176）：前端派活时带当前会话 id；没带就沿用工偏好里选中的
+    # 那个（兼容老调用方）。空串是合法值 —— 老轮次没有会话，不替人猜一个。
+    session_id = str(
+        body.get("session_id") or load_prefs(app).get("session_id") or ""
+    ).strip()
     if not text:
         raise FreeAgentError("一句话都没说")
     if not directory:
@@ -199,6 +204,7 @@ def agent_start(app: App, body: dict[str, Any], turns: Any) -> dict[str, Any]:
             agent=str(body.get("agent") or "").strip(),
             variant=str(body.get("variant") or "").strip(),
             context=context, context_note=context_note,
+            session_id=session_id,
         )
     except ValueError as exc:
         raise FreeAgentError(str(exc)) from exc
@@ -218,6 +224,7 @@ def agent_start(app: App, body: dict[str, Any], turns: Any) -> dict[str, Any]:
         "model": str(body.get("model") or ""),
         "agent": str(body.get("agent") or ""),
         "variant": str(body.get("variant") or ""), "mode": mode,
+        "session_id": session_id,
     })
     # 延迟 import：``endpoints_agent`` 在模块级 import 本模块（派发表要用
     # ``agent_start``），顶层再反着 import 会成环。

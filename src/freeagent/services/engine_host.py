@@ -188,6 +188,13 @@ class EngineHost:
                 self._status = READY
                 return self._session
 
+            # 多会话（V1.176）：服务没起来时若已经切过会话（switch_session 记下
+            # 了 id），这里必须**绑定回那个会话**而不是 create_session 另建一个
+            # —— 否则「打开页面 → 选历史会话 → 派活」会静默换一个引擎会话，
+            # 对话消息与委派轮次就串味了。旧 id 跨进程有效（V1.97 实测）。
+            # 只有「冷启动且已切过会话」才回填；换目录 / 换档是**真的**换了
+            # 工作上下文，那种情况下必须建新会话，不能把旧目录的会话带过去。
+            wanted = self._session if self._server is None else ""
             if self._server is not None:
                 # 换目录 / 换档 / 服务不答话 —— 三者都要求**先收口再起**。
                 # 先起再收会短暂出现两个服务写同一个项目覆盖层。
@@ -197,7 +204,17 @@ class EngineHost:
             server = None
             try:
                 server = self._spawn(pathlib.Path(resolved), mode)
-                session = server.create_session()
+                session = ""
+                if wanted:
+                    use = getattr(server, "use_session", None)
+                    if callable(use):
+                        try:
+                            use(wanted)
+                            session = wanted
+                        except Exception as exc:  # noqa: BLE001 - 绑定失败就新建
+                            log.warning("【引擎】绑定既有会话失败，改建新会话：%s", exc)
+                if not session:
+                    session = server.create_session()
                 if not session:
                     raise ServerError("引擎建了会话但没给出会话 id")
             except Exception as exc:  # noqa: BLE001 - 任何失败都要收口
@@ -287,6 +304,51 @@ class EngineHost:
                 self._server.abort(self._session)
             except Exception as exc:  # noqa: BLE001
                 log.warning("【引擎】中止失败（仍按中止处理）：%s", exc)
+
+    def new_session(self) -> str:
+        """在当前服务上建一个新会话，并把它设为当前会话。
+
+        `session_new` 端点用：新会话必须对应引擎里**真的**一个会话，否则下一轮
+        派活打过去会落到别人的上下文。建会话不重建服务 —— 同进程里其它会话
+        都活着，重建会把它们一起丢掉。
+        """
+        with self._lock:
+            if self._server is None:
+                raise ServerError("引擎还没就绪 —— 先 ensure 再建会话")
+            sid = self._server.create_session()
+            if not sid:
+                raise ServerError("引擎建了会话但没给出会话 id")
+            self._session = sid
+            # 换会话清缓存：这两份都带会话 id，留着会把上一会话的数说成这一会话的。
+            self._usage_cache = None
+            self._ledger_cache = None
+            return sid
+
+    def switch_session(self, sid: str) -> None:
+        """切到本目录下的另一个会话（端点已校验归属，这里只认 id 本身）。
+
+        目录归属的校验在 `endpoints_agent_sessions` 里做 —— 那层才拿得到
+        `chat_sessions` 表；EngineHost 不持有会话表，这正是「一个事实一个
+        写入口」：归属只在仓储层判一次。
+
+        **服务没起来也允许切**：只记下 id，等 `ensure` 起服务时用它绑定
+        （见 `ensure` 里 `wanted` 的处理）。这样「打开页面 → 选一条历史会话
+        → 再派活」不会悄悄换一个引擎会话。
+        """
+        if not sid:
+            raise ServerError("会话 id 不能为空 —— 不猜，也不悄悄退回默认会话")
+        with self._lock:
+            # 历史会话（localStorage 迁移来的老对话，hist: 前缀）没有引擎对应物：
+            # 清空当前 id，让 ensure 起服务时新建干净的引擎会话。绝不拿这个假 id
+            # 去 use_session —— 那等于 prompt 打给一个不存在的会话。
+            if sid.startswith("hist:"):
+                self._session = ""
+            else:
+                if self._server is not None:
+                    self._server.use_session(sid)
+                self._session = sid
+            self._usage_cache = None
+            self._ledger_cache = None
 
     def halt(self) -> None:
         """停掉服务并**还原项目覆盖层**。可重复调用。"""

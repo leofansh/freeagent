@@ -1716,15 +1716,16 @@ class WorkbenchTurnRepo(_RepoBase):
         variant: str = "",
         status: str = "running",
         context_note: str = "",
+        session_id: str = "",
     ) -> None:
         with self._tx():
             self._conn.execute(
                 "INSERT INTO workbench_turns (id, brief, directory, model, agent,"
-                " variant, mode, status, started_at, context_note)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " variant, mode, status, started_at, context_note, session_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     turn_id, brief, directory, model, agent, variant, mode,
-                    status, _dt_out(started_at), context_note,
+                    status, _dt_out(started_at), context_note, session_id,
                 ),
             )
 
@@ -1888,6 +1889,78 @@ class WorkbenchProjectRepo(_RepoBase):
         with self._tx():
             self._conn.execute(
                 "DELETE FROM workbench_projects WHERE id = ?", (project_id,)
+            )
+
+
+class ChatSessionRepo(_RepoBase):
+    """对话会话的存取（V1.176 / 多会话）。**只存取，不判断。**
+
+    一个会话 = 一段对话消息（前端 localStorage 按 session id 分 key 存）
+    + 该会话的委派轮次（``workbench_turns.session_id``）。切会话换引擎
+    session 的判断在 :class:`freeagent.services.engine_host.EngineHost`，
+    这里只负责行的增删改查与按目录列举。
+
+    ## 删会话不删轮次
+
+    轮次是「我当时在那个会话里干了什么」的历史，删会话只是不想再看见这段
+    对话 —— 轮次行留着，它的 ``session_id`` 成为孤儿，读侧按「历史会话」
+    兜底（不把读不出来说成 0）。这与删项目只删档案同一条纪律。
+    """
+
+    def list_by_directory(self, directory: str) -> list[dict[str, object]]:
+        """某目录下的会话按最近更新倒序；同刻用 ``rowid`` 定序（V1.113
+        纪律：秒级时间戳会撞车，拿它单独定序等于随机排序）。"""
+        rows = self._conn.execute(
+            "SELECT * FROM chat_sessions WHERE directory = ?"
+            " ORDER BY updated_at DESC, rowid DESC",
+            (directory,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get(self, session_id: str) -> dict[str, object] | None:
+        row = self._conn.execute(
+            "SELECT * FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def create(
+        self,
+        *,
+        session_id: str,
+        directory: str,
+        title: str,
+        now: datetime,
+    ) -> dict[str, object]:
+        with self._tx():
+            self._conn.execute(
+                "INSERT INTO chat_sessions"
+                " (id, directory, title, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (session_id, directory, title, _dt_out(now), _dt_out(now)),
+            )
+        return self.get(session_id) or {}
+
+    def touch(self, session_id: str, now: datetime) -> None:
+        with self._tx():
+            self._conn.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+                (_dt_out(now), session_id),
+            )
+
+    def rename(
+        self, session_id: str, title: str, now: datetime,
+    ) -> dict[str, object] | None:
+        with self._tx():
+            cursor = self._conn.execute(
+                "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
+                (title, _dt_out(now), session_id),
+            )
+        return self.get(session_id) if cursor.rowcount else None
+
+    def delete(self, session_id: str) -> None:
+        with self._tx():
+            self._conn.execute(
+                "DELETE FROM chat_sessions WHERE id = ?", (session_id,)
             )
 
 
